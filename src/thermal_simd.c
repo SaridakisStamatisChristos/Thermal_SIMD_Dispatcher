@@ -111,6 +111,24 @@ static int parse_ratio_option(const char *value, double min, double max, double 
     return 0;
 }
 
+static int compute_ticks_from_ms(int ms, const char *flag_name) {
+    int64_t interval_us = param_check_interval_us;
+    if (interval_us <= 0) {
+        fprintf(stderr, "Invalid sampling interval while processing %s\n", flag_name);
+        exit(1);
+    }
+
+    int64_t total_us = (int64_t)ms * 1000;
+    int64_t ticks64 = (total_us + interval_us - 1) / interval_us;
+    if (ticks64 <= 0 || ticks64 > INT_MAX) {
+        fprintf(stderr, "Value for %s results in unsupported tick count (%lld)\n",
+                flag_name, (long long)ticks64);
+        exit(1);
+    }
+
+    return (int)ticks64;
+}
+
 static void parse_flags(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         if (!strncmp(argv[i], "--interval=", 11)) {
@@ -167,9 +185,9 @@ static void parse_flags(int argc, char **argv) {
     }
 
     // Convert ms to ticks after parsing all flags (interval might change order)
-    cooldown_down_ticks = (param_cooldown_down_ms * 1000 + param_check_interval_us - 1) / param_check_interval_us;
-    cooldown_up_ticks   = (param_cooldown_up_ms   * 1000 + param_check_interval_us - 1) / param_check_interval_us;
-    min_dwell_ticks     = (param_min_dwell_ms     * 1000 + param_check_interval_us - 1) / param_check_interval_us;
+    cooldown_down_ticks = compute_ticks_from_ms(param_cooldown_down_ms, "--cooldown-down");
+    cooldown_up_ticks   = compute_ticks_from_ms(param_cooldown_up_ms, "--cooldown-up");
+    min_dwell_ticks     = compute_ticks_from_ms(param_min_dwell_ms, "--min-dwell");
 }
 
 // ============================================================================
@@ -721,6 +739,8 @@ int main(int argc, char **argv) {
     printf("  Up threshold: %d stable events\\n", param_up_count);
     printf("  Cooldown: %d ms down, %d ms up\\n", param_cooldown_down_ms, param_cooldown_up_ms);
     printf("  Minimum dwell: %d ms per width\\n", param_min_dwell_ms);
+    printf("  Cooldown ticks: down=%d up=%d min-dwell=%d\\n",
+           cooldown_down_ticks, cooldown_up_ticks, min_dwell_ticks);
     printf("  Demo: %d sec, work iters: %d\\n\\n", demo_duration_sec, work_iters);
     if (init_double_buffer_trampoline() != 0) { fprintf(stderr, "Failed to create trampolines\\n"); return 1; }
     atomic_patch_strict_wx(max_width);
