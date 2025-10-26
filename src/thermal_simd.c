@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <string.h>
 #include <limits.h>
+#include <errno.h>
 #include <sys/mman.h>
 #include <sys/ioctl.h>
 #include <unistd.h>
@@ -22,10 +23,16 @@ static int param_check_interval_us = 50000;     // Check every 50ms
 static int param_down_count = 3;                // Downgrade after 3 throttles
 static int param_up_count = 5;                  // Upgrade after 5 stable
 static double param_down_ratio = 1.5;           // Throttle threshold (1.5x baseline CPI)
+static uint64_t param_down_ratio_milli = 1500;  // Scaled ratio (x1000) for integer math
 static int param_cooldown_down_ms = 1000;       // 1s cooldown after downgrade
 static int param_cooldown_up_ms = 2000;         // 2s cooldown after upgrade
 static int param_allow_avx512 = 1;              // Allow AVX-512 (disable for Zen or conservative policy)
 static int param_min_dwell_ms = 200;            // Minimum 200ms per width (prevents rapid flipping)
+
+#define RATIO_HISTORY 8
+#define FAST_EWMA_SHIFT 2
+#define SLOW_EWMA_SHIFT 5
+#define MPKI_SCALE 1000000ULL
 
 // Demo controls
 static int demo_duration_sec = 10;              // --duration-sec
@@ -52,28 +59,98 @@ static void print_usage(const char *prog) {
     printf("  --help                 Show this help\n");
 }
 
+static void die_invalid_option(const char *option, const char *value) {
+    fprintf(stderr, "Invalid value for %s: '%s'\n", option, value);
+    exit(1);
+}
+
+static int parse_int_option(const char *value, long min, long max, int *out) {
+    if (!value || !out) return -1;
+    errno = 0;
+    char *end = NULL;
+    long parsed = strtol(value, &end, 10);
+    if (errno != 0 || end == value || *end != '\0') {
+        return -1;
+    }
+    if (parsed < min || parsed > max) {
+        return -1;
+    }
+    *out = (int)parsed;
+    return 0;
+}
+
+static int parse_ms_option(const char *value, int min_ms, int max_ms, int *out_us) {
+    int parsed_ms;
+    if (parse_int_option(value, min_ms, max_ms, &parsed_ms) != 0) {
+        return -1;
+    }
+    if ((long)parsed_ms * 1000L > INT_MAX) {
+        return -1;
+    }
+    *out_us = parsed_ms * 1000;
+    return 0;
+}
+
+static int parse_ratio_option(const char *value, double min, double max, double *ratio_out, uint64_t *scaled_out) {
+    if (!value || !ratio_out || !scaled_out) return -1;
+    errno = 0;
+    char *end = NULL;
+    double parsed = strtod(value, &end);
+    if (errno != 0 || end == value || *end != '\0') {
+        return -1;
+    }
+    if (parsed < min || parsed > max) {
+        return -1;
+    }
+    double scaled = parsed * 1000.0;
+    if (scaled < 0.0 || scaled > (double)UINT64_MAX) {
+        return -1;
+    }
+    *ratio_out = parsed;
+    *scaled_out = (uint64_t)(scaled + 0.5);
+    return 0;
+}
+
 static void parse_flags(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         if (!strncmp(argv[i], "--interval=", 11)) {
-            param_check_interval_us = atoi(argv[i] + 11) * 1000;
+            if (parse_ms_option(argv[i] + 11, 1, 10000, &param_check_interval_us) != 0) {
+                die_invalid_option("--interval", argv[i] + 11);
+            }
         } else if (!strncmp(argv[i], "--down-count=", 13)) {
-            param_down_count = atoi(argv[i] + 13);
+            if (parse_int_option(argv[i] + 13, 1, 100, &param_down_count) != 0) {
+                die_invalid_option("--down-count", argv[i] + 13);
+            }
         } else if (!strncmp(argv[i], "--up-count=", 11)) {
-            param_up_count = atoi(argv[i] + 11);
+            if (parse_int_option(argv[i] + 11, 1, 100, &param_up_count) != 0) {
+                die_invalid_option("--up-count", argv[i] + 11);
+            }
         } else if (!strncmp(argv[i], "--down-ratio=", 13)) {
-            param_down_ratio = atof(argv[i] + 13);
+            if (parse_ratio_option(argv[i] + 13, 1.0, 10.0, &param_down_ratio, &param_down_ratio_milli) != 0) {
+                die_invalid_option("--down-ratio", argv[i] + 13);
+            }
         } else if (!strncmp(argv[i], "--cooldown-down=", 16)) {
-            param_cooldown_down_ms = atoi(argv[i] + 16);
+            if (parse_int_option(argv[i] + 16, 1, 3600000, &param_cooldown_down_ms) != 0) {
+                die_invalid_option("--cooldown-down", argv[i] + 16);
+            }
         } else if (!strncmp(argv[i], "--cooldown-up=", 14)) {
-            param_cooldown_up_ms = atoi(argv[i] + 14);
+            if (parse_int_option(argv[i] + 14, 1, 3600000, &param_cooldown_up_ms) != 0) {
+                die_invalid_option("--cooldown-up", argv[i] + 14);
+            }
         } else if (!strncmp(argv[i], "--min-dwell=", 12)) {
-            param_min_dwell_ms = atoi(argv[i] + 12);
+            if (parse_int_option(argv[i] + 12, 1, 3600000, &param_min_dwell_ms) != 0) {
+                die_invalid_option("--min-dwell", argv[i] + 12);
+            }
         } else if (!strcmp(argv[i], "--no-avx512")) {
             param_allow_avx512 = 0;
         } else if (!strncmp(argv[i], "--duration-sec=", 15)) {
-            demo_duration_sec = atoi(argv[i] + 15);
+            if (parse_int_option(argv[i] + 15, 1, 86400, &demo_duration_sec) != 0) {
+                die_invalid_option("--duration-sec", argv[i] + 15);
+            }
         } else if (!strncmp(argv[i], "--work-iters=", 13)) {
-            work_iters = atoi(argv[i] + 13);
+            if (parse_int_option(argv[i] + 13, 1, INT_MAX, &work_iters) != 0) {
+                die_invalid_option("--work-iters", argv[i] + 13);
+            }
         } else if (!strcmp(argv[i], "--help")) {
             print_usage(argv[0]);
             exit(0);
@@ -83,7 +160,12 @@ static void parse_flags(int argc, char **argv) {
             exit(1);
         }
     }
-    
+
+    param_down_ratio_milli = (uint64_t)(param_down_ratio * 1000.0 + 0.5);
+    if (param_down_ratio_milli == 0) {
+        param_down_ratio_milli = 1;
+    }
+
     // Convert ms to ticks after parsing all flags (interval might change order)
     cooldown_down_ticks = (param_cooldown_down_ms * 1000 + param_check_interval_us - 1) / param_check_interval_us;
     cooldown_up_ticks   = (param_cooldown_up_ms   * 1000 + param_check_interval_us - 1) / param_check_interval_us;
@@ -294,8 +376,79 @@ typedef struct {
     int fd_insns;
     int fd_llc_misses;
     uint64_t baseline_cpi;
+    uint64_t baseline_llc_mpki_milli;
+    uint64_t slow_cpi;
+    uint64_t fast_cpi;
+    uint64_t slow_llc_mpki;
+    uint64_t fast_llc_mpki;
+    uint32_t ratio_history[RATIO_HISTORY];
+    size_t   ratio_history_count;
+    size_t   ratio_history_cursor;
+    uint32_t ratio_trimmed_milli;
     int pinned_cpu;
 } perf_ctx_t;
+
+typedef struct {
+    uint64_t cpi_milli;
+    uint32_t ratio_milli;
+    uint32_t trimmed_ratio_milli;
+    uint64_t llc_mpki_milli;
+    uint64_t severity_milli;
+    int memory_bound;
+} thermal_eval_t;
+
+static inline uint64_t update_ewma(uint64_t prev, uint64_t sample, unsigned shift) {
+    if (prev == 0 || shift == 0) {
+        return sample;
+    }
+    if (sample == prev) {
+        return prev;
+    }
+    if (sample > prev) {
+        uint64_t delta = sample - prev;
+        uint64_t step = delta >> shift;
+        if (step == 0) step = 1;
+        uint64_t next = prev + step;
+        return next > sample ? sample : next;
+    }
+    uint64_t delta = prev - sample;
+    uint64_t step = delta >> shift;
+    if (step == 0) step = 1;
+    uint64_t next = prev - step;
+    return next < sample ? sample : next;
+}
+
+static uint32_t compute_trimmed_mean(const uint32_t *values, size_t count) {
+    if (count == 0) {
+        return 0;
+    }
+    uint32_t scratch[RATIO_HISTORY];
+    if (count > RATIO_HISTORY) count = RATIO_HISTORY;
+    memcpy(scratch, values, count * sizeof(uint32_t));
+    for (size_t i = 1; i < count; ++i) {
+        uint32_t key = scratch[i];
+        size_t j = i;
+        while (j > 0 && scratch[j - 1] > key) {
+            scratch[j] = scratch[j - 1];
+            --j;
+        }
+        scratch[j] = key;
+    }
+    if (count <= 2) {
+        uint64_t sum = 0;
+        for (size_t i = 0; i < count; ++i) sum += scratch[i];
+        return (uint32_t)(sum / count);
+    }
+    size_t start = 1;
+    size_t end = count - 1;
+    uint64_t sum = 0;
+    size_t samples = 0;
+    for (size_t i = start; i < end; ++i) {
+        sum += scratch[i];
+        samples++;
+    }
+    return samples ? (uint32_t)(sum / samples) : scratch[count / 2];
+}
 
 static long perf_event_open_sys(struct perf_event_attr *hw_event, pid_t pid, int cpu, int group_fd, unsigned long flags) {
     return syscall(__NR_perf_event_open, hw_event, pid, cpu, group_fd, flags);
@@ -381,11 +534,20 @@ static inline uint64_t scale_counter(uint64_t delta, uint64_t time_enabled, uint
 
 static void measure_baseline_cpi(perf_ctx_t *ctx) {
     struct { uint64_t nr, time_enabled, time_running, values[2]; } rd_before = {0}, rd_after = {0};
+    uint64_t llc_before = 0, llc_after = 0;
     ssize_t n = read(ctx->fd_cycles, &rd_before, sizeof(rd_before));
     if (n < 0) { ctx->baseline_cpi = 1000; return; }
+    if (ctx->fd_llc_misses >= 0) {
+        ssize_t llc_read = read(ctx->fd_llc_misses, &llc_before, sizeof(llc_before));
+        if (llc_read < 0) llc_before = 0;
+    }
     for (int i = 0; i < 100000; i++) workload_once();
     n = read(ctx->fd_cycles, &rd_after, sizeof(rd_after));
     if (n < 0) { ctx->baseline_cpi = 1000; return; }
+    if (ctx->fd_llc_misses >= 0) {
+        ssize_t llc_read = read(ctx->fd_llc_misses, &llc_after, sizeof(llc_after));
+        if (llc_read < 0) llc_after = llc_before;
+    }
     uint64_t delta_cycles = scale_counter(rd_after.values[0] - rd_before.values[0],
                                           rd_after.time_enabled - rd_before.time_enabled,
                                           rd_after.time_running - rd_before.time_running);
@@ -393,17 +555,37 @@ static void measure_baseline_cpi(perf_ctx_t *ctx) {
                                           rd_after.time_enabled - rd_before.time_enabled,
                                           rd_after.time_running - rd_before.time_running);
     ctx->baseline_cpi = (delta_cycles * 1000) / (delta_insns ?: 1);
+    uint64_t delta_llc = (ctx->fd_llc_misses >= 0 && llc_after >= llc_before) ? (llc_after - llc_before) : 0;
+    ctx->baseline_llc_mpki_milli = delta_insns ? (delta_llc * MPKI_SCALE) / delta_insns : 0;
+    if (ctx->baseline_llc_mpki_milli == 0) {
+        ctx->baseline_llc_mpki_milli = 1000; // Assume light cache pressure if we saw none.
+    }
+    ctx->slow_cpi = ctx->fast_cpi = ctx->baseline_cpi ?: 1000;
+    ctx->slow_llc_mpki = ctx->fast_llc_mpki = ctx->baseline_llc_mpki_milli;
+    ctx->ratio_history_count = 0;
+    ctx->ratio_history_cursor = 0;
+    ctx->ratio_trimmed_milli = (param_down_ratio_milli > UINT32_MAX) ? UINT32_MAX : (uint32_t)param_down_ratio_milli;
     printf("Baseline CPI: %lu.%03lu\n", ctx->baseline_cpi / 1000, ctx->baseline_cpi % 1000);
+    printf("Baseline MPKI: %lu.%03lu\n", ctx->baseline_llc_mpki_milli / 1000, ctx->baseline_llc_mpki_milli % 1000);
 }
 
 
-static int check_thermal_throttle(perf_ctx_t *ctx) {
+static int evaluate_thermal_state(perf_ctx_t *ctx, thermal_eval_t *out) {
     struct { uint64_t nr, time_enabled, time_running, values[2]; } rd_before = {0}, rd_after = {0};
+    uint64_t llc_before = 0, llc_after = 0;
     ssize_t n = read(ctx->fd_cycles, &rd_before, sizeof(rd_before));
     if (n < 0) return 0;
+    if (ctx->fd_llc_misses >= 0) {
+        ssize_t llc_read = read(ctx->fd_llc_misses, &llc_before, sizeof(llc_before));
+        if (llc_read < 0) llc_before = 0;
+    }
     for (int i = 0; i < 10000; i++) workload_once();
     n = read(ctx->fd_cycles, &rd_after, sizeof(rd_after));
     if (n < 0) return 0;
+    if (ctx->fd_llc_misses >= 0) {
+        ssize_t llc_read = read(ctx->fd_llc_misses, &llc_after, sizeof(llc_after));
+        if (llc_read < 0) llc_after = llc_before;
+    }
     uint64_t delta_cycles = scale_counter(rd_after.values[0] - rd_before.values[0],
                                           rd_after.time_enabled - rd_before.time_enabled,
                                           rd_after.time_running - rd_before.time_running);
@@ -411,10 +593,62 @@ static int check_thermal_throttle(perf_ctx_t *ctx) {
                                           rd_after.time_enabled - rd_before.time_enabled,
                                           rd_after.time_running - rd_before.time_running);
     uint64_t current_cpi = (delta_cycles * 1000) / (delta_insns ?: 1);
-    // Integer comparison to avoid FP in hot path
-    uint64_t lhs = current_cpi * 1000;
-    uint64_t rhs = (uint64_t)((double)ctx->baseline_cpi * (param_down_ratio * 1000.0));
-    return lhs > rhs;
+    uint64_t delta_llc = (ctx->fd_llc_misses >= 0 && llc_after >= llc_before) ? (llc_after - llc_before) : 0;
+    uint64_t mpki_milli = delta_insns ? (delta_llc * MPKI_SCALE) / delta_insns : 0;
+
+    ctx->fast_cpi = update_ewma(ctx->fast_cpi, current_cpi, FAST_EWMA_SHIFT);
+    ctx->slow_cpi = update_ewma(ctx->slow_cpi, current_cpi, SLOW_EWMA_SHIFT);
+    if (ctx->slow_cpi == 0) ctx->slow_cpi = current_cpi ?: (ctx->baseline_cpi ?: 1000);
+    ctx->fast_llc_mpki = update_ewma(ctx->fast_llc_mpki, mpki_milli, FAST_EWMA_SHIFT);
+    ctx->slow_llc_mpki = update_ewma(ctx->slow_llc_mpki, mpki_milli, SLOW_EWMA_SHIFT);
+
+    uint64_t reference_cpi = ctx->slow_cpi ?: (ctx->baseline_cpi ?: 1);
+    __uint128_t ratio_num = (__uint128_t)current_cpi * 1000u;
+    uint64_t ratio_milli = (uint64_t)((ratio_num + reference_cpi / 2) / reference_cpi);
+    if (ctx->ratio_history_count < RATIO_HISTORY) {
+        ctx->ratio_history_count++;
+    }
+    uint32_t stored_ratio = (ratio_milli > UINT32_MAX) ? UINT32_MAX : (uint32_t)ratio_milli;
+    ctx->ratio_history[ctx->ratio_history_cursor] = stored_ratio;
+    ctx->ratio_history_cursor = (ctx->ratio_history_cursor + 1) % RATIO_HISTORY;
+    ctx->ratio_trimmed_milli = compute_trimmed_mean(ctx->ratio_history, ctx->ratio_history_count);
+
+    uint64_t baseline_mpki = ctx->baseline_llc_mpki_milli ?: 1000;
+    uint64_t mpki_reference = ctx->slow_llc_mpki ?: mpki_milli;
+    __uint128_t mpki_ratio_num = (__uint128_t)mpki_reference * 1000u;
+    uint64_t mpki_ratio = (uint64_t)((mpki_ratio_num + baseline_mpki / 2) / baseline_mpki);
+    int memory_bound = ctx->fd_llc_misses >= 0 && mpki_ratio > 2500; // >2.5x baseline cache pressure.
+
+    uint64_t dynamic_threshold = param_down_ratio_milli;
+    if (ctx->fast_cpi > ctx->slow_cpi) {
+        uint64_t delta = ctx->fast_cpi - ctx->slow_cpi;
+        uint64_t delta_ratio = (uint64_t)(((__uint128_t)delta * 1000u) / (ctx->slow_cpi ?: 1));
+        uint64_t slope_penalty = delta_ratio / 5; // respond faster to sharp CPI climbs
+        if (slope_penalty > dynamic_threshold / 4) {
+            slope_penalty = dynamic_threshold / 4;
+        }
+        if (dynamic_threshold > slope_penalty) {
+            dynamic_threshold -= slope_penalty;
+        }
+    }
+    if (memory_bound) {
+        uint64_t guard = dynamic_threshold / 5 + 200; // require more margin if cache bound
+        dynamic_threshold += guard;
+    }
+
+    uint64_t consensus_ratio = (ratio_milli + ctx->ratio_trimmed_milli) / 2;
+    uint64_t severity = (consensus_ratio > dynamic_threshold) ? (consensus_ratio - dynamic_threshold) : 0;
+
+    if (out) {
+        out->cpi_milli = current_cpi;
+        out->ratio_milli = (uint32_t)ratio_milli;
+        out->trimmed_ratio_milli = ctx->ratio_trimmed_milli;
+        out->llc_mpki_milli = mpki_milli;
+        out->severity_milli = severity;
+        out->memory_bound = memory_bound;
+    }
+
+    return severity > 0;
 }
 
 
@@ -438,14 +672,25 @@ void* thermal_monitor_thread(void *arg) {
         dwell_ticks++;
         if (cooldown > 0) { cooldown--; continue; }
         if (dwell_ticks < min_dwell_ticks) { continue; }
-        if (check_thermal_throttle(ctx)) {
+        thermal_eval_t eval = {0};
+        if (evaluate_thermal_state(ctx, &eval)) {
             throttle_count++; stable_count = 0;
             if (throttle_count >= param_down_count && width > SIMD_SSE41) {
+                printf("\nThermal throttle: ratio=%u.%03u (trimmed %u.%03u) severity=+%lu.%03lu MPKI=%lu.%03lu%s\n",
+                       eval.ratio_milli / 1000, eval.ratio_milli % 1000,
+                       eval.trimmed_ratio_milli / 1000, eval.trimmed_ratio_milli % 1000,
+                       eval.severity_milli / 1000, eval.severity_milli % 1000,
+                       eval.llc_mpki_milli / 1000, eval.llc_mpki_milli % 1000,
+                       eval.memory_bound ? " [memory bound guard raised]" : "");
                 width--; atomic_patch_strict_wx(width); throttle_count = 0; cooldown = cooldown_down_ticks; dwell_ticks = 0;
             }
         } else {
             stable_count++; throttle_count = 0;
             if (stable_count >= param_up_count && width < max_width_cached) {
+                printf("\nRecovered: ratio=%u.%03u (trimmed %u.%03u) MPKI=%lu.%03lu\n",
+                       eval.ratio_milli / 1000, eval.ratio_milli % 1000,
+                       eval.trimmed_ratio_milli / 1000, eval.trimmed_ratio_milli % 1000,
+                       eval.llc_mpki_milli / 1000, eval.llc_mpki_milli % 1000);
                 width++; atomic_patch_strict_wx(width); stable_count = 0; cooldown = cooldown_up_ticks; dwell_ticks = 0;
             }
         }
