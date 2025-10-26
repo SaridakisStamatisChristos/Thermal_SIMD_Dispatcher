@@ -258,6 +258,7 @@ static trampoline_ctx_t trampoline_ctx;
 static pthread_mutex_t patch_lock = PTHREAD_MUTEX_INITIALIZER;
 static _Atomic(simd_width_t) current_width;  // Atomic to avoid data race in shim
 static _Atomic unsigned char current_width_byte;  // Mirror for shim byte-read (C11-safe)
+static _Atomic int trampoline_initialized;  // Tracks whether trampoline was patched at least once
 static _Atomic(patch_slot_t*) active_trampoline __attribute__((aligned(8)));
 
 // CORRECTED ENCODINGS (verified with objdump)
@@ -311,7 +312,9 @@ static void serialize_instruction_stream(void) {
 
 static void atomic_patch_strict_wx(simd_width_t new_width) {
     pthread_mutex_lock(&patch_lock);
-    if (new_width == current_width) { pthread_mutex_unlock(&patch_lock); return; }
+    simd_width_t width = __atomic_load_n(&current_width, __ATOMIC_ACQUIRE);
+    int initialized = __atomic_load_n(&trampoline_initialized, __ATOMIC_ACQUIRE);
+    if (initialized && new_width == width) { pthread_mutex_unlock(&patch_lock); return; }
     const uint8_t *patch_data;
     switch (new_width) {
         case SIMD_SSE41:  patch_data = PATCH_SSE41;  break;
@@ -337,6 +340,7 @@ static void atomic_patch_strict_wx(simd_width_t new_width) {
     trampoline_ctx.inactive = tmp;
     __atomic_store_n(&current_width, new_width, __ATOMIC_RELEASE);
     __atomic_store_n(&current_width_byte, (unsigned char)new_width, __ATOMIC_RELEASE);
+    __atomic_store_n(&trampoline_initialized, 1, __ATOMIC_RELEASE);
     printf("Patched to %s (strict W^X)\\n", new_width == SIMD_AVX512 ? "AVX-512" : new_width == SIMD_AVX2 ? "AVX2" : "SSE4.1");
 unlock:
     pthread_mutex_unlock(&patch_lock);
@@ -719,8 +723,6 @@ int main(int argc, char **argv) {
     printf("  Minimum dwell: %d ms per width\\n", param_min_dwell_ms);
     printf("  Demo: %d sec, work iters: %d\\n\\n", demo_duration_sec, work_iters);
     if (init_double_buffer_trampoline() != 0) { fprintf(stderr, "Failed to create trampolines\\n"); return 1; }
-    __atomic_store_n(&current_width, max_width, __ATOMIC_RELEASE);
-    __atomic_store_n(&current_width_byte, (unsigned char)max_width, __ATOMIC_RELEASE);
     atomic_patch_strict_wx(max_width);
     perf_ctx_t *perf = init_perf_monitoring();
     if (perf) {
