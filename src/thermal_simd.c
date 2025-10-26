@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
+#include <limits.h>
 #include <sys/mman.h>
 #include <sys/ioctl.h>
 #include <unistd.h>
@@ -188,14 +189,23 @@ _Static_assert(sizeof(PATCH_AVX2) == 8, "AVX2 payload must be 8 bytes");
 _Static_assert(sizeof(PATCH_AVX512) == 8, "AVX512 payload must be 8 bytes");
 
 static void* create_rx_page(void) {
-    size_t pagesize = sysconf(_SC_PAGESIZE);
-    void *mem = mmap(NULL, pagesize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    long pagesize_long = sysconf(_SC_PAGESIZE);
+    if (pagesize_long <= 0) {
+        return NULL;
+    }
+    size_t pagesize = (size_t)pagesize_long;
+    void *mem = mmap(NULL, pagesize, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (mem == MAP_FAILED) return NULL;
     return mem;
 }
 
 int init_double_buffer_trampoline(void) {
-    size_t pagesize = sysconf(_SC_PAGESIZE);
+    long pagesize_long = sysconf(_SC_PAGESIZE);
+    if (pagesize_long <= 0) {
+        return -1;
+    }
+    size_t pagesize = (size_t)pagesize_long;
     trampoline_ctx.page_a = create_rx_page();
     trampoline_ctx.page_b = create_rx_page();
     if (!trampoline_ctx.page_a || !trampoline_ctx.page_b) return -1;
@@ -227,7 +237,11 @@ static void atomic_patch_strict_wx(simd_width_t new_width) {
         case SIMD_AVX512: patch_data = PATCH_AVX512; break;
         default: goto unlock;
     }
-    size_t pagesize = sysconf(_SC_PAGESIZE);
+    long pagesize_long = sysconf(_SC_PAGESIZE);
+    if (pagesize_long <= 0) {
+        goto unlock;
+    }
+    size_t pagesize = (size_t)pagesize_long;
     patch_slot_t *inactive = trampoline_ctx.inactive;
     void *inactive_page = (void*)((uintptr_t)inactive & ~(pagesize - 1));
     if (mprotect(inactive_page, pagesize, PROT_READ | PROT_WRITE) != 0) goto unlock;
@@ -251,20 +265,21 @@ unlock:
 // ============================================================================
 
 __attribute__((naked))
-static int32_t simd_shim(int32_t a, int32_t b) {
+static int32_t simd_shim(int32_t a __attribute__((unused)),
+                         int32_t b __attribute__((unused))) {
     __asm__ __volatile__(
-        "cmpb $0, g_avx_available(%%rip)\\n\\t"
-        "je 1f\\n\\t"
-        "cmpb $0, current_width_byte(%%rip)\\n\\t"
-        "jne 1f\\n\\t"
-        ".byte 0xC5, 0xF8, 0x77\\n\\t"
-        "1:\\n\\t"
-        "movd %%edi, %%xmm0\\n\\t"
-        "movd %%esi, %%xmm1\\n\\t"
-        "mov active_trampoline(%%rip), %%rax\\n\\t"
-        "call *%%rax\\n\\t"
-        "movd %%xmm0, %%eax\\n\\t"
-        "ret\\n\\t"
+        "cmpb $0, g_avx_available(%rip)\n\t"
+        "je 1f\n\t"
+        "cmpb $0, current_width_byte(%rip)\n\t"
+        "jne 1f\n\t"
+        ".byte 0xC5, 0xF8, 0x77\n\t"  // vzeroupper
+        "1:\n\t"
+        "movd %edi, %xmm0\n\t"
+        "movd %esi, %xmm1\n\t"
+        "movq active_trampoline(%rip), %rax\n\t"
+        "call *%rax\n\t"
+        "movd %xmm0, %eax\n\t"
+        "ret\n\t"
     );
 }
 
@@ -274,37 +289,87 @@ static inline void workload_once(void) { (void)simd_shim(42, 7); }
 // 4. PERFORMANCE MONITORING
 // ============================================================================
 
-typedef struct { int fd_cycles; int fd_insns; int fd_llc_misses; uint64_t baseline_cpi; int pinned_cpu; } perf_ctx_t;
+typedef struct {
+    int fd_cycles;
+    int fd_insns;
+    int fd_llc_misses;
+    uint64_t baseline_cpi;
+    int pinned_cpu;
+} perf_ctx_t;
 
 static long perf_event_open_sys(struct perf_event_attr *hw_event, pid_t pid, int cpu, int group_fd, unsigned long flags) {
     return syscall(__NR_perf_event_open, hw_event, pid, cpu, group_fd, flags);
 }
 
 static void enable_perf(perf_ctx_t* ctx) {
-    ioctl(ctx->fd_cycles, PERF_EVENT_IOC_RESET, 0);
-    ioctl(ctx->fd_insns,  PERF_EVENT_IOC_RESET, 0);
-    ioctl(ctx->fd_llc_misses, PERF_EVENT_IOC_RESET, 0);
-    ioctl(ctx->fd_cycles, PERF_EVENT_IOC_ENABLE, 0);
-    ioctl(ctx->fd_insns,  PERF_EVENT_IOC_ENABLE, 0);
-    ioctl(ctx->fd_llc_misses, PERF_EVENT_IOC_ENABLE, 0);
+    if (!ctx) return;
+    if (ctx->fd_cycles >= 0) { ioctl(ctx->fd_cycles, PERF_EVENT_IOC_RESET, 0);  ioctl(ctx->fd_cycles, PERF_EVENT_IOC_ENABLE, 0); }
+    if (ctx->fd_insns  >= 0) { ioctl(ctx->fd_insns,  PERF_EVENT_IOC_RESET, 0);  ioctl(ctx->fd_insns,  PERF_EVENT_IOC_ENABLE, 0); }
+    if (ctx->fd_llc_misses >= 0) { ioctl(ctx->fd_llc_misses, PERF_EVENT_IOC_RESET, 0); ioctl(ctx->fd_llc_misses, PERF_EVENT_IOC_ENABLE, 0); }
 }
 
 static void disable_perf(perf_ctx_t* ctx) {
-    ioctl(ctx->fd_cycles, PERF_EVENT_IOC_DISABLE, 0);
-    ioctl(ctx->fd_insns,  PERF_EVENT_IOC_DISABLE, 0);
-    ioctl(ctx->fd_llc_misses, PERF_EVENT_IOC_DISABLE, 0);
+    if (!ctx) return;
+    if (ctx->fd_cycles >= 0) ioctl(ctx->fd_cycles, PERF_EVENT_IOC_DISABLE, 0);
+    if (ctx->fd_insns  >= 0) ioctl(ctx->fd_insns,  PERF_EVENT_IOC_DISABLE, 0);
+    if (ctx->fd_llc_misses >= 0) ioctl(ctx->fd_llc_misses, PERF_EVENT_IOC_DISABLE, 0);
 }
 
 static perf_ctx_t* init_perf_monitoring(void) {
     perf_ctx_t *ctx = calloc(1, sizeof(perf_ctx_t));
-    cpu_set_t cpuset; CPU_ZERO(&cpuset); CPU_SET(0, &cpuset); sched_setaffinity(0, sizeof(cpuset), &cpuset); ctx->pinned_cpu = 0;
-    struct perf_event_attr pe = {0}; pe.type = PERF_TYPE_HARDWARE; pe.size = sizeof(pe); pe.disabled = 1; pe.exclude_kernel = 1; pe.exclude_hv = 1;
+    if (!ctx) return NULL;
+    ctx->fd_cycles = -1;
+    ctx->fd_insns = -1;
+    ctx->fd_llc_misses = -1;
+
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(0, &cpuset);
+    (void)sched_setaffinity(0, sizeof(cpuset), &cpuset);
+    ctx->pinned_cpu = 0;
+
+    struct perf_event_attr pe = {0};
+    pe.type = PERF_TYPE_HARDWARE;
+    pe.size = sizeof(pe);
+    pe.disabled = 1;
+    pe.exclude_kernel = 1;
+    pe.exclude_hv = 1;
     pe.read_format = PERF_FORMAT_GROUP | PERF_FORMAT_TOTAL_TIME_ENABLED | PERF_FORMAT_TOTAL_TIME_RUNNING;
-    pe.config = PERF_COUNT_HW_CPU_CYCLES; ctx->fd_cycles = perf_event_open_sys(&pe, 0, -1, -1, 0);
-    pe.config = PERF_COUNT_HW_INSTRUCTIONS; ctx->fd_insns = perf_event_open_sys(&pe, 0, -1, ctx->fd_cycles, 0);
-    pe.read_format = 0; pe.config = PERF_COUNT_HW_CACHE_MISSES; ctx->fd_llc_misses = perf_event_open_sys(&pe, 0, -1, -1, 0);
-    if (ctx->fd_cycles < 0 || ctx->fd_insns < 0 || ctx->fd_llc_misses < 0) { free(ctx); return NULL; }
+
+    // CPU cycles (group leader)
+    pe.config = PERF_COUNT_HW_CPU_CYCLES;
+    long fd_cycles = perf_event_open_sys(&pe, 0, -1, -1, 0);
+    if (fd_cycles < 0) { free(ctx); return NULL; }
+    ctx->fd_cycles = (int)fd_cycles;
+
+    // Instructions (in same group)
+    pe.config = PERF_COUNT_HW_INSTRUCTIONS;
+    long fd_insns = perf_event_open_sys(&pe, 0, -1, ctx->fd_cycles, 0);
+    if (fd_insns < 0) { close(ctx->fd_cycles); free(ctx); return NULL; }
+    ctx->fd_insns = (int)fd_insns;
+
+    // LLC misses (separate counter)
+    pe.read_format = 0;
+    pe.config = PERF_COUNT_HW_CACHE_MISSES;
+    long fd_llc_misses = perf_event_open_sys(&pe, 0, -1, -1, 0);
+    if (fd_llc_misses < 0) {
+        close(ctx->fd_insns);
+        close(ctx->fd_cycles);
+        free(ctx);
+        return NULL;
+    }
+    ctx->fd_llc_misses = (int)fd_llc_misses;
+
     return ctx;
+}
+
+static void cleanup_perf(perf_ctx_t *ctx) {
+    if (!ctx) return;
+    disable_perf(ctx);
+    if (ctx->fd_cycles >= 0) close(ctx->fd_cycles);
+    if (ctx->fd_insns  >= 0) close(ctx->fd_insns);
+    if (ctx->fd_llc_misses >= 0) close(ctx->fd_llc_misses);
+    free(ctx);
 }
 
 // Scale helper (copied signature used above). 128-bit to avoid overflow.
@@ -321,24 +386,37 @@ static void measure_baseline_cpi(perf_ctx_t *ctx) {
     for (int i = 0; i < 100000; i++) workload_once();
     n = read(ctx->fd_cycles, &rd_after, sizeof(rd_after));
     if (n < 0) { ctx->baseline_cpi = 1000; return; }
-    uint64_t delta_cycles = scale_counter(rd_after.values[0] - rd_before.values[0], rd_after.time_enabled - rd_before.time_enabled, rd_after.time_running - rd_before.time_running);
-    uint64_t delta_insns  = scale_counter(rd_after.values[1] - rd_before.values[1], rd_after.time_enabled - rd_before.time_enabled, rd_after.time_running - rd_before.time_running);
+    uint64_t delta_cycles = scale_counter(rd_after.values[0] - rd_before.values[0],
+                                          rd_after.time_enabled - rd_before.time_enabled,
+                                          rd_after.time_running - rd_before.time_running);
+    uint64_t delta_insns  = scale_counter(rd_after.values[1] - rd_before.values[1],
+                                          rd_after.time_enabled - rd_before.time_enabled,
+                                          rd_after.time_running - rd_before.time_running);
     ctx->baseline_cpi = (delta_cycles * 1000) / (delta_insns ?: 1);
-    printf("Baseline CPI: %lu.%03lu\\n", ctx->baseline_cpi / 1000, ctx->baseline_cpi % 1000);
+    printf("Baseline CPI: %lu.%03lu\n", ctx->baseline_cpi / 1000, ctx->baseline_cpi % 1000);
 }
+
 
 static int check_thermal_throttle(perf_ctx_t *ctx) {
     struct { uint64_t nr, time_enabled, time_running, values[2]; } rd_before = {0}, rd_after = {0};
-    ssize_t n = read(ctx->fd_cycles, &rd_before, sizeof(rd_before)); if (n < 0) return 0;
+    ssize_t n = read(ctx->fd_cycles, &rd_before, sizeof(rd_before));
+    if (n < 0) return 0;
     for (int i = 0; i < 10000; i++) workload_once();
-    n = read(ctx->fd_cycles, &rd_after, sizeof(rd_after)); if (n < 0) return 0;
-    uint64_t delta_cycles = scale_counter(rd_after.values[0] - rd_before.values[0], rd_after.time_enabled - rd_before.time_enabled, rd_after.time_running - rd_before.time_running);
-    uint64_t delta_insns  = scale_counter(rd_after.values[1] - rd_before.values[1], rd_after.time_enabled - rd_before.time_enabled, rd_after.time_running - rd_before.time_running);
+    n = read(ctx->fd_cycles, &rd_after, sizeof(rd_after));
+    if (n < 0) return 0;
+    uint64_t delta_cycles = scale_counter(rd_after.values[0] - rd_before.values[0],
+                                          rd_after.time_enabled - rd_before.time_enabled,
+                                          rd_after.time_running - rd_before.time_running);
+    uint64_t delta_insns  = scale_counter(rd_after.values[1] - rd_before.values[1],
+                                          rd_after.time_enabled - rd_before.time_enabled,
+                                          rd_after.time_running - rd_before.time_running);
     uint64_t current_cpi = (delta_cycles * 1000) / (delta_insns ?: 1);
+    // Integer comparison to avoid FP in hot path
     uint64_t lhs = current_cpi * 1000;
-    uint64_t rhs = (uint64_t)( (double)ctx->baseline_cpi * (param_down_ratio * 1000.0) );
+    uint64_t rhs = (uint64_t)((double)ctx->baseline_cpi * (param_down_ratio * 1000.0));
     return lhs > rhs;
 }
+
 
 // ============================================================================
 // 5. ADAPTIVE MANAGER
@@ -351,9 +429,12 @@ void* thermal_monitor_thread(void *arg) {
     simd_width_t width = __atomic_load_n(&current_width, __ATOMIC_ACQUIRE);
     simd_width_t max_width_cached = detect_max_simd();
     int throttle_count = 0, stable_count = 0, cooldown = 0, dwell_ticks = 0;
-    cpu_set_t cpuset; CPU_ZERO(&cpuset); CPU_SET(ctx->pinned_cpu, &cpuset); sched_setaffinity(0, sizeof(cpuset), &cpuset);
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET((size_t)ctx->pinned_cpu, &cpuset);
+    (void)sched_setaffinity(0, sizeof(cpuset), &cpuset);
     while (running) {
-        usleep(param_check_interval_us);
+        usleep((useconds_t)param_check_interval_us);
         dwell_ticks++;
         if (cooldown > 0) { cooldown--; continue; }
         if (dwell_ticks < min_dwell_ticks) { continue; }
@@ -371,6 +452,7 @@ void* thermal_monitor_thread(void *arg) {
     }
     return NULL;
 }
+
 
 // ============================================================================
 // 6. MAIN
