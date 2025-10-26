@@ -1,0 +1,6 @@
+cmake_minimum_required(VERSION 3.15)
+project(thermal_simd_dispatcher C)
+set(CMAKE_C_STANDARD 11)
+add_executable(thermal_simd src/thermal_simd.c)
+target_compile_options(thermal_simd PRIVATE -O2 -march=native -pthread -fPIC -mno-avx)
+target_link_libraries(thermal_simd pthread)
