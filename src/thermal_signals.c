@@ -1,4 +1,4 @@
-#include "thermal_signals.h"
+#include <thermal/simd/thermal_signals.h>
 
 #include <errno.h>
 #include <signal.h>
@@ -7,7 +7,7 @@
 #include <string.h>
 #include <unistd.h>
 
-#include "thermal_trampoline.h"
+#include <thermal/simd/thermal_trampoline.h>
 
 static void tsd_safe_write_buf(int fd, const char *buf, size_t len) {
     while (len > 0) {

@@ -4,7 +4,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#include "thermal_simd_internal.h"
+#include <thermal/simd/simd_width.h>
 
 #ifdef __cplusplus
 extern "C" {

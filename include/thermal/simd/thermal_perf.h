@@ -5,7 +5,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#include "thermal_config.h"
+#include <thermal/simd/thermal_config.h>
 
 #ifdef __cplusplus
 extern "C" {

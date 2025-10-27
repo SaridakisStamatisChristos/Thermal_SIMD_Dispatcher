@@ -11,11 +11,11 @@
 #include <time.h>
 #include <unistd.h>
 
-#include "thermal_config.h"
-#include "thermal_cpu.h"
-#include "thermal_perf.h"
-#include "thermal_signals.h"
-#include "thermal_trampoline.h"
+#include <thermal/simd/thermal_config.h>
+#include <thermal/simd/thermal_cpu.h>
+#include <thermal/simd/thermal_perf.h>
+#include <thermal/simd/thermal_signals.h>
+#include <thermal/simd/thermal_trampoline.h>
 
 #ifdef TSD_ENABLE_TESTS
 #include "thermal_simd_test.h"

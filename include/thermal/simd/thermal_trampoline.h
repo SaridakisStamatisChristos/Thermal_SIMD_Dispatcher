@@ -6,7 +6,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#include "thermal_simd_internal.h"
+#include <thermal/simd/simd_width.h>
 
 typedef struct {
     uint8_t code[16];

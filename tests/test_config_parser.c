@@ -1,4 +1,4 @@
-#include "config_parser.h"
+#include <thermal/simd/config_parser.h>
 
 #include <errno.h>
 #include <limits.h>
