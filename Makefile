@@ -4,14 +4,14 @@ CFLAGS ?= -O2 -pthread -fPIC -mno-avx -Wall -Wextra -Wshadow -Wconversion -Wcast
 LDFLAGS ?= -pthread
 
 BIN := thermal_simd
-SRC := src/thermal_simd.c
+SRC := src/thermal_simd.c src/config_parser.c src/statistics.c
 
 .PHONY: all clean run
 
 all: $(BIN)
 
 $(BIN): $(SRC)
-	$(CC) $(CFLAGS) $(ARCHFLAGS) -o $@ $< $(LDFLAGS)
+	$(CC) $(CFLAGS) $(ARCHFLAGS) -Isrc -o $@ $(SRC) $(LDFLAGS)
 
 run: $(BIN)
 	./$(BIN)

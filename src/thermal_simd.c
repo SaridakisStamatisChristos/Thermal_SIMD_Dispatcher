@@ -18,6 +18,9 @@
 #include <asm/unistd.h>
 #include <cpuid.h>
 
+#include "config_parser.h"
+#include "statistics.h"
+
 // ============================================================================
 // 0. RUNTIME CONFIGURATION (CLI-tunable)
 // ============================================================================
@@ -34,7 +37,7 @@ static int param_min_dwell_ms = 200;            // Minimum 200ms per width (prev
 static int param_memory_guard_divisor = 5;      // Dynamic threshold divisor when cache bound
 static int param_memory_guard_offset_milli = 200; // Additional guard (milli-ratio)
 
-#define RATIO_HISTORY 8
+#define RATIO_HISTORY TSD_RATIO_HISTORY
 #define FAST_EWMA_SHIFT 2
 #define SLOW_EWMA_SHIFT 5
 #define MPKI_SCALE 1000000ULL
@@ -72,99 +75,34 @@ static void die_invalid_option(const char *option, const char *value) {
     exit(1);
 }
 
-static int parse_int_option(const char *value, long min, long max, int *out) {
-    if (!value || !out) return -1;
-    errno = 0;
-    char *end = NULL;
-    long parsed = strtol(value, &end, 10);
-    if (errno != 0 || end == value || *end != '\0') {
-        return -1;
-    }
-    if (parsed < min || parsed > max) {
-        return -1;
-    }
-    *out = (int)parsed;
-    return 0;
-}
-
-static int parse_ms_option(const char *value, int min_ms, int max_ms, int *out_us) {
-    int parsed_ms;
-    if (parse_int_option(value, min_ms, max_ms, &parsed_ms) != 0) {
-        return -1;
-    }
-    if ((long)parsed_ms * 1000L > INT_MAX) {
-        return -1;
-    }
-    *out_us = parsed_ms * 1000;
-    return 0;
-}
-
-static int parse_ratio_option(const char *value, double min, double max, double *ratio_out, uint64_t *scaled_out) {
-    if (!value || !ratio_out || !scaled_out) return -1;
-    errno = 0;
-    char *end = NULL;
-    double parsed = strtod(value, &end);
-    if (errno != 0 || end == value || *end != '\0') {
-        return -1;
-    }
-    if (parsed < min || parsed > max) {
-        return -1;
-    }
-    double scaled = parsed * 1000.0;
-    if (scaled < 0.0 || scaled > (double)UINT64_MAX) {
-        return -1;
-    }
-    *ratio_out = parsed;
-    *scaled_out = (uint64_t)(scaled + 0.5);
-    return 0;
-}
-
-static int compute_ticks_from_ms(int ms, const char *flag_name) {
-    int64_t interval_us = param_check_interval_us;
-    if (interval_us <= 0) {
-        fprintf(stderr, "Invalid sampling interval while processing %s\n", flag_name);
-        exit(1);
-    }
-
-    int64_t total_us = (int64_t)ms * 1000;
-    int64_t ticks64 = (total_us + interval_us - 1) / interval_us;
-    if (ticks64 <= 0 || ticks64 > INT_MAX) {
-        fprintf(stderr, "Value for %s results in unsupported tick count (%lld)\n",
-                flag_name, (long long)ticks64);
-        exit(1);
-    }
-
-    return (int)ticks64;
-}
-
 static void parse_flags(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         if (!strncmp(argv[i], "--interval=", 11)) {
-            if (parse_ms_option(argv[i] + 11, 1, 10000, &param_check_interval_us) != 0) {
+            if (tsd_parse_ms_option(argv[i] + 11, 1, 10000, &param_check_interval_us) != 0) {
                 die_invalid_option("--interval", argv[i] + 11);
             }
         } else if (!strncmp(argv[i], "--down-count=", 13)) {
-            if (parse_int_option(argv[i] + 13, 1, 100, &param_down_count) != 0) {
+            if (tsd_parse_int_option(argv[i] + 13, 1, 100, &param_down_count) != 0) {
                 die_invalid_option("--down-count", argv[i] + 13);
             }
         } else if (!strncmp(argv[i], "--up-count=", 11)) {
-            if (parse_int_option(argv[i] + 11, 1, 100, &param_up_count) != 0) {
+            if (tsd_parse_int_option(argv[i] + 11, 1, 100, &param_up_count) != 0) {
                 die_invalid_option("--up-count", argv[i] + 11);
             }
         } else if (!strncmp(argv[i], "--down-ratio=", 13)) {
-            if (parse_ratio_option(argv[i] + 13, 1.0, 10.0, &param_down_ratio, &param_down_ratio_milli) != 0) {
+            if (tsd_parse_ratio_option(argv[i] + 13, 1.0, 10.0, &param_down_ratio, &param_down_ratio_milli) != 0) {
                 die_invalid_option("--down-ratio", argv[i] + 13);
             }
         } else if (!strncmp(argv[i], "--cooldown-down=", 16)) {
-            if (parse_int_option(argv[i] + 16, 1, 3600000, &param_cooldown_down_ms) != 0) {
+            if (tsd_parse_int_option(argv[i] + 16, 1, 3600000, &param_cooldown_down_ms) != 0) {
                 die_invalid_option("--cooldown-down", argv[i] + 16);
             }
         } else if (!strncmp(argv[i], "--cooldown-up=", 14)) {
-            if (parse_int_option(argv[i] + 14, 1, 3600000, &param_cooldown_up_ms) != 0) {
+            if (tsd_parse_int_option(argv[i] + 14, 1, 3600000, &param_cooldown_up_ms) != 0) {
                 die_invalid_option("--cooldown-up", argv[i] + 14);
             }
         } else if (!strncmp(argv[i], "--min-dwell=", 12)) {
-            if (parse_int_option(argv[i] + 12, 1, 3600000, &param_min_dwell_ms) != 0) {
+            if (tsd_parse_int_option(argv[i] + 12, 1, 3600000, &param_min_dwell_ms) != 0) {
                 die_invalid_option("--min-dwell", argv[i] + 12);
             }
         } else if (!strcmp(argv[i], "--no-avx512")) {
@@ -172,19 +110,19 @@ static void parse_flags(int argc, char **argv) {
         } else if (!strcmp(argv[i], "--allow-avx512")) {
             param_allow_avx512 = 1;
         } else if (!strncmp(argv[i], "--memory-guard-div=", 20)) {
-            if (parse_int_option(argv[i] + 20, 1, 1000, &param_memory_guard_divisor) != 0) {
+            if (tsd_parse_int_option(argv[i] + 20, 1, 1000, &param_memory_guard_divisor) != 0) {
                 die_invalid_option("--memory-guard-div", argv[i] + 20);
             }
         } else if (!strncmp(argv[i], "--memory-guard-offset=", 23)) {
-            if (parse_int_option(argv[i] + 23, 0, 1000000, &param_memory_guard_offset_milli) != 0) {
+            if (tsd_parse_int_option(argv[i] + 23, 0, 1000000, &param_memory_guard_offset_milli) != 0) {
                 die_invalid_option("--memory-guard-offset", argv[i] + 23);
             }
         } else if (!strncmp(argv[i], "--duration-sec=", 15)) {
-            if (parse_int_option(argv[i] + 15, 1, 86400, &demo_duration_sec) != 0) {
+            if (tsd_parse_int_option(argv[i] + 15, 1, 86400, &demo_duration_sec) != 0) {
                 die_invalid_option("--duration-sec", argv[i] + 15);
             }
         } else if (!strncmp(argv[i], "--work-iters=", 13)) {
-            if (parse_int_option(argv[i] + 13, 1, INT_MAX, &work_iters) != 0) {
+            if (tsd_parse_int_option(argv[i] + 13, 1, INT_MAX, &work_iters) != 0) {
                 die_invalid_option("--work-iters", argv[i] + 13);
             }
         } else if (!strcmp(argv[i], "--help")) {
@@ -202,10 +140,31 @@ static void parse_flags(int argc, char **argv) {
         param_down_ratio_milli = 1;
     }
 
-    // Convert ms to ticks after parsing all flags (interval might change order)
-    cooldown_down_ticks = compute_ticks_from_ms(param_cooldown_down_ms, "--cooldown-down");
-    cooldown_up_ticks   = compute_ticks_from_ms(param_cooldown_up_ms, "--cooldown-up");
-    min_dwell_ticks     = compute_ticks_from_ms(param_min_dwell_ms, "--min-dwell");
+    long long raw_ticks = 0;
+    if (tsd_compute_ticks_from_ms(param_check_interval_us, param_cooldown_down_ms, &cooldown_down_ticks, &raw_ticks) != 0) {
+        if (errno == EINVAL) {
+            fprintf(stderr, "Invalid sampling interval while processing %s\n", "--cooldown-down");
+        } else {
+            fprintf(stderr, "Value for %s results in unsupported tick count (%lld)\n", "--cooldown-down", raw_ticks);
+        }
+        exit(1);
+    }
+    if (tsd_compute_ticks_from_ms(param_check_interval_us, param_cooldown_up_ms, &cooldown_up_ticks, &raw_ticks) != 0) {
+        if (errno == EINVAL) {
+            fprintf(stderr, "Invalid sampling interval while processing %s\n", "--cooldown-up");
+        } else {
+            fprintf(stderr, "Value for %s results in unsupported tick count (%lld)\n", "--cooldown-up", raw_ticks);
+        }
+        exit(1);
+    }
+    if (tsd_compute_ticks_from_ms(param_check_interval_us, param_min_dwell_ms, &min_dwell_ticks, &raw_ticks) != 0) {
+        if (errno == EINVAL) {
+            fprintf(stderr, "Invalid sampling interval while processing %s\n", "--min-dwell");
+        } else {
+            fprintf(stderr, "Value for %s results in unsupported tick count (%lld)\n", "--min-dwell", raw_ticks);
+        }
+        exit(1);
+    }
 }
 
 // ============================================================================
@@ -544,59 +503,6 @@ typedef struct {
     int memory_bound;
 } thermal_eval_t;
 
-static inline uint64_t update_ewma(uint64_t prev, uint64_t sample, unsigned shift) {
-    if (prev == 0 || shift == 0) {
-        return sample;
-    }
-    if (sample == prev) {
-        return prev;
-    }
-    if (sample > prev) {
-        uint64_t delta = sample - prev;
-        uint64_t step = delta >> shift;
-        if (step == 0) step = 1;
-        uint64_t next = prev + step;
-        return next > sample ? sample : next;
-    }
-    uint64_t delta = prev - sample;
-    uint64_t step = delta >> shift;
-    if (step == 0) step = 1;
-    uint64_t next = prev - step;
-    return next < sample ? sample : next;
-}
-
-static uint32_t compute_trimmed_mean(const uint32_t *values, size_t count) {
-    if (count == 0) {
-        return 0;
-    }
-    uint32_t scratch[RATIO_HISTORY];
-    if (count > RATIO_HISTORY) count = RATIO_HISTORY;
-    memcpy(scratch, values, count * sizeof(uint32_t));
-    for (size_t i = 1; i < count; ++i) {
-        uint32_t key = scratch[i];
-        size_t j = i;
-        while (j > 0 && scratch[j - 1] > key) {
-            scratch[j] = scratch[j - 1];
-            --j;
-        }
-        scratch[j] = key;
-    }
-    if (count <= 2) {
-        uint64_t sum = 0;
-        for (size_t i = 0; i < count; ++i) sum += scratch[i];
-        return (uint32_t)(sum / count);
-    }
-    size_t start = 1;
-    size_t end = count - 1;
-    uint64_t sum = 0;
-    size_t samples = 0;
-    for (size_t i = start; i < end; ++i) {
-        sum += scratch[i];
-        samples++;
-    }
-    return samples ? (uint32_t)(sum / samples) : scratch[count / 2];
-}
-
 static long perf_event_open_sys(struct perf_event_attr *hw_event, pid_t pid, int cpu, int group_fd, unsigned long flags) {
     return syscall(__NR_perf_event_open, hw_event, pid, cpu, group_fd, flags);
 }
@@ -776,11 +682,11 @@ static int evaluate_thermal_state(perf_ctx_t *ctx, thermal_eval_t *out) {
                          ? (llc_now - llc_before) : 0;
     uint64_t mpki_milli = delta_insns ? (delta_llc * MPKI_SCALE) / delta_insns : 0;
 
-    ctx->fast_cpi = update_ewma(ctx->fast_cpi, current_cpi, FAST_EWMA_SHIFT);
-    ctx->slow_cpi = update_ewma(ctx->slow_cpi, current_cpi, SLOW_EWMA_SHIFT);
+    ctx->fast_cpi = tsd_update_ewma(ctx->fast_cpi, current_cpi, FAST_EWMA_SHIFT);
+    ctx->slow_cpi = tsd_update_ewma(ctx->slow_cpi, current_cpi, SLOW_EWMA_SHIFT);
     if (ctx->slow_cpi == 0) ctx->slow_cpi = current_cpi ?: (ctx->baseline_cpi ?: 1000);
-    ctx->fast_llc_mpki = update_ewma(ctx->fast_llc_mpki, mpki_milli, FAST_EWMA_SHIFT);
-    ctx->slow_llc_mpki = update_ewma(ctx->slow_llc_mpki, mpki_milli, SLOW_EWMA_SHIFT);
+    ctx->fast_llc_mpki = tsd_update_ewma(ctx->fast_llc_mpki, mpki_milli, FAST_EWMA_SHIFT);
+    ctx->slow_llc_mpki = tsd_update_ewma(ctx->slow_llc_mpki, mpki_milli, SLOW_EWMA_SHIFT);
 
     uint64_t reference_cpi = ctx->slow_cpi ?: (ctx->baseline_cpi ?: 1);
     __uint128_t ratio_num = (__uint128_t)current_cpi * 1000u;
@@ -791,7 +697,7 @@ static int evaluate_thermal_state(perf_ctx_t *ctx, thermal_eval_t *out) {
     uint32_t stored_ratio = (ratio_milli > UINT32_MAX) ? UINT32_MAX : (uint32_t)ratio_milli;
     ctx->ratio_history[ctx->ratio_history_cursor] = stored_ratio;
     ctx->ratio_history_cursor = (ctx->ratio_history_cursor + 1) % RATIO_HISTORY;
-    ctx->ratio_trimmed_milli = compute_trimmed_mean(ctx->ratio_history, ctx->ratio_history_count);
+    ctx->ratio_trimmed_milli = tsd_compute_trimmed_mean(ctx->ratio_history, ctx->ratio_history_count);
 
     uint64_t baseline_mpki = ctx->baseline_llc_mpki_milli ?: 1000;
     uint64_t mpki_reference = ctx->slow_llc_mpki ?: mpki_milli;
