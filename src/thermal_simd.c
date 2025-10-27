@@ -353,12 +353,12 @@ static void atomic_patch_strict_wx(simd_width_t new_width) {
     __atomic_store_n((uint64_t*)inactive->code, patch_qword, __ATOMIC_SEQ_CST);
     serialize_instruction_stream();
     if (mprotect(inactive_page, pagesize, PROT_READ | PROT_EXEC) != 0) goto unlock;
+    __atomic_store_n(&current_width, new_width, __ATOMIC_RELEASE);
+    __atomic_store_n(&current_width_byte, (unsigned char)new_width, __ATOMIC_RELEASE);
     __atomic_store_n(&active_trampoline, inactive, __ATOMIC_SEQ_CST);
     patch_slot_t *tmp = trampoline_ctx.active;
     trampoline_ctx.active = trampoline_ctx.inactive;
     trampoline_ctx.inactive = tmp;
-    __atomic_store_n(&current_width, new_width, __ATOMIC_RELEASE);
-    __atomic_store_n(&current_width_byte, (unsigned char)new_width, __ATOMIC_RELEASE);
     __atomic_store_n(&trampoline_initialized, 1, __ATOMIC_RELEASE);
     printf("Patched to %s (strict W^X)\\n", new_width == SIMD_AVX512 ? "AVX-512" : new_width == SIMD_AVX2 ? "AVX2" : "SSE4.1");
 unlock:
