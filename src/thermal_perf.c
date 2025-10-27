@@ -1,5 +1,5 @@
 #define _GNU_SOURCE
-#include "thermal_perf.h"
+#include <thermal/simd/thermal_perf.h>
 
 #include <errno.h>
 #include <inttypes.h>
@@ -15,7 +15,7 @@
 #include <time.h>
 #include <unistd.h>
 
-#include "statistics.h"
+#include <thermal/simd/statistics.h>
 
 #define RATIO_HISTORY TSD_RATIO_HISTORY
 #define FAST_EWMA_SHIFT 2

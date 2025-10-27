@@ -1,4 +1,4 @@
-#include "thermal_cpu.h"
+#include <thermal/simd/thermal_cpu.h>
 
 #include <cpuid.h>
 #include <stddef.h>

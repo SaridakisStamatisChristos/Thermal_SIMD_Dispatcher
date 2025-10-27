@@ -1,4 +1,4 @@
-#include "thermal_config.h"
+#include <thermal/simd/thermal_config.h>
 
 #include <errno.h>
 #include <limits.h>
@@ -6,7 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "config_parser.h"
+#include <thermal/simd/config_parser.h>
 
 static const tsd_runtime_config k_default_config = {
     .check_interval_us = 50000,

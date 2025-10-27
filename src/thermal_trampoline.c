@@ -1,4 +1,4 @@
-#include "thermal_trampoline.h"
+#include <thermal/simd/thermal_trampoline.h>
 
 #include <errno.h>
 #include <inttypes.h>
@@ -12,7 +12,7 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 
-#include "thermal_cpu.h"
+#include <thermal/simd/thermal_cpu.h>
 
 #ifdef TSD_ENABLE_TESTS
 #include "thermal_simd_test.h"

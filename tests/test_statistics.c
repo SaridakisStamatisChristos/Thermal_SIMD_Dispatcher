@@ -1,4 +1,4 @@
-#include "statistics.h"
+#include <thermal/simd/statistics.h>
 
 #include <inttypes.h>
 #include <stdint.h>

@@ -3,8 +3,8 @@
 
 #include <stdint.h>
 
-#include "thermal_config.h"
-#include "thermal_simd_internal.h"
+#include <thermal/simd/simd_width.h>
+#include <thermal/simd/thermal_config.h>
 
 extern uint8_t g_tsd_avx_available;
 
