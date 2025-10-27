@@ -678,7 +678,7 @@ static int evaluate_thermal_state(perf_ctx_t *ctx, thermal_eval_t *out) {
 // 5. ADAPTIVE MANAGER
 // ============================================================================
 
-static volatile int running = 1;
+_Atomic int running = 1;
 
 void* thermal_monitor_thread(void *arg) {
     perf_ctx_t *ctx = (perf_ctx_t*)arg;
@@ -689,7 +689,7 @@ void* thermal_monitor_thread(void *arg) {
     CPU_ZERO(&cpuset);
     CPU_SET((size_t)ctx->pinned_cpu, &cpuset);
     (void)sched_setaffinity(0, sizeof(cpuset), &cpuset);
-    while (running) {
+    while (__atomic_load_n(&running, __ATOMIC_ACQUIRE)) {
         usleep((useconds_t)param_check_interval_us);
         dwell_ticks++;
         if (cooldown > 0) { cooldown--; continue; }
@@ -756,7 +756,7 @@ int main(int argc, char **argv) {
             printf("."); fflush(stdout);
         }
         printf("\\n\\nDone.\\n");
-        running = 0;
+        __atomic_store_n(&running, 0, __ATOMIC_RELEASE);
         pthread_join(monitor, NULL);
         cleanup_perf(perf);
     } else {
