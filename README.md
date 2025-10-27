@@ -46,3 +46,6 @@ tests/compile.sh && tests/smoke.sh
 - Requires SSE4.1 (fails fast otherwise)
 - Uses `perf_event_open`; in containers, add `--cap-add=SYS_ADMIN` or run privileged
 - XMM‑only payloads to minimize downclocks and power
+
+## License
+This project is distributed under a proprietary commercial license. See [LICENSE](LICENSE) for full terms.
