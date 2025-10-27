@@ -1,5 +1,6 @@
 CC ?= gcc
-CFLAGS ?= -O2 -march=native -pthread -fPIC -mno-avx -Wall -Wextra -Wshadow -Wconversion -Wcast-qual -Wformat=2 -Werror=return-type
+ARCHFLAGS ?=
+CFLAGS ?= -O2 -pthread -fPIC -mno-avx -Wall -Wextra -Wshadow -Wconversion -Wcast-qual -Wformat=2 -Werror=return-type
 LDFLAGS ?= -pthread
 
 BIN := thermal_simd
@@ -10,7 +11,7 @@ SRC := src/thermal_simd.c
 all: $(BIN)
 
 $(BIN): $(SRC)
-	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
+	$(CC) $(CFLAGS) $(ARCHFLAGS) -o $@ $< $(LDFLAGS)
 
 run: $(BIN)
 	./$(BIN)
