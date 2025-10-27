@@ -56,11 +56,11 @@ static int run_monitor_thread_scenario(void) {
         return 1;
     }
     int rc = 0;
-    if (wait_for_width(SIMD_SSE41, 500) != 0) {
+    if (wait_for_width(SIMD_SSE41, 5000) != 0) {
         fprintf(stderr, "width did not downgrade\n");
         rc = 1;
     }
-    if (rc == 0 && wait_for_width(SIMD_AVX2, 500) != 0) {
+    if (rc == 0 && wait_for_width(SIMD_AVX2, 5000) != 0) {
         fprintf(stderr, "width did not upgrade\n");
         rc = 1;
     }

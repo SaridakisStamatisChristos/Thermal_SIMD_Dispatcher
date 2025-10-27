@@ -78,8 +78,8 @@ jobs:
 
       - name: Generate coverage report
         run: |
-          ~/.local/bin/gcovr --root . --txt coverage-summary.txt
-          ~/.local/bin/gcovr --root . --xml-pretty coverage.xml
+          ~/.local/bin/gcovr --root . --object-directory build --txt --output coverage-summary.txt
+          ~/.local/bin/gcovr --root . --object-directory build --xml-pretty --output coverage.xml
 
       - name: Upload coverage artifact
         uses: actions/upload-artifact@v4
