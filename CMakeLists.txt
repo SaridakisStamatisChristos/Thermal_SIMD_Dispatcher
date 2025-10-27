@@ -25,3 +25,11 @@ add_executable(test_statistics tests/test_statistics.c)
 target_link_libraries(test_statistics PRIVATE thermal_simd_core)
 target_compile_options(test_statistics PRIVATE -Wall -Wextra)
 add_test(NAME statistics COMMAND test_statistics)
+
+add_executable(test_thermal_simd
+    tests/test_thermal_simd.c
+    src/thermal_simd.c)
+target_compile_definitions(test_thermal_simd PRIVATE TSD_ENABLE_TESTS)
+target_link_libraries(test_thermal_simd PRIVATE thermal_simd_core pthread)
+target_compile_options(test_thermal_simd PRIVATE -Wall -Wextra -O1 -pthread -fPIC)
+add_test(NAME thermal_simd COMMAND test_thermal_simd)

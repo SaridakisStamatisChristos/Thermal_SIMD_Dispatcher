@@ -20,10 +20,28 @@
 
 #include "config_parser.h"
 #include "statistics.h"
+#include "thermal_simd_internal.h"
+#ifdef TSD_ENABLE_TESTS
+#include "thermal_simd_test.h"
+#endif
 
 // ============================================================================
 // 0. RUNTIME CONFIGURATION (CLI-tunable)
 // ============================================================================
+
+static const int TSD_DEFAULT_CHECK_INTERVAL_US = 50000;
+static const int TSD_DEFAULT_DOWN_COUNT = 3;
+static const int TSD_DEFAULT_UP_COUNT = 5;
+static const double TSD_DEFAULT_DOWN_RATIO = 1.5;
+static const uint64_t TSD_DEFAULT_DOWN_RATIO_MILLI = 1500;
+static const int TSD_DEFAULT_COOLDOWN_DOWN_MS = 1000;
+static const int TSD_DEFAULT_COOLDOWN_UP_MS = 2000;
+static const int TSD_DEFAULT_ALLOW_AVX512 = 0;
+static const int TSD_DEFAULT_MIN_DWELL_MS = 200;
+static const int TSD_DEFAULT_MEMORY_GUARD_DIVISOR = 5;
+static const int TSD_DEFAULT_MEMORY_GUARD_OFFSET_MILLI = 200;
+static const int TSD_DEFAULT_DEMO_DURATION_SEC = 10;
+static const int TSD_DEFAULT_WORK_ITERS = 10000000;
 
 static int param_check_interval_us = 50000;     // Check every 50ms
 static int param_down_count = 3;                // Downgrade after 3 throttles
@@ -43,15 +61,19 @@ static int param_memory_guard_offset_milli = 200; // Additional guard (milli-rat
 #define MPKI_SCALE 1000000ULL
 
 // Demo controls
-static int demo_duration_sec = 10;              // --duration-sec
-static int work_iters = 10000000;               // --work-iters
+static int demo_duration_sec = TSD_DEFAULT_DEMO_DURATION_SEC;              // --duration-sec
+static int work_iters = TSD_DEFAULT_WORK_ITERS;               // --work-iters
 
 // Computed tick values (set after CLI parsing)
 static int cooldown_down_ticks;
 static int cooldown_up_ticks;
 static int min_dwell_ticks;
 
-static void print_usage(const char *prog) {
+static void
+#ifdef TSD_ENABLE_TESTS
+__attribute__((unused))
+#endif
+print_usage(const char *prog) {
     printf("Usage: %s [OPTIONS]\n", prog);
     printf("Options:\n");
     printf("  --interval=MS          Check interval in milliseconds (default: 50)\n");
@@ -70,11 +92,45 @@ static void print_usage(const char *prog) {
     printf("  --help                 Show this help\n");
 }
 
-static void die_invalid_option(const char *option, const char *value) {
+static void
+#ifdef TSD_ENABLE_TESTS
+__attribute__((unused))
+#endif
+die_invalid_option(const char *option, const char *value) {
     fprintf(stderr, "Invalid value for %s: '%s'\n", option, value);
     exit(1);
 }
 
+static int refresh_tick_config(void) {
+    long long raw_ticks = 0;
+    if (tsd_compute_ticks_from_ms(param_check_interval_us, param_cooldown_down_ms, &cooldown_down_ticks, &raw_ticks) != 0) {
+        if (errno == EINVAL) {
+            fprintf(stderr, "Invalid sampling interval while processing %s\n", "--cooldown-down");
+        } else {
+            fprintf(stderr, "Value for %s results in unsupported tick count (%lld)\n", "--cooldown-down", raw_ticks);
+        }
+        return -1;
+    }
+    if (tsd_compute_ticks_from_ms(param_check_interval_us, param_cooldown_up_ms, &cooldown_up_ticks, &raw_ticks) != 0) {
+        if (errno == EINVAL) {
+            fprintf(stderr, "Invalid sampling interval while processing %s\n", "--cooldown-up");
+        } else {
+            fprintf(stderr, "Value for %s results in unsupported tick count (%lld)\n", "--cooldown-up", raw_ticks);
+        }
+        return -1;
+    }
+    if (tsd_compute_ticks_from_ms(param_check_interval_us, param_min_dwell_ms, &min_dwell_ticks, &raw_ticks) != 0) {
+        if (errno == EINVAL) {
+            fprintf(stderr, "Invalid sampling interval while processing %s\n", "--min-dwell");
+        } else {
+            fprintf(stderr, "Value for %s results in unsupported tick count (%lld)\n", "--min-dwell", raw_ticks);
+        }
+        return -1;
+    }
+    return 0;
+}
+
+#ifndef TSD_ENABLE_TESTS
 static void parse_flags(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         if (!strncmp(argv[i], "--interval=", 11)) {
@@ -140,42 +196,15 @@ static void parse_flags(int argc, char **argv) {
         param_down_ratio_milli = 1;
     }
 
-    long long raw_ticks = 0;
-    if (tsd_compute_ticks_from_ms(param_check_interval_us, param_cooldown_down_ms, &cooldown_down_ticks, &raw_ticks) != 0) {
-        if (errno == EINVAL) {
-            fprintf(stderr, "Invalid sampling interval while processing %s\n", "--cooldown-down");
-        } else {
-            fprintf(stderr, "Value for %s results in unsupported tick count (%lld)\n", "--cooldown-down", raw_ticks);
-        }
-        exit(1);
-    }
-    if (tsd_compute_ticks_from_ms(param_check_interval_us, param_cooldown_up_ms, &cooldown_up_ticks, &raw_ticks) != 0) {
-        if (errno == EINVAL) {
-            fprintf(stderr, "Invalid sampling interval while processing %s\n", "--cooldown-up");
-        } else {
-            fprintf(stderr, "Value for %s results in unsupported tick count (%lld)\n", "--cooldown-up", raw_ticks);
-        }
-        exit(1);
-    }
-    if (tsd_compute_ticks_from_ms(param_check_interval_us, param_min_dwell_ms, &min_dwell_ticks, &raw_ticks) != 0) {
-        if (errno == EINVAL) {
-            fprintf(stderr, "Invalid sampling interval while processing %s\n", "--min-dwell");
-        } else {
-            fprintf(stderr, "Value for %s results in unsupported tick count (%lld)\n", "--min-dwell", raw_ticks);
-        }
+    if (refresh_tick_config() != 0) {
         exit(1);
     }
 }
+#endif
 
 // ============================================================================
 // 1. CORRECT FEATURE DETECTION (with AVX bit check)
 // ============================================================================
-
-typedef enum {
-    SIMD_SSE41,
-    SIMD_AVX2,
-    SIMD_AVX512
-} simd_width_t;
 
 static int cpu_has_sse41(void) {
     unsigned int eax, ebx, ecx, edx;
@@ -191,7 +220,7 @@ static int cpu_has_avx_bit(void) {
     return (ecx & (1u << 28)) != 0; // CPUID.1:ECX[28] = AVX
 }
 
-static uint8_t g_avx_available = 0; // Global for shim AVX transition guard
+uint8_t g_avx_available = 0; // Global for shim AVX transition guard
 
 static int check_xsave_support(void) {
     unsigned int eax, ebx, ecx, edx;
@@ -206,6 +235,12 @@ static int check_xsave_support(void) {
 }
 
 static simd_width_t detect_max_simd(void) {
+#ifdef TSD_ENABLE_TESTS
+    extern simd_width_t (*tsd_test_detect_hook)(void);
+    if (tsd_test_detect_hook) {
+        return tsd_test_detect_hook();
+    }
+#endif
     unsigned int eax, ebx, ecx, edx;
     if (!cpu_has_sse41()) {
         return SIMD_SSE41; // Will error out in main
@@ -259,6 +294,23 @@ static _Atomic unsigned char last_patch_attempt;  // For diagnostics
 static _Atomic unsigned char last_patched_width;  // For diagnostics
 static int warned_llc_unavailable = 0;
 static int warned_perf_group_layout = 0;
+static _Atomic uint64_t workload_iterations = 0;
+
+#ifdef TSD_ENABLE_TESTS
+simd_width_t (*tsd_test_detect_hook)(void) = NULL;
+static const uint8_t *test_patch_override[3] = { NULL, NULL, NULL };
+static size_t test_patch_override_size[3] = { 0, 0, 0 };
+static char test_last_patch_error[256] = {0};
+static tsd_patch_fail_stage_t test_patch_fail_stage = TSD_PATCH_FAIL_NONE;
+typedef struct {
+    uint32_t ratios[128];
+    size_t count;
+    size_t index;
+    uint32_t mpki;
+    int enabled;
+} test_perf_script_t;
+static test_perf_script_t test_perf_script = {0};
+#endif
 
 // CORRECTED ENCODINGS (verified with objdump)
 // XMM-only variants (128-bit, scalar-exact, minimal power/downclock)
@@ -337,7 +389,60 @@ static const char* width_name_from_byte(unsigned char width) {
     }
 }
 
-static void crash_signal_handler(int sig) {
+static void log_errno_message(const char *prefix, int err) {
+    if (!prefix) {
+        return;
+    }
+    fprintf(stderr, "[thermal_simd] %s: %s\n", prefix, strerror(err));
+}
+
+static void report_patch_error(const char *context, int err) {
+    log_errno_message(context, err);
+#ifdef TSD_ENABLE_TESTS
+    if (context) {
+        snprintf(test_last_patch_error, sizeof(test_last_patch_error), "%s: %s", context, strerror(err));
+    }
+#endif
+}
+
+static void
+#ifdef TSD_ENABLE_TESTS
+__attribute__((unused))
+#endif
+try_perf_ioctl(int fd, unsigned long request, const char *what) {
+    if (fd < 0) {
+        return;
+    }
+    if (ioctl(fd, request, 0) != 0) {
+        log_errno_message(what, errno);
+    }
+}
+
+static int should_fallback_to_software(int err) {
+    return err == EACCES || err == EPERM || err == ENOENT || err == EOPNOTSUPP;
+}
+
+static uint64_t timespec_diff_ns(const struct timespec *start, const struct timespec *end) {
+    if (!start || !end) {
+        return 0;
+    }
+    time_t sec = end->tv_sec - start->tv_sec;
+    long nsec = end->tv_nsec - start->tv_nsec;
+    if (nsec < 0) {
+        sec -= 1;
+        nsec += 1000000000L;
+    }
+    if (sec < 0) {
+        return 0;
+    }
+    return (uint64_t)sec * 1000000000ULL + (uint64_t)nsec;
+}
+
+static void
+#ifdef TSD_ENABLE_TESTS
+__attribute__((unused))
+#endif
+crash_signal_handler(int sig) {
     safe_write_str(STDERR_FILENO, "\n[thermal_simd] caught signal ");
     safe_write_uint(STDERR_FILENO, (unsigned int)sig);
     safe_write_str(STDERR_FILENO, " while patching. last_patched=");
@@ -353,7 +458,13 @@ static void crash_signal_handler(int sig) {
     _exit(128 + sig);
 }
 
-static void install_signal_handlers(void) {
+static void
+#ifdef TSD_ENABLE_TESTS
+__attribute__((unused))
+#endif
+install_signal_handlers(void)
+#ifndef TSD_ENABLE_TESTS
+{
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = crash_signal_handler;
@@ -362,21 +473,30 @@ static void install_signal_handlers(void) {
     sigaction(SIGSEGV, &sa, NULL);
     sigaction(SIGBUS, &sa, NULL);
 }
+#else
+{}
+#endif
 
 int init_double_buffer_trampoline(void) {
     long pagesize_long = sysconf(_SC_PAGESIZE);
     if (pagesize_long <= 0) {
+        log_errno_message("failed to query page size", errno ? errno : EINVAL);
         return -1;
     }
     size_t pagesize = (size_t)pagesize_long;
     trampoline_ctx.page_a = create_rx_page();
     trampoline_ctx.page_b = create_rx_page();
-    if (!trampoline_ctx.page_a || !trampoline_ctx.page_b) return -1;
+    if (!trampoline_ctx.page_a || !trampoline_ctx.page_b) {
+        log_errno_message("failed to allocate RX trampoline pages", errno ? errno : ENOMEM);
+        return -1;
+    }
     trampoline_ctx.active = (patch_slot_t*)trampoline_ctx.page_a;
     trampoline_ctx.inactive = (patch_slot_t*)trampoline_ctx.page_b;
     if (mprotect(trampoline_ctx.page_a, pagesize, PROT_READ | PROT_EXEC) != 0 ||
-        mprotect(trampoline_ctx.page_b, pagesize, PROT_READ | PROT_EXEC) != 0)
+        mprotect(trampoline_ctx.page_b, pagesize, PROT_READ | PROT_EXEC) != 0) {
+        report_patch_error("mprotect(initial RX)", errno);
         return -1;
+    }
     __atomic_store_n(&active_trampoline, trampoline_ctx.active, __ATOMIC_SEQ_CST);
     return 0;
 }
@@ -398,11 +518,27 @@ static void atomic_patch_strict_wx(simd_width_t new_width) {
     const uint8_t *patch_data = NULL;
     size_t patch_size = 0;
     switch (new_width) {
-        case SIMD_SSE41:  patch_data = PATCH_SSE41;  patch_size = sizeof(PATCH_SSE41);  break;
-        case SIMD_AVX2:   patch_data = PATCH_AVX2;   patch_size = sizeof(PATCH_AVX2);   break;
-        case SIMD_AVX512: patch_data = PATCH_AVX512; patch_size = sizeof(PATCH_AVX512); break;
-        default: goto unlock;
+        case SIMD_SSE41:
+            patch_data = PATCH_SSE41;
+            patch_size = sizeof(PATCH_SSE41);
+            break;
+        case SIMD_AVX2:
+            patch_data = PATCH_AVX2;
+            patch_size = sizeof(PATCH_AVX2);
+            break;
+        case SIMD_AVX512:
+            patch_data = PATCH_AVX512;
+            patch_size = sizeof(PATCH_AVX512);
+            break;
+        default:
+            goto unlock;
     }
+#ifdef TSD_ENABLE_TESTS
+    if (test_patch_override[new_width]) {
+        patch_data = test_patch_override[new_width];
+        patch_size = test_patch_override_size[new_width];
+    }
+#endif
     __atomic_store_n(&last_patch_attempt, (unsigned char)new_width, __ATOMIC_RELAXED);
     if (patch_size == 0 || (patch_size % sizeof(uint64_t)) != 0) {
         goto unlock;
@@ -416,14 +552,38 @@ static void atomic_patch_strict_wx(simd_width_t new_width) {
     if (!inactive) goto unlock;
     void *inactive_page = page_align(inactive, pagesize);
     if (!inactive_page) goto unlock;
-    if (mprotect(inactive_page, pagesize, PROT_READ | PROT_WRITE) != 0) goto unlock;
+    if (patch_size == 0) { goto unlock; }
+#ifdef TSD_ENABLE_TESTS
+    if (test_patch_fail_stage == TSD_PATCH_FAIL_PROTECT_WRITE) {
+        errno = EPERM;
+        report_patch_error("mprotect(trampoline write)", errno);
+        test_patch_fail_stage = TSD_PATCH_FAIL_NONE;
+        goto unlock;
+    }
+#endif
+    if (mprotect(inactive_page, pagesize, PROT_READ | PROT_WRITE) != 0) {
+        report_patch_error("mprotect(trampoline write)", errno);
+        goto unlock;
+    }
     for (size_t offset = 0; offset < patch_size; offset += sizeof(uint64_t)) {
         uint64_t chunk = 0;
         memcpy(&chunk, patch_data + offset, sizeof(uint64_t));
         __atomic_store_n((uint64_t*)(inactive->code + offset), chunk, __ATOMIC_SEQ_CST);
     }
     serialize_instruction_stream();
-    if (mprotect(inactive_page, pagesize, PROT_READ | PROT_EXEC) != 0) goto unlock;
+    if (patch_size == 0) { goto unlock; }
+#ifdef TSD_ENABLE_TESTS
+    if (test_patch_fail_stage == TSD_PATCH_FAIL_PROTECT_EXEC) {
+        errno = EPERM;
+        report_patch_error("mprotect(trampoline exec)", errno);
+        test_patch_fail_stage = TSD_PATCH_FAIL_NONE;
+        goto unlock;
+    }
+#endif
+    if (mprotect(inactive_page, pagesize, PROT_READ | PROT_EXEC) != 0) {
+        report_patch_error("mprotect(trampoline exec)", errno);
+        goto unlock;
+    }
     __atomic_store_n(&current_width, new_width, __ATOMIC_RELEASE);
     __atomic_store_n(&current_width_byte, (unsigned char)new_width, __ATOMIC_RELEASE);
     __atomic_store_n(&active_trampoline, inactive, __ATOMIC_SEQ_CST);
@@ -460,7 +620,10 @@ static int32_t simd_shim(int32_t a __attribute__((unused)),
     );
 }
 
-static inline void workload_once(void) { (void)simd_shim(42, 7); }
+static inline void workload_once(void) {
+    (void)simd_shim(42, 7);
+    __atomic_fetch_add(&workload_iterations, 1, __ATOMIC_RELAXED);
+}
 
 // ============================================================================
 // 4. PERFORMANCE MONITORING
@@ -473,7 +636,13 @@ typedef struct {
     uint64_t values[2];
 } perf_group_read_t;
 
-typedef struct {
+typedef enum {
+    PERF_MODE_NONE = 0,
+    PERF_MODE_HARDWARE,
+    PERF_MODE_SOFTWARE
+} perf_mode_t;
+
+typedef struct perf_ctx {
     int fd_cycles;
     int fd_insns;
     int fd_llc_misses;
@@ -492,6 +661,10 @@ typedef struct {
     perf_group_read_t last_group_read;
     int last_group_valid;
     uint64_t last_llc_value;
+    perf_mode_t mode;
+    int software_adaptation;
+    struct timespec sw_last_timestamp;
+    uint64_t sw_last_iterations;
 } perf_ctx_t;
 
 typedef struct {
@@ -507,18 +680,29 @@ static long perf_event_open_sys(struct perf_event_attr *hw_event, pid_t pid, int
     return syscall(__NR_perf_event_open, hw_event, pid, cpu, group_fd, flags);
 }
 
-static void enable_perf(perf_ctx_t* ctx) {
-    if (!ctx) return;
-    if (ctx->fd_cycles >= 0) { ioctl(ctx->fd_cycles, PERF_EVENT_IOC_RESET, 0);  ioctl(ctx->fd_cycles, PERF_EVENT_IOC_ENABLE, 0); }
-    if (ctx->fd_insns  >= 0) { ioctl(ctx->fd_insns,  PERF_EVENT_IOC_RESET, 0);  ioctl(ctx->fd_insns,  PERF_EVENT_IOC_ENABLE, 0); }
-    if (ctx->fd_llc_misses >= 0) { ioctl(ctx->fd_llc_misses, PERF_EVENT_IOC_RESET, 0); ioctl(ctx->fd_llc_misses, PERF_EVENT_IOC_ENABLE, 0); }
+static void
+#ifdef TSD_ENABLE_TESTS
+__attribute__((unused))
+#endif
+enable_perf(perf_ctx_t* ctx) {
+    if (!ctx || ctx->mode != PERF_MODE_HARDWARE) return;
+    try_perf_ioctl(ctx->fd_cycles, PERF_EVENT_IOC_RESET, "perf ioctl reset(cycles)");
+    try_perf_ioctl(ctx->fd_cycles, PERF_EVENT_IOC_ENABLE, "perf ioctl enable(cycles)");
+    try_perf_ioctl(ctx->fd_insns, PERF_EVENT_IOC_RESET, "perf ioctl reset(insns)");
+    try_perf_ioctl(ctx->fd_insns, PERF_EVENT_IOC_ENABLE, "perf ioctl enable(insns)");
+    try_perf_ioctl(ctx->fd_llc_misses, PERF_EVENT_IOC_RESET, "perf ioctl reset(llc)");
+    try_perf_ioctl(ctx->fd_llc_misses, PERF_EVENT_IOC_ENABLE, "perf ioctl enable(llc)");
 }
 
-static void disable_perf(perf_ctx_t* ctx) {
-    if (!ctx) return;
-    if (ctx->fd_cycles >= 0) ioctl(ctx->fd_cycles, PERF_EVENT_IOC_DISABLE, 0);
-    if (ctx->fd_insns  >= 0) ioctl(ctx->fd_insns,  PERF_EVENT_IOC_DISABLE, 0);
-    if (ctx->fd_llc_misses >= 0) ioctl(ctx->fd_llc_misses, PERF_EVENT_IOC_DISABLE, 0);
+static void
+#ifdef TSD_ENABLE_TESTS
+__attribute__((unused))
+#endif
+disable_perf(perf_ctx_t* ctx) {
+    if (!ctx || ctx->mode != PERF_MODE_HARDWARE) return;
+    try_perf_ioctl(ctx->fd_cycles, PERF_EVENT_IOC_DISABLE, "perf ioctl disable(cycles)");
+    try_perf_ioctl(ctx->fd_insns, PERF_EVENT_IOC_DISABLE, "perf ioctl disable(insns)");
+    try_perf_ioctl(ctx->fd_llc_misses, PERF_EVENT_IOC_DISABLE, "perf ioctl disable(llc)");
 }
 
 static perf_ctx_t* init_perf_monitoring(void) {
@@ -529,6 +713,11 @@ static perf_ctx_t* init_perf_monitoring(void) {
     ctx->fd_llc_misses = -1;
     ctx->last_group_valid = 0;
     ctx->last_llc_value = 0;
+    ctx->mode = PERF_MODE_NONE;
+    ctx->software_adaptation = 0;
+    ctx->sw_last_iterations = 0;
+    ctx->sw_last_timestamp.tv_sec = 0;
+    ctx->sw_last_timestamp.tv_nsec = 0;
 
     cpu_set_t cpuset;
     CPU_ZERO(&cpuset);
@@ -544,6 +733,14 @@ static perf_ctx_t* init_perf_monitoring(void) {
         }
     }
 
+    const char *force_sw_env = getenv("TSD_FAKE_PERF");
+    int force_sw = force_sw_env && force_sw_env[0] != '\0' && strcmp(force_sw_env, "0") != 0;
+
+    if (force_sw) {
+        ctx->mode = PERF_MODE_SOFTWARE;
+        return ctx;
+    }
+
     struct perf_event_attr pe = {0};
     pe.type = PERF_TYPE_HARDWARE;
     pe.size = sizeof(pe);
@@ -555,13 +752,35 @@ static perf_ctx_t* init_perf_monitoring(void) {
     // CPU cycles (group leader). Attach to this process on the pinned core.
     pe.config = PERF_COUNT_HW_CPU_CYCLES;
     long fd_cycles = perf_event_open_sys(&pe, 0, ctx->pinned_cpu, -1, 0);
-    if (fd_cycles < 0) { free(ctx); return NULL; }
+    if (fd_cycles < 0) {
+        int err = errno;
+        if (should_fallback_to_software(err)) {
+            log_errno_message("perf_event_open cycles (falling back to software)", err);
+            ctx->mode = PERF_MODE_SOFTWARE;
+            return ctx;
+        }
+        log_errno_message("perf_event_open cycles", err);
+        free(ctx);
+        return NULL;
+    }
     ctx->fd_cycles = (int)fd_cycles;
 
     // Instructions (in the same per-CPU group)
     pe.config = PERF_COUNT_HW_INSTRUCTIONS;
     long fd_insns = perf_event_open_sys(&pe, 0, ctx->pinned_cpu, ctx->fd_cycles, 0);
-    if (fd_insns < 0) { close(ctx->fd_cycles); free(ctx); return NULL; }
+    if (fd_insns < 0) {
+        int err = errno;
+        close(ctx->fd_cycles);
+        ctx->fd_cycles = -1;
+        if (should_fallback_to_software(err)) {
+            log_errno_message("perf_event_open instructions (falling back to software)", err);
+            ctx->mode = PERF_MODE_SOFTWARE;
+            return ctx;
+        }
+        log_errno_message("perf_event_open instructions", err);
+        free(ctx);
+        return NULL;
+    }
     ctx->fd_insns = (int)fd_insns;
 
     // LLC misses (separate counter, also bound to the pinned CPU)
@@ -581,6 +800,7 @@ static perf_ctx_t* init_perf_monitoring(void) {
         ctx->fd_llc_misses = (int)fd_llc_misses;
     }
 
+    ctx->mode = PERF_MODE_HARDWARE;
     return ctx;
 }
 
@@ -601,6 +821,40 @@ static inline uint64_t scale_counter(uint64_t delta, uint64_t time_enabled, uint
 }
 
 static void measure_baseline_cpi(perf_ctx_t *ctx) {
+    if (!ctx) return;
+    if (ctx->mode == PERF_MODE_SOFTWARE) {
+        struct timespec start = {0}, end = {0};
+        const int loops = 100000;
+        uint64_t before_iters = __atomic_load_n(&workload_iterations, __ATOMIC_RELAXED);
+        clock_gettime(CLOCK_MONOTONIC, &start);
+        for (int i = 0; i < loops; i++) workload_once();
+        clock_gettime(CLOCK_MONOTONIC, &end);
+        uint64_t after_iters = __atomic_load_n(&workload_iterations, __ATOMIC_RELAXED);
+        uint64_t delta_iters = (after_iters > before_iters) ? (after_iters - before_iters) : (uint64_t)loops;
+        uint64_t elapsed_ns = timespec_diff_ns(&start, &end);
+        if (elapsed_ns == 0) {
+            elapsed_ns = 1;
+        }
+        uint64_t surrogate_cpi = (delta_iters == 0) ? 1000 : ((elapsed_ns * 1000ULL) / delta_iters);
+        if (surrogate_cpi == 0) {
+            surrogate_cpi = 1000;
+        }
+        ctx->baseline_cpi = surrogate_cpi;
+        ctx->baseline_llc_mpki_milli = 1000;
+        ctx->slow_cpi = ctx->fast_cpi = ctx->baseline_cpi;
+        ctx->slow_llc_mpki = ctx->fast_llc_mpki = ctx->baseline_llc_mpki_milli;
+        ctx->ratio_history_count = 0;
+        ctx->ratio_history_cursor = 0;
+        ctx->ratio_trimmed_milli = (param_down_ratio_milli > UINT32_MAX) ? UINT32_MAX : (uint32_t)param_down_ratio_milli;
+        ctx->last_group_valid = 0;
+        ctx->last_llc_value = 0;
+        ctx->software_adaptation = 1;
+        ctx->sw_last_iterations = __atomic_load_n(&workload_iterations, __ATOMIC_RELAXED);
+        clock_gettime(CLOCK_MONOTONIC, &ctx->sw_last_timestamp);
+        printf("Baseline (software) CPI surrogate: %lu.%03lu\n", surrogate_cpi / 1000, surrogate_cpi % 1000);
+        printf("Baseline MPKI surrogate: %lu.%03lu\n", ctx->baseline_llc_mpki_milli / 1000, ctx->baseline_llc_mpki_milli % 1000);
+        return;
+    }
     perf_group_read_t rd_before = {0}, rd_after = {0};
     uint64_t llc_before = 0, llc_after = 0;
     ssize_t n = read(ctx->fd_cycles, &rd_before, sizeof(rd_before));
@@ -641,7 +895,107 @@ static void measure_baseline_cpi(perf_ctx_t *ctx) {
 }
 
 
+static int process_measurement(perf_ctx_t *ctx, thermal_eval_t *out, uint64_t current_cpi, uint64_t mpki_milli) {
+    if (!ctx) return 0;
+    ctx->fast_cpi = tsd_update_ewma(ctx->fast_cpi, current_cpi, FAST_EWMA_SHIFT);
+    ctx->slow_cpi = tsd_update_ewma(ctx->slow_cpi, current_cpi, SLOW_EWMA_SHIFT);
+    if (ctx->slow_cpi == 0) ctx->slow_cpi = current_cpi ?: (ctx->baseline_cpi ?: 1000);
+    ctx->fast_llc_mpki = tsd_update_ewma(ctx->fast_llc_mpki, mpki_milli, FAST_EWMA_SHIFT);
+    ctx->slow_llc_mpki = tsd_update_ewma(ctx->slow_llc_mpki, mpki_milli, SLOW_EWMA_SHIFT);
+
+    uint64_t reference_cpi = ctx->slow_cpi ?: (ctx->baseline_cpi ?: 1);
+    __uint128_t ratio_num = (__uint128_t)current_cpi * 1000u;
+    uint64_t ratio_milli = (uint64_t)((ratio_num + reference_cpi / 2) / reference_cpi);
+    if (ctx->ratio_history_count < RATIO_HISTORY) {
+        ctx->ratio_history_count++;
+    }
+    uint32_t stored_ratio = (ratio_milli > UINT32_MAX) ? UINT32_MAX : (uint32_t)ratio_milli;
+    ctx->ratio_history[ctx->ratio_history_cursor] = stored_ratio;
+    ctx->ratio_history_cursor = (ctx->ratio_history_cursor + 1) % RATIO_HISTORY;
+    ctx->ratio_trimmed_milli = tsd_compute_trimmed_mean(ctx->ratio_history, ctx->ratio_history_count);
+
+    uint64_t baseline_mpki = ctx->baseline_llc_mpki_milli ?: 1000;
+    uint64_t mpki_reference = ctx->slow_llc_mpki ?: mpki_milli;
+    __uint128_t mpki_ratio_num = (__uint128_t)mpki_reference * 1000u;
+    uint64_t mpki_ratio = (uint64_t)((mpki_ratio_num + baseline_mpki / 2) / baseline_mpki);
+    int memory_bound = ctx->fd_llc_misses >= 0 && mpki_ratio > 2500;
+
+    uint64_t dynamic_threshold = param_down_ratio_milli;
+    if (ctx->fast_cpi > ctx->slow_cpi) {
+        uint64_t delta = ctx->fast_cpi - ctx->slow_cpi;
+        uint64_t delta_ratio = (uint64_t)(((__uint128_t)delta * 1000u) / (ctx->slow_cpi ?: 1));
+        uint64_t slope_penalty = delta_ratio / 5;
+        if (slope_penalty > dynamic_threshold / 4) {
+            slope_penalty = dynamic_threshold / 4;
+        }
+        if (dynamic_threshold > slope_penalty) {
+            dynamic_threshold -= slope_penalty;
+        }
+    }
+    if (memory_bound) {
+        uint64_t guard = 0;
+        if (param_memory_guard_divisor > 0) {
+            guard = dynamic_threshold / (uint64_t)param_memory_guard_divisor;
+        }
+        guard += (uint64_t)param_memory_guard_offset_milli;
+        dynamic_threshold += guard;
+    }
+
+    uint64_t consensus_ratio = (ratio_milli + ctx->ratio_trimmed_milli) / 2;
+    uint64_t severity = (consensus_ratio > dynamic_threshold) ? (consensus_ratio - dynamic_threshold) : 0;
+
+    if (out) {
+        out->cpi_milli = current_cpi;
+        out->ratio_milli = (uint32_t)ratio_milli;
+        out->trimmed_ratio_milli = ctx->ratio_trimmed_milli;
+        out->llc_mpki_milli = mpki_milli;
+        out->severity_milli = severity;
+        out->memory_bound = memory_bound;
+    }
+
+    return severity > 0;
+}
+
 static int evaluate_thermal_state(perf_ctx_t *ctx, thermal_eval_t *out) {
+    if (!ctx) return 0;
+    if (ctx->mode == PERF_MODE_SOFTWARE) {
+#ifdef TSD_ENABLE_TESTS
+        if (test_perf_script.enabled && test_perf_script.count > 0) {
+            uint32_t ratio = test_perf_script.ratios[test_perf_script.index];
+            if (test_perf_script.index + 1 < test_perf_script.count) {
+                test_perf_script.index++;
+            }
+            uint64_t baseline = ctx->slow_cpi ?: (ctx->baseline_cpi ?: 1000);
+            if (baseline == 0) {
+                baseline = 1000;
+            }
+            uint64_t current_cpi = (uint64_t)(((__uint128_t)baseline * ratio + 500u) / 1000u);
+            return process_measurement(ctx, out, current_cpi, test_perf_script.mpki);
+        }
+#endif
+        if (!ctx->software_adaptation) {
+            ctx->sw_last_iterations = __atomic_load_n(&workload_iterations, __ATOMIC_RELAXED);
+            clock_gettime(CLOCK_MONOTONIC, &ctx->sw_last_timestamp);
+            ctx->software_adaptation = 1;
+            return 0;
+        }
+        struct timespec now = {0};
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        uint64_t now_iters = __atomic_load_n(&workload_iterations, __ATOMIC_RELAXED);
+        uint64_t delta_iters = (now_iters >= ctx->sw_last_iterations) ? (now_iters - ctx->sw_last_iterations) : 0;
+        uint64_t delta_ns = timespec_diff_ns(&ctx->sw_last_timestamp, &now);
+        ctx->sw_last_iterations = now_iters;
+        ctx->sw_last_timestamp = now;
+        if (delta_iters == 0 || delta_ns == 0) {
+            return 0;
+        }
+        uint64_t current_cpi = (delta_ns * 1000ULL) / delta_iters;
+        if (current_cpi == 0) {
+            current_cpi = ctx->baseline_cpi ?: 1000;
+        }
+        return process_measurement(ctx, out, current_cpi, 0);
+    }
+
     perf_group_read_t rd_now = {0};
     uint64_t llc_now = 0;
     ssize_t n = read(ctx->fd_cycles, &rd_now, sizeof(rd_now));
@@ -682,63 +1036,7 @@ static int evaluate_thermal_state(perf_ctx_t *ctx, thermal_eval_t *out) {
                          ? (llc_now - llc_before) : 0;
     uint64_t mpki_milli = delta_insns ? (delta_llc * MPKI_SCALE) / delta_insns : 0;
 
-    ctx->fast_cpi = tsd_update_ewma(ctx->fast_cpi, current_cpi, FAST_EWMA_SHIFT);
-    ctx->slow_cpi = tsd_update_ewma(ctx->slow_cpi, current_cpi, SLOW_EWMA_SHIFT);
-    if (ctx->slow_cpi == 0) ctx->slow_cpi = current_cpi ?: (ctx->baseline_cpi ?: 1000);
-    ctx->fast_llc_mpki = tsd_update_ewma(ctx->fast_llc_mpki, mpki_milli, FAST_EWMA_SHIFT);
-    ctx->slow_llc_mpki = tsd_update_ewma(ctx->slow_llc_mpki, mpki_milli, SLOW_EWMA_SHIFT);
-
-    uint64_t reference_cpi = ctx->slow_cpi ?: (ctx->baseline_cpi ?: 1);
-    __uint128_t ratio_num = (__uint128_t)current_cpi * 1000u;
-    uint64_t ratio_milli = (uint64_t)((ratio_num + reference_cpi / 2) / reference_cpi);
-    if (ctx->ratio_history_count < RATIO_HISTORY) {
-        ctx->ratio_history_count++;
-    }
-    uint32_t stored_ratio = (ratio_milli > UINT32_MAX) ? UINT32_MAX : (uint32_t)ratio_milli;
-    ctx->ratio_history[ctx->ratio_history_cursor] = stored_ratio;
-    ctx->ratio_history_cursor = (ctx->ratio_history_cursor + 1) % RATIO_HISTORY;
-    ctx->ratio_trimmed_milli = tsd_compute_trimmed_mean(ctx->ratio_history, ctx->ratio_history_count);
-
-    uint64_t baseline_mpki = ctx->baseline_llc_mpki_milli ?: 1000;
-    uint64_t mpki_reference = ctx->slow_llc_mpki ?: mpki_milli;
-    __uint128_t mpki_ratio_num = (__uint128_t)mpki_reference * 1000u;
-    uint64_t mpki_ratio = (uint64_t)((mpki_ratio_num + baseline_mpki / 2) / baseline_mpki);
-    int memory_bound = ctx->fd_llc_misses >= 0 && mpki_ratio > 2500; // >2.5x baseline cache pressure.
-
-    uint64_t dynamic_threshold = param_down_ratio_milli;
-    if (ctx->fast_cpi > ctx->slow_cpi) {
-        uint64_t delta = ctx->fast_cpi - ctx->slow_cpi;
-        uint64_t delta_ratio = (uint64_t)(((__uint128_t)delta * 1000u) / (ctx->slow_cpi ?: 1));
-        uint64_t slope_penalty = delta_ratio / 5; // respond faster to sharp CPI climbs
-        if (slope_penalty > dynamic_threshold / 4) {
-            slope_penalty = dynamic_threshold / 4;
-        }
-        if (dynamic_threshold > slope_penalty) {
-            dynamic_threshold -= slope_penalty;
-        }
-    }
-    if (memory_bound) {
-        uint64_t guard = 0;
-        if (param_memory_guard_divisor > 0) {
-            guard = dynamic_threshold / (uint64_t)param_memory_guard_divisor;
-        }
-        guard += (uint64_t)param_memory_guard_offset_milli;
-        dynamic_threshold += guard;
-    }
-
-    uint64_t consensus_ratio = (ratio_milli + ctx->ratio_trimmed_milli) / 2;
-    uint64_t severity = (consensus_ratio > dynamic_threshold) ? (consensus_ratio - dynamic_threshold) : 0;
-
-    if (out) {
-        out->cpi_milli = current_cpi;
-        out->ratio_milli = (uint32_t)ratio_milli;
-        out->trimmed_ratio_milli = ctx->ratio_trimmed_milli;
-        out->llc_mpki_milli = mpki_milli;
-        out->severity_milli = severity;
-        out->memory_bound = memory_bound;
-    }
-
-    return severity > 0;
+    return process_measurement(ctx, out, current_cpi, mpki_milli);
 }
 
 
@@ -747,6 +1045,201 @@ static int evaluate_thermal_state(perf_ctx_t *ctx, thermal_eval_t *out) {
 // ============================================================================
 
 _Atomic int running = 1;
+
+#ifdef TSD_ENABLE_TESTS
+static void tsd_test_clear_fake_perf_script_internal(void) {
+    test_perf_script.enabled = 0;
+    test_perf_script.count = 0;
+    test_perf_script.index = 0;
+    test_perf_script.mpki = 0;
+    memset(test_perf_script.ratios, 0, sizeof(test_perf_script.ratios));
+}
+
+void tsd_test_clear_fake_perf_script(void) {
+    tsd_test_clear_fake_perf_script_internal();
+}
+
+void tsd_test_set_fake_perf_script(const uint32_t *ratios, size_t count, uint32_t mpki) {
+    tsd_test_clear_fake_perf_script_internal();
+    if (!ratios || count == 0) {
+        return;
+    }
+    if (count > sizeof(test_perf_script.ratios) / sizeof(test_perf_script.ratios[0])) {
+        count = sizeof(test_perf_script.ratios) / sizeof(test_perf_script.ratios[0]);
+    }
+    for (size_t i = 0; i < count; ++i) {
+        test_perf_script.ratios[i] = ratios[i];
+    }
+    test_perf_script.count = count;
+    test_perf_script.index = 0;
+    test_perf_script.mpki = mpki;
+    test_perf_script.enabled = 1;
+}
+
+void tsd_test_clear_patch_overrides(void) {
+    for (size_t i = 0; i < 3; ++i) {
+        test_patch_override[i] = NULL;
+        test_patch_override_size[i] = 0;
+    }
+}
+
+void tsd_test_override_patch(simd_width_t width, const uint8_t *bytes, size_t len) {
+    if (width < SIMD_SSE41 || width > SIMD_AVX512) {
+        return;
+    }
+    test_patch_override[width] = bytes;
+    test_patch_override_size[width] = len;
+}
+
+const uint8_t* tsd_test_patch_bytes(simd_width_t width, size_t *len) {
+    if (len) {
+        *len = 0;
+    }
+    switch (width) {
+        case SIMD_SSE41:
+            if (len) *len = sizeof(PATCH_SSE41);
+            return PATCH_SSE41;
+        case SIMD_AVX2:
+            if (len) *len = sizeof(PATCH_AVX2);
+            return PATCH_AVX2;
+        case SIMD_AVX512:
+            if (len) *len = sizeof(PATCH_AVX512);
+            return PATCH_AVX512;
+        default:
+            return NULL;
+    }
+}
+
+void tsd_test_set_detect_override(simd_width_t (*fn)(void)) {
+    tsd_test_detect_hook = fn;
+}
+
+void tsd_test_clear_detect_override(void) {
+    tsd_test_detect_hook = NULL;
+}
+
+void tsd_test_force_patch_failure(tsd_patch_fail_stage_t stage) {
+    test_patch_fail_stage = stage;
+}
+
+const char* tsd_test_last_patch_error(void) {
+    return test_last_patch_error;
+}
+
+void tsd_test_run_workload(int iterations) {
+    if (iterations < 0) {
+        return;
+    }
+    for (int i = 0; i < iterations; ++i) {
+        workload_once();
+    }
+}
+
+void tsd_test_reset_workload_counter(void) {
+    __atomic_store_n(&workload_iterations, 0, __ATOMIC_RELAXED);
+}
+
+void tsd_test_set_running(int value) {
+    __atomic_store_n(&running, value, __ATOMIC_RELEASE);
+}
+
+simd_width_t tsd_test_current_width(void) {
+    return __atomic_load_n(&current_width, __ATOMIC_RELAXED);
+}
+
+unsigned char tsd_test_last_patched_width(void) {
+    return __atomic_load_n(&last_patched_width, __ATOMIC_RELAXED);
+}
+
+void tsd_test_patch(simd_width_t width) {
+    atomic_patch_strict_wx(width);
+}
+
+perf_ctx_t* tsd_test_init_perf(void) {
+    return init_perf_monitoring();
+}
+
+void tsd_test_measure_baseline(perf_ctx_t *ctx) {
+    measure_baseline_cpi(ctx);
+}
+
+void tsd_test_cleanup_perf(perf_ctx_t *ctx) {
+    cleanup_perf(ctx);
+}
+
+simd_width_t tsd_test_detect_host_max(void) {
+    simd_width_t (*saved)(void) = tsd_test_detect_hook;
+    tsd_test_detect_hook = NULL;
+    simd_width_t result = detect_max_simd();
+    tsd_test_detect_hook = saved;
+    return result;
+}
+
+void tsd_test_set_policy_counts(int down, int up) {
+    if (down > 0) {
+        param_down_count = down;
+    }
+    if (up > 0) {
+        param_up_count = up;
+    }
+}
+
+void tsd_test_set_timing(int interval_us, int cooldown_down_ms, int cooldown_up_ms, int dwell_ms) {
+    if (interval_us > 0) {
+        param_check_interval_us = interval_us;
+    }
+    if (cooldown_down_ms >= 0) {
+        param_cooldown_down_ms = cooldown_down_ms;
+    }
+    if (cooldown_up_ms >= 0) {
+        param_cooldown_up_ms = cooldown_up_ms;
+    }
+    if (dwell_ms >= 0) {
+        param_min_dwell_ms = dwell_ms;
+    }
+}
+
+int tsd_test_refresh_ticks(void) {
+    return refresh_tick_config();
+}
+
+static void tsd_test_reset_patch_state(void) {
+    __atomic_store_n(&current_width, SIMD_SSE41, __ATOMIC_RELAXED);
+    __atomic_store_n(&current_width_byte, (unsigned char)SIMD_SSE41, __ATOMIC_RELAXED);
+    __atomic_store_n(&trampoline_initialized, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&active_trampoline, trampoline_ctx.active, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&last_patch_attempt, (unsigned char)SIMD_SSE41, __ATOMIC_RELAXED);
+    __atomic_store_n(&last_patched_width, (unsigned char)SIMD_SSE41, __ATOMIC_RELAXED);
+    test_last_patch_error[0] = '\0';
+    test_patch_fail_stage = TSD_PATCH_FAIL_NONE;
+}
+
+void tsd_test_reset_runtime(void) {
+    param_check_interval_us = TSD_DEFAULT_CHECK_INTERVAL_US;
+    param_down_count = TSD_DEFAULT_DOWN_COUNT;
+    param_up_count = TSD_DEFAULT_UP_COUNT;
+    param_down_ratio = TSD_DEFAULT_DOWN_RATIO;
+    param_down_ratio_milli = TSD_DEFAULT_DOWN_RATIO_MILLI;
+    param_cooldown_down_ms = TSD_DEFAULT_COOLDOWN_DOWN_MS;
+    param_cooldown_up_ms = TSD_DEFAULT_COOLDOWN_UP_MS;
+    param_allow_avx512 = TSD_DEFAULT_ALLOW_AVX512;
+    param_min_dwell_ms = TSD_DEFAULT_MIN_DWELL_MS;
+    param_memory_guard_divisor = TSD_DEFAULT_MEMORY_GUARD_DIVISOR;
+    param_memory_guard_offset_milli = TSD_DEFAULT_MEMORY_GUARD_OFFSET_MILLI;
+    demo_duration_sec = TSD_DEFAULT_DEMO_DURATION_SEC;
+    work_iters = TSD_DEFAULT_WORK_ITERS;
+    warned_llc_unavailable = 0;
+    warned_perf_group_layout = 0;
+    g_avx_available = 0;
+    tsd_test_clear_detect_override();
+    tsd_test_clear_patch_overrides();
+    tsd_test_clear_fake_perf_script_internal();
+    tsd_test_reset_patch_state();
+    __atomic_store_n(&running, 1, __ATOMIC_RELAXED);
+    __atomic_store_n(&workload_iterations, 0, __ATOMIC_RELAXED);
+    refresh_tick_config();
+}
+#endif
 
 void* thermal_monitor_thread(void *arg) {
     perf_ctx_t *ctx = (perf_ctx_t*)arg;
@@ -798,6 +1291,7 @@ void* thermal_monitor_thread(void *arg) {
 // 6. MAIN
 // ============================================================================
 
+#ifndef TSD_ENABLE_TESTS
 int main(int argc, char **argv) {
     printf("=== Production Thermal-Aware SIMD Dispatcher ===\\n\\n");
     parse_flags(argc, argv);
@@ -823,9 +1317,14 @@ int main(int argc, char **argv) {
     atomic_patch_strict_wx(max_width);
     perf_ctx_t *perf = init_perf_monitoring();
     if (perf) {
-        enable_perf(perf);
-        measure_baseline_cpi(perf);
-        printf("Perf target CPU: %d (monitor thread on CPU %d)\\n", perf->pinned_cpu, perf->monitor_cpu);
+        if (perf->mode == PERF_MODE_HARDWARE) {
+            enable_perf(perf);
+            measure_baseline_cpi(perf);
+            printf("Perf target CPU: %d (monitor thread on CPU %d)\\n", perf->pinned_cpu, perf->monitor_cpu);
+        } else {
+            printf("\nHardware performance counters unavailable; using software telemetry fallback.\\n");
+            measure_baseline_cpi(perf);
+        }
         pthread_t monitor;
         int monitor_started = 0;
         int monitor_err = pthread_create(&monitor, NULL, thermal_monitor_thread, perf);
@@ -859,3 +1358,4 @@ int main(int argc, char **argv) {
     }
     return 0;
 }
+#endif
