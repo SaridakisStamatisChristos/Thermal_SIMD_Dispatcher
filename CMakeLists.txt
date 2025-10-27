@@ -7,6 +7,11 @@ set(THERMAL_SIMD_DISPATCHER_CPU_FLAGS "-msse4.1" CACHE STRING "CPU-specific comp
 add_library(thermal_simd_core STATIC
     src/config_parser.c
     src/statistics.c
+    src/thermal_config.c
+    src/thermal_cpu.c
+    src/thermal_trampoline.c
+    src/thermal_perf.c
+    src/thermal_signals.c
 )
 target_include_directories(thermal_simd_core PUBLIC src)
 
