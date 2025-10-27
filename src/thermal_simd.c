@@ -921,6 +921,7 @@ int main(int argc, char **argv) {
         measure_baseline_cpi(perf);
         printf("Perf target CPU: %d (monitor thread on CPU %d)\\n", perf->pinned_cpu, perf->monitor_cpu);
         pthread_t monitor;
+        int monitor_started = 0;
         int monitor_err = pthread_create(&monitor, NULL, thermal_monitor_thread, perf);
         if (monitor_err != 0) {
             fprintf(stderr, "ERROR: Failed to start monitor thread: %s\n", strerror(monitor_err));
@@ -928,6 +929,7 @@ int main(int argc, char **argv) {
             cleanup_perf(perf);
             return 1;
         }
+        monitor_started = 1;
         printf("\\nRunning workload for %d seconds...\\n", demo_duration_sec);
         printf("Try: stress-ng --cpu 8 --cpu-load 100  (to simulate thermal load)\\n\\n");
         for (int sec = 0; sec < demo_duration_sec; sec++) {
@@ -936,7 +938,9 @@ int main(int argc, char **argv) {
         }
         printf("\\n\\nDone.\\n");
         __atomic_store_n(&running, 0, __ATOMIC_RELEASE);
-        pthread_join(monitor, NULL);
+        if (monitor_started) {
+            pthread_join(monitor, NULL);
+        }
         cleanup_perf(perf);
     } else {
         printf("\\nPerformance monitoring unavailable.\\n");
