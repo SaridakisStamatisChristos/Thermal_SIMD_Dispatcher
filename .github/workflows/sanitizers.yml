@@ -1,0 +1,45 @@
+name: Sanitizer Builds
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  sanitizers:
+    name: ${{ matrix.compiler }}-${{ matrix.sanitizer }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler: [gcc, clang]
+        sanitizer: [asan, ubsan, tsan]
+    env:
+      CTEST_OUTPUT_ON_FAILURE: 1
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build
+
+      - name: Configure
+        run: |
+          if [ "${{ matrix.compiler }}" = "gcc" ]; then
+            cxx_compiler=g++
+          else
+            cxx_compiler=clang++
+          fi
+          cmake -S . -B build -G Ninja \
+            -DBUILD_TESTING=ON \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DTSD_SANITIZER=${{ matrix.sanitizer }} \
+            -DCMAKE_C_COMPILER=${{ matrix.compiler }} \
+            -DCMAKE_CXX_COMPILER=${cxx_compiler}
+
+      - name: Build
+        run: cmake --build build --config RelWithDebInfo
+
+      - name: Run tests
+        run: ctest --test-dir build --output-on-failure

@@ -1,0 +1,44 @@
+name: perf-gate
+
+on:
+  workflow_call:
+    inputs:
+      baseline:
+        description: Path to the baseline file
+        required: false
+        default: tests/perf_smoke.baseline
+        type: string
+      threshold:
+        description: Maximum allowed regression ratio
+        required: false
+        default: 0.6
+        type: number
+
+jobs:
+  perf:
+    runs-on: ubuntu-latest
+    env:
+      CTEST_OUTPUT_ON_FAILURE: 1
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build
+
+      - name: Configure
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DBUILD_TESTING=ON \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo
+
+      - name: Build perf smoke benchmark
+        run: cmake --build build --target perf_smoke --config RelWithDebInfo
+
+      - name: Run perf smoke gate
+        run: |
+          python3 tools/perf_gate.py \
+            --baseline "${{ inputs.baseline }}" \
+            --threshold "${{ inputs.threshold }}" \
+            -- ./build/perf_smoke

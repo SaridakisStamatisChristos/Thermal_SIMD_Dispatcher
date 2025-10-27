@@ -1,0 +1,13 @@
+name: Perf Regression Gate
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  perf-smoke:
+    uses: ./.github/workflows/perf-gate.yml
+    with:
+      baseline: tests/perf_smoke.baseline
+      threshold: 0.6

@@ -6,6 +6,47 @@ set(THERMAL_SIMD_DISPATCHER_CPU_FLAGS "-msse4.1" CACHE STRING "CPU-specific comp
 
 include(CTest)
 
+option(TSD_ENABLE_COVERAGE "Enable coverage instrumentation" OFF)
+set(TSD_SANITIZER "" CACHE STRING "Sanitizer to enable (asan, ubsan, tsan)")
+
+if(TSD_ENABLE_COVERAGE)
+    add_compile_options(-fprofile-instr-generate -fcoverage-mapping)
+    add_link_options(-fprofile-instr-generate -fcoverage-mapping)
+endif()
+
+if(TSD_SANITIZER)
+    string(TOLOWER "${TSD_SANITIZER}" _tsd_sanitizer_kind)
+    if(_tsd_sanitizer_kind STREQUAL "asan")
+        set(_tsd_sanitizer_flag "address")
+    elseif(_tsd_sanitizer_kind STREQUAL "ubsan")
+        set(_tsd_sanitizer_flag "undefined")
+    elseif(_tsd_sanitizer_kind STREQUAL "tsan")
+        set(_tsd_sanitizer_flag "thread")
+    elseif(_tsd_sanitizer_kind STREQUAL "address" OR _tsd_sanitizer_kind STREQUAL "undefined" OR _tsd_sanitizer_kind STREQUAL "thread")
+        set(_tsd_sanitizer_flag "${_tsd_sanitizer_kind}")
+    else()
+        message(FATAL_ERROR "Unsupported sanitizer '${TSD_SANITIZER}'. Use asan, ubsan or tsan.")
+    endif()
+
+    set(_tsd_sanitizer_flags "-fsanitize=${_tsd_sanitizer_flag}")
+    add_compile_options(${_tsd_sanitizer_flags} -fno-omit-frame-pointer)
+    add_link_options(${_tsd_sanitizer_flags})
+
+    if(_tsd_sanitizer_kind STREQUAL "ubsan" OR _tsd_sanitizer_kind STREQUAL "undefined")
+        add_compile_options(-fno-sanitize-recover=undefined)
+        add_link_options(-fno-sanitize-recover=undefined)
+    endif()
+
+    if(_tsd_sanitizer_kind STREQUAL "asan" OR _tsd_sanitizer_kind STREQUAL "address")
+        add_link_options(-shared-libasan)
+    endif()
+
+    if(_tsd_sanitizer_kind STREQUAL "tsan" OR _tsd_sanitizer_kind STREQUAL "thread")
+        add_compile_options(-fPIE)
+        add_link_options(-pie)
+    endif()
+endif()
+
 file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/include/thermal/simd)
 configure_file(
     ${CMAKE_CURRENT_SOURCE_DIR}/include/thermal/simd/version.h.in
@@ -66,6 +107,11 @@ if(BUILD_TESTING)
     target_compile_options(test_thermal_simd PRIVATE -Wall -Wextra -O1 -pthread -fPIC)
     target_include_directories(test_thermal_simd PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME thermal_simd COMMAND test_thermal_simd)
+
+    add_executable(perf_smoke tests/perf_smoke.c)
+    target_link_libraries(perf_smoke PRIVATE thermal_simd_core_tests pthread m)
+    target_compile_definitions(perf_smoke PRIVATE TSD_ENABLE_TESTS)
+    target_compile_options(perf_smoke PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 
 install(TARGETS thermal_simd_core

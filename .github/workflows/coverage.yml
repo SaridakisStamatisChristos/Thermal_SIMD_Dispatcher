@@ -1,0 +1,66 @@
+name: Coverage
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  coverage:
+    runs-on: ubuntu-latest
+    env:
+      CTEST_OUTPUT_ON_FAILURE: 1
+      LLVM_PROFILE_FILE: build/profiles/%p.profraw
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang llvm ninja-build
+
+      - name: Configure
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DBUILD_TESTING=ON \
+            -DTSD_ENABLE_COVERAGE=ON \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_C_COMPILER=clang \
+            -DCMAKE_CXX_COMPILER=clang++
+
+      - name: Build
+        run: cmake --build build --config Debug
+
+      - name: Run tests
+        run: |
+          mkdir -p build/profiles
+          ctest --test-dir build --output-on-failure
+
+      - name: Generate coverage report
+        run: |
+          shopt -s nullglob
+          profiles=(build/profiles/*.profraw)
+          if [ ${#profiles[@]} -eq 0 ]; then
+            echo "No coverage profiles were generated" >&2
+            exit 1
+          fi
+          llvm-profdata merge -sparse "${profiles[@]}" -o build/coverage.profdata
+          llvm-cov export \
+            --format=lcov \
+            --instr-profile=build/coverage.profdata \
+            build/test_config_parser \
+            build/test_statistics \
+            build/test_thermal_simd > build/lcov.info
+          llvm-cov report \
+            --instr-profile=build/coverage.profdata \
+            build/test_config_parser \
+            build/test_statistics \
+            build/test_thermal_simd > build/coverage.txt
+
+      - name: Upload coverage artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: |
+            build/coverage.txt
+            build/lcov.info
