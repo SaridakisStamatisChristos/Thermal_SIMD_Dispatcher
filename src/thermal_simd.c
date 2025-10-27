@@ -754,7 +754,14 @@ int main(int argc, char **argv) {
     if (perf) {
         enable_perf(perf);
         measure_baseline_cpi(perf);
-        pthread_t monitor; pthread_create(&monitor, NULL, thermal_monitor_thread, perf);
+        pthread_t monitor;
+        int monitor_err = pthread_create(&monitor, NULL, thermal_monitor_thread, perf);
+        if (monitor_err != 0) {
+            fprintf(stderr, "ERROR: Failed to start monitor thread: %s\n", strerror(monitor_err));
+            __atomic_store_n(&running, 0, __ATOMIC_RELEASE);
+            cleanup_perf(perf);
+            return 1;
+        }
         printf("\\nRunning workload for %d seconds...\\n", demo_duration_sec);
         printf("Try: stress-ng --cpu 8 --cpu-load 100  (to simulate thermal load)\\n\\n");
         for (int sec = 0; sec < demo_duration_sec; sec++) {
