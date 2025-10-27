@@ -1,0 +1,34 @@
+name: perf-smoke
+
+on:
+  workflow_call:
+    inputs:
+      threshold_ns:
+        description: Maximum acceptable nanoseconds per iteration
+        required: false
+        type: number
+        default: 300
+      iterations:
+        description: Number of iterations to run in the benchmark
+        required: false
+        type: number
+        default: 5000000
+
+jobs:
+  perf-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure CMake
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build perf benchmark
+        run: cmake --build build --target perf_smoke --parallel
+
+      - name: Run perf benchmark
+        run: ./build/tests/perf_smoke
+        env:
+          TSD_PERF_THRESHOLD_NS: ${{ inputs.threshold_ns }}
+          TSD_PERF_ITERATIONS: ${{ inputs.iterations }}

@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.15)
-project(thermal_simd_dispatcher VERSION 0.1.0 LANGUAGES C)
+project(thermal_simd_dispatcher VERSION 0.1.0 LANGUAGES C CXX)
 set(CMAKE_C_STANDARD 11)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 set(THERMAL_SIMD_DISPATCHER_CPU_FLAGS "-msse4.1" CACHE STRING "CPU-specific compiler flags for thermal_simd")
 
@@ -66,6 +68,12 @@ if(BUILD_TESTING)
     target_compile_options(test_thermal_simd PRIVATE -Wall -Wextra -O1 -pthread -fPIC)
     target_include_directories(test_thermal_simd PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME thermal_simd COMMAND test_thermal_simd)
+
+    add_executable(perf_smoke tests/perf_smoke.cpp)
+    target_link_libraries(perf_smoke PRIVATE thermal_simd_core_tests)
+    target_compile_features(perf_smoke PRIVATE cxx_std_17)
+    target_compile_options(perf_smoke PRIVATE -Wall -Wextra -O3)
+    set_target_properties(perf_smoke PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
 endif()
 
 install(TARGETS thermal_simd_core
