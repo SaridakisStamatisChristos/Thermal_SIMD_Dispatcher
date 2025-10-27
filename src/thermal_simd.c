@@ -512,22 +512,22 @@ static perf_ctx_t* init_perf_monitoring(void) {
     pe.exclude_hv = 1;
     pe.read_format = PERF_FORMAT_GROUP | PERF_FORMAT_TOTAL_TIME_ENABLED | PERF_FORMAT_TOTAL_TIME_RUNNING;
 
-    // CPU cycles (group leader)
+    // CPU cycles (group leader). Attach per-CPU using pid=-1 so events follow the pinned core.
     pe.config = PERF_COUNT_HW_CPU_CYCLES;
-    long fd_cycles = perf_event_open_sys(&pe, 0, -1, -1, 0);
+    long fd_cycles = perf_event_open_sys(&pe, -1, ctx->pinned_cpu, -1, 0);
     if (fd_cycles < 0) { free(ctx); return NULL; }
     ctx->fd_cycles = (int)fd_cycles;
 
-    // Instructions (in same group)
+    // Instructions (in the same per-CPU group)
     pe.config = PERF_COUNT_HW_INSTRUCTIONS;
-    long fd_insns = perf_event_open_sys(&pe, 0, -1, ctx->fd_cycles, 0);
+    long fd_insns = perf_event_open_sys(&pe, -1, ctx->pinned_cpu, ctx->fd_cycles, 0);
     if (fd_insns < 0) { close(ctx->fd_cycles); free(ctx); return NULL; }
     ctx->fd_insns = (int)fd_insns;
 
-    // LLC misses (separate counter)
+    // LLC misses (separate counter, also bound to the pinned CPU)
     pe.read_format = 0;
     pe.config = PERF_COUNT_HW_CACHE_MISSES;
-    long fd_llc_misses = perf_event_open_sys(&pe, 0, -1, -1, 0);
+    long fd_llc_misses = perf_event_open_sys(&pe, -1, ctx->pinned_cpu, -1, 0);
     if (fd_llc_misses < 0) {
         close(ctx->fd_insns);
         close(ctx->fd_cycles);
