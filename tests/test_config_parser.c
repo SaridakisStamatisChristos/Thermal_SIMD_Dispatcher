@@ -57,6 +57,15 @@ static void test_parse_ratio_option(void) {
     check_int_eq((long long)scaled, 10000, "parse_ratio_option upper scaling");
 }
 
+static void test_parse_ratio_option_min_scaled(void) {
+    double ratio = 0.0;
+    uint64_t scaled = 0;
+    check_true(tsd_parse_ratio_option("0.0005", 0.0005, 2.0, &ratio, &scaled) == 0,
+               "parse_ratio_option accepts tiny positive value");
+    check_true(ratio > 0.0, "parse_ratio_option tiny ratio recorded");
+    check_int_eq((long long)scaled, 1, "parse_ratio_option minimum scaled clamped");
+}
+
 static void test_compute_ticks_from_ms(void) {
     int ticks = 0;
     long long raw = 0;
@@ -82,6 +91,7 @@ int main(void) {
     test_parse_int_option();
     test_parse_ms_option();
     test_parse_ratio_option();
+    test_parse_ratio_option_min_scaled();
     test_compute_ticks_from_ms();
     return 0;
 }

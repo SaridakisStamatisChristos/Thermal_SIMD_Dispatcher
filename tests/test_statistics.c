@@ -72,6 +72,20 @@ static void test_trimmed_mean_caps_history(void) {
     check_true(mean <= values[TSD_RATIO_HISTORY - 2], "trimmed mean excludes last element");
 }
 
+static void test_trimmed_mean_outlier_resilience(void) {
+    uint32_t values[] = {5000, 1003, 1001, 1000, 1002, 1005};
+    uint32_t mean = tsd_compute_trimmed_mean(values, sizeof(values) / sizeof(values[0]));
+    check_uint32_eq(mean, 1002, "trimmed mean suppresses single outlier");
+}
+
+static void test_ewma_convergence(void) {
+    uint64_t ewma = 0;
+    for (int i = 0; i < 10; ++i) {
+        ewma = tsd_update_ewma(ewma, 2000, 2);
+    }
+    check_true(ewma >= 1990 && ewma <= 2000, "ewma approaches steady state");
+}
+
 int main(void) {
     test_update_ewma_trending_up();
     test_update_ewma_trending_down();
@@ -79,5 +93,7 @@ int main(void) {
     test_trimmed_mean_basics();
     test_trimmed_mean_small_samples();
     test_trimmed_mean_caps_history();
+    test_trimmed_mean_outlier_resilience();
+    test_ewma_convergence();
     return 0;
 }
