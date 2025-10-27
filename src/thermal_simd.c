@@ -5,6 +5,7 @@
 #include <string.h>
 #include <limits.h>
 #include <errno.h>
+#include <time.h>
 #include <sys/mman.h>
 #include <sys/ioctl.h>
 #include <unistd.h>
@@ -690,7 +691,12 @@ void* thermal_monitor_thread(void *arg) {
     CPU_SET((size_t)ctx->pinned_cpu, &cpuset);
     (void)sched_setaffinity(0, sizeof(cpuset), &cpuset);
     while (__atomic_load_n(&running, __ATOMIC_ACQUIRE)) {
-        usleep((useconds_t)param_check_interval_us);
+        struct timespec interval = {
+            .tv_sec = param_check_interval_us / 1000000,
+            .tv_nsec = (long)(param_check_interval_us % 1000000) * 1000L,
+        };
+        while (nanosleep(&interval, &interval) == -1 && errno == EINTR) {
+        }
         dwell_ticks++;
         if (cooldown > 0) { cooldown--; continue; }
         if (dwell_ticks < min_dwell_ticks) { continue; }
