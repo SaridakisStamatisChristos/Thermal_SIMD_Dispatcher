@@ -1,0 +1,9 @@
+---
+- name: Reload systemd
+  command: systemctl daemon-reload
+
+- name: Restart runner service
+  service:
+    name: "{{ runner_service }}"
+    state: restarted
+    enabled: true
