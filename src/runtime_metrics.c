@@ -3,6 +3,8 @@
 #include <stdatomic.h>
 #include <stddef.h>
 
+#include <observability/metrics_exporter.h>
+
 static _Atomic uint64_t g_tsd_metric_counters[TSD_METRIC_COUNT];
 
 void tsd_metrics_increment(tsd_metric_counter_t id) {
@@ -55,4 +57,5 @@ void tsd_metrics_record_width_transition(simd_width_t from, simd_width_t to, int
     } else {
         tsd_metrics_increment(TSD_METRIC_PATCH_FAILURES);
     }
+    tsd_metrics_exporter_record_patch(from, to, rc, 0);
 }

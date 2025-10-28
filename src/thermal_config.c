@@ -41,6 +41,9 @@ static const tsd_runtime_config k_default_config = {
     .degraded_timeout_sec = 120,
     .degraded_policy_active = 0,
     .health_check_mode = 0,
+    .metrics_enabled = 1,
+    .metrics_port = 9464,
+    .metrics_bind_host = "127.0.0.1",
     .log_level = TSD_LOG_LEVEL_INFO,
     .policy = {0},
 };
@@ -196,6 +199,8 @@ void tsd_runtime_config_print_usage(const char *prog) {
     printf("  --thermal-ratio-weight=W Frequency ratio severity weight in milli [0-100000] (default: 0)\n");
     printf("  --duration-sec=S       Demo duration (default: 10)\n");
     printf("  --work-iters=N         Inner work iterations per second (default: 10000000)\n");
+    printf("  --metrics-port=P       Prometheus metrics port (0 to disable, default: %d)\n", k_default_config.metrics_port);
+    printf("  --metrics-bind=ADDR    Metrics bind address (default: %s)\n", k_default_config.metrics_bind_host);
     printf("  --degraded-timeout-sec=S Fail closed if hardware counters missing for S seconds (default: %d)\n",
            k_default_config.degraded_timeout_sec);
     printf("  --policy-slo-ratio=R   Predictive policy CPI target ratio (default: %.3f)\n",
@@ -288,6 +293,18 @@ int tsd_runtime_config_parse_cli(tsd_runtime_config *cfg, int argc, char **argv)
             if (tsd_parse_int_option(argv[i] + 13, 1, INT_MAX, &cfg->work_iters) != 0) {
                 die_invalid_option("--work-iters", argv[i] + 13);
             }
+        } else if (!strncmp(argv[i], "--metrics-port=", 15)) {
+            if (tsd_parse_int_option(argv[i] + 15, 0, 65535, &cfg->metrics_port) != 0) {
+                die_invalid_option("--metrics-port", argv[i] + 15);
+            }
+            cfg->metrics_enabled = cfg->metrics_port > 0;
+        } else if (!strncmp(argv[i], "--metrics-bind=", 15)) {
+            const char *value = argv[i] + 15;
+            size_t len = strlen(value);
+            if (len == 0 || len >= sizeof(cfg->metrics_bind_host)) {
+                die_invalid_option("--metrics-bind", value);
+            }
+            snprintf(cfg->metrics_bind_host, sizeof(cfg->metrics_bind_host), "%s", value);
         } else if (!strncmp(argv[i], "--degraded-timeout-sec=", 23)) {
             if (tsd_parse_int_option(argv[i] + 23, 1, 86400, &cfg->degraded_timeout_sec) != 0) {
                 die_invalid_option("--degraded-timeout-sec", argv[i] + 23);
@@ -339,6 +356,16 @@ int tsd_runtime_config_parse_cli(tsd_runtime_config *cfg, int argc, char **argv)
             tsd_runtime_config_print_usage(argv[0]);
             exit(1);
         }
+    }
+
+    if (cfg->metrics_port <= 0) {
+        cfg->metrics_port = 0;
+        cfg->metrics_enabled = 0;
+    } else if (!cfg->metrics_enabled) {
+        cfg->metrics_enabled = 1;
+    }
+    if (cfg->metrics_bind_host[0] == '\0') {
+        snprintf(cfg->metrics_bind_host, sizeof(cfg->metrics_bind_host), "%s", k_default_config.metrics_bind_host);
     }
 
     cfg->down_ratio_milli = (uint64_t)(cfg->down_ratio * 1000.0 + 0.5);

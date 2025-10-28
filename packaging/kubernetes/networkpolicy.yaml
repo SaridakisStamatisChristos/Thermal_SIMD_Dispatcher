@@ -1,0 +1,23 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: thermal-simd-metrics
+  labels:
+    app: thermal-simd
+spec:
+  podSelector:
+    matchLabels:
+      app: thermal-simd
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+        - podSelector:
+            matchLabels:
+              observability: allowed
+      ports:
+        - protocol: TCP
+          port: 9464

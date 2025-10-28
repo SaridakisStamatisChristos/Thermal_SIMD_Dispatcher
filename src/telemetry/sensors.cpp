@@ -5,6 +5,7 @@
 #include <mutex>
 
 #include <thermal/simd/logging.h>
+#include <observability/metrics_exporter.h>
 
 namespace telemetry {
 
@@ -35,7 +36,9 @@ bool SensorAdapterBase::is_available(int socket) const {
 
 SensorSample SensorAdapterBase::sample(int socket) {
     if (!sample_provider_) {
-        return degraded_sample(socket);
+        SensorSample sample = degraded_sample(socket);
+        tsd_metrics_exporter_record_sensor_health(name_.c_str(), socket, sample.health, sample.quality, sample.valid ? 1 : 0);
+        return sample;
     }
 
     try {
@@ -50,6 +53,7 @@ SensorSample SensorAdapterBase::sample(int socket) {
                 std::lock_guard<std::mutex> lock(mutex_);
                 last_good_samples_[socket] = sample;
             }
+            tsd_metrics_exporter_record_sensor_health(name_.c_str(), socket, sample.health, sample.quality, sample.valid ? 1 : 0);
             return sample;
         }
     } catch (const std::exception &ex) {
@@ -65,7 +69,9 @@ SensorSample SensorAdapterBase::sample(int socket) {
                      socket);
     }
 
-    return degraded_sample(socket);
+    SensorSample sample = degraded_sample(socket);
+    tsd_metrics_exporter_record_sensor_health(name_.c_str(), socket, sample.health, sample.quality, sample.valid ? 1 : 0);
+    return sample;
 }
 
 SensorSample SensorAdapterBase::degraded_sample(int socket) const {

@@ -25,6 +25,7 @@ set(THERMAL_SIMD_CORE_SOURCES
     src/telemetry/evaluator.cpp
     src/telemetry/history_store.cpp
     src/telemetry/sensors.cpp
+    src/observability/metrics.cpp
     src/thermal_config.c
     src/thermal_cpu.c
     src/thermal_trampoline.c
@@ -48,6 +49,20 @@ target_include_directories(thermal_simd_core
 add_executable(thermal_simd src/thermal_simd.c)
 target_compile_options(thermal_simd PRIVATE -O2 -pthread -fPIC -mno-avx ${THERMAL_SIMD_DISPATCHER_CPU_FLAGS})
 target_link_libraries(thermal_simd PRIVATE thermal_simd_core pthread)
+
+add_library(tsd_policy_tuner STATIC src/tools/policy_tuner/tuner.cpp)
+target_include_directories(tsd_policy_tuner
+    PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/include>
+        $<INSTALL_INTERFACE:include>
+)
+target_link_libraries(tsd_policy_tuner
+    PUBLIC
+        thermal_simd_core)
+
+add_executable(policy_tuner src/tools/policy_tuner/main.cpp)
+target_link_libraries(policy_tuner PRIVATE tsd_policy_tuner)
 
 if(BUILD_TESTING)
     add_library(thermal_simd_core_tests STATIC ${THERMAL_SIMD_CORE_SOURCES})
@@ -88,6 +103,11 @@ if(BUILD_TESTING)
     target_link_libraries(test_telemetry PRIVATE thermal_simd_core_tests)
     target_compile_options(test_telemetry PRIVATE -Wall -Wextra)
     add_test(NAME telemetry_adapters COMMAND test_telemetry)
+
+    add_executable(test_integration_metrics_tuner tests/integration/metrics_tuner.cpp)
+    target_link_libraries(test_integration_metrics_tuner PRIVATE tsd_policy_tuner pthread)
+    target_compile_options(test_integration_metrics_tuner PRIVATE -Wall -Wextra)
+    add_test(NAME integration_metrics_tuner COMMAND test_integration_metrics_tuner)
 endif()
 
 install(TARGETS thermal_simd_core
