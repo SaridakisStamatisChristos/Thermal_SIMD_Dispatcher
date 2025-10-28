@@ -18,7 +18,8 @@ typedef struct perf_ctx perf_ctx_t;
 typedef enum {
     TSD_PATCH_FAIL_NONE = 0,
     TSD_PATCH_FAIL_PROTECT_WRITE,
-    TSD_PATCH_FAIL_PROTECT_EXEC
+    TSD_PATCH_FAIL_PROTECT_EXEC,
+    TSD_PATCH_FAIL_PKU_WINDOW
 } tsd_patch_fail_stage_t;
 
 void tsd_test_reset_runtime(void);
