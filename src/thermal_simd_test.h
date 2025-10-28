@@ -39,7 +39,7 @@ void tsd_test_force_patch_failure(tsd_patch_fail_stage_t stage);
 simd_width_t tsd_test_current_width(void);
 unsigned char tsd_test_last_patched_width(void);
 simd_width_t tsd_test_detect_host_max(void);
-void tsd_test_patch(simd_width_t width);
+int tsd_test_patch(simd_width_t width);
 perf_ctx_t* tsd_test_init_perf(void);
 void tsd_test_measure_baseline(perf_ctx_t *ctx);
 void tsd_test_cleanup_perf(perf_ctx_t *ctx);

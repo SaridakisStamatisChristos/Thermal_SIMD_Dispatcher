@@ -22,13 +22,19 @@ static int wait_for_width(simd_width_t expected, int attempts) {
 }
 
 static int run_monitor_thread_scenario(void) {
+    int rc = 0;
+    int monitor_started = 0;
+    pthread_t thread = {0};
+    perf_ctx_t *ctx = NULL;
+
     setenv("TSD_FAKE_PERF", "1", 1);
     tsd_test_reset_runtime();
     tsd_test_set_policy_counts(1, 1);
     tsd_test_set_timing(1000, 1, 1, 1);
     if (tsd_test_refresh_ticks() != 0) {
         fprintf(stderr, "failed to refresh ticks\n");
-        return 1;
+        rc = 1;
+        goto out;
     }
     tsd_test_set_detect_override(force_avx2);
     size_t patch_len = 0;
@@ -37,25 +43,34 @@ static int run_monitor_thread_scenario(void) {
     tsd_test_override_patch(SIMD_AVX512, sse_patch, patch_len);
     if (init_double_buffer_trampoline() != 0) {
         fprintf(stderr, "failed to init trampoline\n");
-        return 1;
+        rc = 1;
+        goto out;
     }
-    tsd_test_patch(SIMD_SSE41);
-    perf_ctx_t *ctx = tsd_test_init_perf();
+    if (tsd_test_patch(SIMD_SSE41) != 0) {
+        fprintf(stderr, "failed to patch SSE4.1 baseline\n");
+        rc = 1;
+        goto out;
+    }
+    ctx = tsd_test_init_perf();
     if (!ctx) {
         fprintf(stderr, "failed to init perf context\n");
-        return 1;
+        rc = 1;
+        goto out;
     }
     tsd_test_measure_baseline(ctx);
     tsd_test_set_fake_perf_script((const uint32_t[]){2100, 900, 900, 900, 900, 900}, 6, 0);
-    tsd_test_patch(SIMD_AVX2);
+    if (tsd_test_patch(SIMD_AVX2) != 0) {
+        fprintf(stderr, "failed to patch AVX2 baseline\n");
+        rc = 1;
+        goto out;
+    }
     tsd_test_set_running(1);
-    pthread_t thread;
     if (pthread_create(&thread, NULL, thermal_monitor_thread, ctx) != 0) {
         fprintf(stderr, "failed to start monitor thread\n");
-        tsd_test_cleanup_perf(ctx);
-        return 1;
+        rc = 1;
+        goto out;
     }
-    int rc = 0;
+    monitor_started = 1;
     if (wait_for_width(SIMD_SSE41, 500) != 0) {
         fprintf(stderr, "width did not downgrade\n");
         rc = 1;
@@ -64,9 +79,39 @@ static int run_monitor_thread_scenario(void) {
         fprintf(stderr, "width did not upgrade\n");
         rc = 1;
     }
+    if (rc == 0) {
+        tsd_test_force_patch_failure(TSD_PATCH_FAIL_PROTECT_WRITE);
+        tsd_test_set_fake_perf_script((const uint32_t[]){2100, 900, 900, 900}, 4, 0);
+        usleep(20000);
+        if (tsd_test_current_width() != SIMD_AVX2) {
+            fprintf(stderr, "width changed unexpectedly after forced failure\n");
+            rc = 1;
+        }
+        tsd_test_force_patch_failure(TSD_PATCH_FAIL_NONE);
+    }
+    if (rc == 0) {
+        tsd_test_set_fake_perf_script((const uint32_t[]){2100, 2100, 2100, 900, 900}, 5, 0);
+        if (wait_for_width(SIMD_SSE41, 1000) != 0) {
+            fprintf(stderr, "width did not downgrade after failure cleared\n");
+            rc = 1;
+        }
+    }
+    if (rc == 0) {
+        tsd_test_set_fake_perf_script((const uint32_t[]){900, 900, 900}, 3, 0);
+        if (wait_for_width(SIMD_AVX2, 500) != 0) {
+            fprintf(stderr, "width did not upgrade after retry\n");
+            rc = 1;
+        }
+    }
+
+out:
     tsd_test_set_running(0);
-    pthread_join(thread, NULL);
-    tsd_test_cleanup_perf(ctx);
+    if (monitor_started) {
+        pthread_join(thread, NULL);
+    }
+    if (ctx) {
+        tsd_test_cleanup_perf(ctx);
+    }
     tsd_test_clear_detect_override();
     tsd_test_clear_fake_perf_script();
     tsd_test_clear_patch_overrides();
@@ -80,7 +125,10 @@ static int run_patch_failure_diagnostic(void) {
     const uint8_t *sse_patch = tsd_test_patch_bytes(SIMD_SSE41, &patch_len);
     tsd_test_override_patch(SIMD_AVX2, sse_patch, patch_len);
     tsd_test_force_patch_failure(TSD_PATCH_FAIL_PROTECT_WRITE);
-    tsd_test_patch(SIMD_AVX2);
+    if (tsd_test_patch(SIMD_AVX2) == 0) {
+        fprintf(stderr, "patch unexpectedly succeeded under forced failure\n");
+        return 1;
+    }
     const char *err = tsd_test_last_patch_error();
     if (!err || strstr(err, "mprotect(trampoline write)") == NULL) {
         fprintf(stderr, "expected patch error message, got '%s'\n", err ? err : "<null>");

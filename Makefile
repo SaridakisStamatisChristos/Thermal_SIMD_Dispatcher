@@ -12,8 +12,10 @@ src/thermal_perf.c src/thermal_signals.c
 
 all: $(BIN)
 
+INCLUDES := -Isrc -Iinclude
+
 $(BIN): $(SRC)
-	$(CC) $(CFLAGS) $(ARCHFLAGS) -Isrc -o $@ $(SRC) $(LDFLAGS)
+	$(CC) $(CFLAGS) $(ARCHFLAGS) $(INCLUDES) -o $@ $(SRC) $(LDFLAGS)
 
 run: $(BIN)
 	./$(BIN)

@@ -29,7 +29,7 @@ extern _Atomic unsigned char g_tsd_last_patch_attempt;
 extern _Atomic unsigned char g_tsd_last_patched_width;
 
 int tsd_trampoline_init(void);
-void tsd_trampoline_patch(simd_width_t new_width);
+int tsd_trampoline_patch(simd_width_t new_width);
 int init_double_buffer_trampoline(void);
 
 #ifdef TSD_ENABLE_TESTS

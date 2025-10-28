@@ -53,6 +53,9 @@ static void log_errno_message(const char *prefix, int err) {
 }
 
 static void report_patch_error(const char *context, int err) {
+    if (err) {
+        errno = err;
+    }
     log_errno_message(context, err);
 }
 
@@ -145,41 +148,49 @@ static const uint8_t* select_patch(simd_width_t width, size_t *len) {
     }
 }
 
-void tsd_trampoline_patch(simd_width_t new_width) {
+int tsd_trampoline_patch(simd_width_t new_width) {
+    int rc = 0;
     pthread_mutex_lock(&g_tsd_patch_lock);
     simd_width_t width = atomic_load_explicit(&g_tsd_current_width, memory_order_acquire);
     int initialized = atomic_load_explicit(&g_tsd_trampoline_initialized, memory_order_acquire);
     if (initialized && new_width == width) {
         pthread_mutex_unlock(&g_tsd_patch_lock);
-        return;
-    }
-    const uint8_t *patch_data = NULL;
-    size_t patch_size = 0;
-    patch_data = select_patch(new_width, &patch_size);
-    if (!patch_data || patch_size == 0) {
-        pthread_mutex_unlock(&g_tsd_patch_lock);
-        return;
+        return 0;
     }
 
-    size_t pagesize = (size_t)sysconf(_SC_PAGESIZE);
+    size_t patch_size = 0;
+    const uint8_t *patch_data = select_patch(new_width, &patch_size);
+    if (!patch_data || patch_size == 0) {
+        report_patch_error("invalid SIMD width", EINVAL);
+        rc = -1;
+        goto out_unlock;
+    }
+
+    long pagesize_long = sysconf(_SC_PAGESIZE);
+    if (pagesize_long <= 0) {
+        report_patch_error("sysconf(_SC_PAGESIZE)", errno ? errno : EINVAL);
+        rc = -1;
+        goto out_unlock;
+    }
+
+    size_t pagesize = (size_t)pagesize_long;
     tsd_patch_slot_t *inactive = g_tsd_trampoline_ctx.inactive;
     void *inactive_page = page_align(inactive, pagesize);
     atomic_store_explicit(&g_tsd_last_patch_attempt, (unsigned char)new_width, memory_order_release);
 
 #ifdef TSD_ENABLE_TESTS
     if (g_test_force_failure_stage == TSD_PATCH_FAIL_PROTECT_WRITE) {
-        errno = EPERM;
-        report_patch_error("mprotect(trampoline write)", errno);
+        report_patch_error("mprotect(trampoline write)", EPERM);
         g_test_force_failure_stage = TSD_PATCH_FAIL_NONE;
-        pthread_mutex_unlock(&g_tsd_patch_lock);
-        return;
+        rc = -1;
+        goto out_unlock;
     }
 #endif
 
     if (mprotect(inactive_page, pagesize, PROT_READ | PROT_WRITE) != 0) {
         report_patch_error("mprotect(trampoline write)", errno);
-        pthread_mutex_unlock(&g_tsd_patch_lock);
-        return;
+        rc = -1;
+        goto out_unlock;
     }
 
     for (size_t offset = 0; offset < patch_size; offset += sizeof(uint64_t)) {
@@ -194,18 +205,17 @@ void tsd_trampoline_patch(simd_width_t new_width) {
 
 #ifdef TSD_ENABLE_TESTS
     if (g_test_force_failure_stage == TSD_PATCH_FAIL_PROTECT_EXEC) {
-        errno = EPERM;
-        report_patch_error("mprotect(trampoline exec)", errno);
+        report_patch_error("mprotect(trampoline exec)", EPERM);
         g_test_force_failure_stage = TSD_PATCH_FAIL_NONE;
-        pthread_mutex_unlock(&g_tsd_patch_lock);
-        return;
+        rc = -1;
+        goto out_unlock;
     }
 #endif
 
     if (mprotect(inactive_page, pagesize, PROT_READ | PROT_EXEC) != 0) {
         report_patch_error("mprotect(trampoline exec)", errno);
-        pthread_mutex_unlock(&g_tsd_patch_lock);
-        return;
+        rc = -1;
+        goto out_unlock;
     }
 
     atomic_store_explicit(&g_tsd_current_width, new_width, memory_order_release);
@@ -217,7 +227,11 @@ void tsd_trampoline_patch(simd_width_t new_width) {
     atomic_store_explicit(&g_tsd_trampoline_initialized, 1, memory_order_release);
     atomic_store_explicit(&g_tsd_last_patched_width, (unsigned char)new_width, memory_order_release);
     printf("Patched to %s (strict W^X)\n", new_width == SIMD_AVX512 ? "AVX-512" : new_width == SIMD_AVX2 ? "AVX2" : "SSE4.1");
+    rc = 0;
+
+out_unlock:
     pthread_mutex_unlock(&g_tsd_patch_lock);
+    return rc;
 }
 
 #ifdef TSD_ENABLE_TESTS

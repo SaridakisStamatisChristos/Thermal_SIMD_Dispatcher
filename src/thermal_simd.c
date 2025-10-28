@@ -121,8 +121,25 @@ void* thermal_monitor_thread(void *arg) {
                        eval.severity_milli / 1000, eval.severity_milli % 1000,
                        eval.llc_mpki_milli / 1000, eval.llc_mpki_milli % 1000,
                        eval.memory_bound ? " [memory bound guard raised]" : "");
-                width--;
-                tsd_trampoline_patch(width);
+                simd_width_t target = width - 1;
+                int patch_rc = tsd_trampoline_patch(target);
+                if (patch_rc == 0) {
+                    width = target;
+                } else {
+                    int patch_err = errno;
+                    width = atomic_load_explicit(&g_tsd_current_width, memory_order_acquire);
+#ifdef TSD_ENABLE_TESTS
+                    const char *patch_err_msg = tsd_trampoline_last_error();
+                    if (patch_err_msg && patch_err_msg[0] != '\0') {
+                        fprintf(stderr, "[thermal_simd] downgrade patch failed: %s\n", patch_err_msg);
+                    } else
+#endif
+                    if (patch_err != 0) {
+                        fprintf(stderr, "[thermal_simd] downgrade patch failed: %s\n", strerror(patch_err));
+                    } else {
+                        fprintf(stderr, "[thermal_simd] downgrade patch failed\n");
+                    }
+                }
                 throttle_count = 0;
                 cooldown = g_tsd_config.cooldown_down_ticks;
                 dwell_ticks = 0;
@@ -135,8 +152,25 @@ void* thermal_monitor_thread(void *arg) {
                        eval.ratio_milli / 1000, eval.ratio_milli % 1000,
                        eval.trimmed_ratio_milli / 1000, eval.trimmed_ratio_milli % 1000,
                        eval.llc_mpki_milli / 1000, eval.llc_mpki_milli % 1000);
-                width++;
-                tsd_trampoline_patch(width);
+                simd_width_t target = width + 1;
+                int patch_rc = tsd_trampoline_patch(target);
+                if (patch_rc == 0) {
+                    width = target;
+                } else {
+                    int patch_err = errno;
+                    width = atomic_load_explicit(&g_tsd_current_width, memory_order_acquire);
+#ifdef TSD_ENABLE_TESTS
+                    const char *patch_err_msg = tsd_trampoline_last_error();
+                    if (patch_err_msg && patch_err_msg[0] != '\0') {
+                        fprintf(stderr, "[thermal_simd] upgrade patch failed: %s\n", patch_err_msg);
+                    } else
+#endif
+                    if (patch_err != 0) {
+                        fprintf(stderr, "[thermal_simd] upgrade patch failed: %s\n", strerror(patch_err));
+                    } else {
+                        fprintf(stderr, "[thermal_simd] upgrade patch failed\n");
+                    }
+                }
                 stable_count = 0;
                 cooldown = g_tsd_config.cooldown_up_ticks;
                 dwell_ticks = 0;
@@ -215,7 +249,10 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    tsd_trampoline_patch(max_width);
+    if (tsd_trampoline_patch(max_width) != 0) {
+        fprintf(stderr, "Failed to install initial trampoline patch\n");
+        return 1;
+    }
     print_configuration(max_width);
     run_demo();
     return 0;
@@ -334,8 +371,8 @@ simd_width_t tsd_test_detect_host_max(void) {
     return tsd_cpu_detect_ignoring_override(&g_tsd_config);
 }
 
-void tsd_test_patch(simd_width_t width) {
-    tsd_trampoline_patch(width);
+int tsd_test_patch(simd_width_t width) {
+    return tsd_trampoline_patch(width);
 }
 
 perf_ctx_t* tsd_test_init_perf(void) {
