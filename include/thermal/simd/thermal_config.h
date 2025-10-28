@@ -3,6 +3,8 @@
 
 #include <stdint.h>
 
+#include <thermal/simd/logging.h>
+
 typedef struct {
     int check_interval_us;
     int down_count;
@@ -22,6 +24,7 @@ typedef struct {
     int min_dwell_ticks;
     int thermal_temp_weight_milli;
     int thermal_ratio_weight_milli;
+    tsd_log_level_t log_level;
 } tsd_runtime_config;
 
 extern tsd_runtime_config g_tsd_config;

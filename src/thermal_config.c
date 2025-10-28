@@ -8,6 +8,8 @@
 
 #include <thermal/simd/config_parser.h>
 
+#define LOG_COMPONENT "config"
+
 static const tsd_runtime_config k_default_config = {
     .check_interval_us = 50000,
     .down_count = 3,
@@ -27,6 +29,7 @@ static const tsd_runtime_config k_default_config = {
     .min_dwell_ticks = 0,
     .thermal_temp_weight_milli = 0,
     .thermal_ratio_weight_milli = 0,
+    .log_level = TSD_LOG_LEVEL_INFO,
 };
 
 tsd_runtime_config g_tsd_config;
@@ -47,30 +50,30 @@ int tsd_runtime_config_refresh_ticks(tsd_runtime_config *cfg) {
     if (tsd_compute_ticks_from_ms(cfg->check_interval_us, cfg->cooldown_down_ms,
                                   &cfg->cooldown_down_ticks, &raw_ticks) != 0) {
         if (errno == EINVAL) {
-            fprintf(stderr, "Invalid sampling interval while processing %s\n", "--cooldown-down");
+            tsd_log_error(LOG_COMPONENT, "Invalid sampling interval while processing %s", "--cooldown-down");
         } else {
-            fprintf(stderr, "Value for %s results in unsupported tick count (%lld)\n",
-                    "--cooldown-down", raw_ticks);
+            tsd_log_error(LOG_COMPONENT, "Value for %s results in unsupported tick count (%lld)",
+                          "--cooldown-down", raw_ticks);
         }
         return -1;
     }
     if (tsd_compute_ticks_from_ms(cfg->check_interval_us, cfg->cooldown_up_ms,
                                   &cfg->cooldown_up_ticks, &raw_ticks) != 0) {
         if (errno == EINVAL) {
-            fprintf(stderr, "Invalid sampling interval while processing %s\n", "--cooldown-up");
+            tsd_log_error(LOG_COMPONENT, "Invalid sampling interval while processing %s", "--cooldown-up");
         } else {
-            fprintf(stderr, "Value for %s results in unsupported tick count (%lld)\n",
-                    "--cooldown-up", raw_ticks);
+            tsd_log_error(LOG_COMPONENT, "Value for %s results in unsupported tick count (%lld)",
+                          "--cooldown-up", raw_ticks);
         }
         return -1;
     }
     if (tsd_compute_ticks_from_ms(cfg->check_interval_us, cfg->min_dwell_ms,
                                   &cfg->min_dwell_ticks, &raw_ticks) != 0) {
         if (errno == EINVAL) {
-            fprintf(stderr, "Invalid sampling interval while processing %s\n", "--min-dwell");
+            tsd_log_error(LOG_COMPONENT, "Invalid sampling interval while processing %s", "--min-dwell");
         } else {
-            fprintf(stderr, "Value for %s results in unsupported tick count (%lld)\n",
-                    "--min-dwell", raw_ticks);
+            tsd_log_error(LOG_COMPONENT, "Value for %s results in unsupported tick count (%lld)",
+                          "--min-dwell", raw_ticks);
         }
         return -1;
     }
@@ -79,7 +82,7 @@ int tsd_runtime_config_refresh_ticks(tsd_runtime_config *cfg) {
 
 #ifndef TSD_ENABLE_TESTS
 static void die_invalid_option(const char *option, const char *value) {
-    fprintf(stderr, "Invalid value for %s: '%s'\n", option, value ? value : "");
+    tsd_log_error(LOG_COMPONENT, "Invalid value for %s: '%s'", option, value ? value : "");
     exit(1);
 }
 
@@ -101,6 +104,7 @@ void tsd_runtime_config_print_usage(const char *prog) {
     printf("  --thermal-ratio-weight=W Frequency ratio severity weight in milli [0-100000] (default: 0)\n");
     printf("  --duration-sec=S       Demo duration (default: 10)\n");
     printf("  --work-iters=N         Inner work iterations per second (default: 10000000)\n");
+    printf("  --log-level=LEVEL      Log verbosity (error, warn, info, debug)\n");
     printf("  --help                 Show this help\n");
 }
 
@@ -109,6 +113,18 @@ int tsd_runtime_config_parse_cli(tsd_runtime_config *cfg, int argc, char **argv)
         return -1;
     }
     tsd_runtime_config_set_defaults(cfg);
+
+    const char *env_level = getenv("TSD_LOG_LEVEL");
+    if (env_level && env_level[0] != '\0') {
+        tsd_log_level_t parsed_env_level;
+        if (tsd_log_level_from_string(env_level, &parsed_env_level) == 0) {
+            cfg->log_level = parsed_env_level;
+        } else {
+            tsd_log_warn(LOG_COMPONENT,
+                         "Ignoring invalid TSD_LOG_LEVEL '%s' (expected error|warn|info|debug)",
+                         env_level);
+        }
+    }
 
     for (int i = 1; i < argc; i++) {
         if (!strncmp(argv[i], "--interval=", 11)) {
@@ -167,11 +183,17 @@ int tsd_runtime_config_parse_cli(tsd_runtime_config *cfg, int argc, char **argv)
             if (tsd_parse_int_option(argv[i] + 13, 1, INT_MAX, &cfg->work_iters) != 0) {
                 die_invalid_option("--work-iters", argv[i] + 13);
             }
+        } else if (!strncmp(argv[i], "--log-level=", 12)) {
+            tsd_log_level_t parsed_level;
+            if (tsd_log_level_from_string(argv[i] + 12, &parsed_level) != 0) {
+                die_invalid_option("--log-level", argv[i] + 12);
+            }
+            cfg->log_level = parsed_level;
         } else if (!strcmp(argv[i], "--help")) {
             tsd_runtime_config_print_usage(argv[0]);
             exit(0);
         } else {
-            fprintf(stderr, "Unknown option: %s\n", argv[i]);
+            tsd_log_error(LOG_COMPONENT, "Unknown option: %s", argv[i]);
             tsd_runtime_config_print_usage(argv[0]);
             exit(1);
         }
@@ -187,6 +209,7 @@ int tsd_runtime_config_parse_cli(tsd_runtime_config *cfg, int argc, char **argv)
     }
 
     g_tsd_config = *cfg;
+    tsd_log_set_level(cfg->log_level);
     return 0;
 }
 #endif
