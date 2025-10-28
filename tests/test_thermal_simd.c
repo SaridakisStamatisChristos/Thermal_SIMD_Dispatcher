@@ -138,6 +138,22 @@ static int run_patch_failure_diagnostic(void) {
         fprintf(stderr, "width changed unexpectedly after failed patch\n");
         return 1;
     }
+    tsd_test_force_patch_failure(TSD_PATCH_FAIL_PROTECT_EXEC);
+    if (tsd_test_patch(SIMD_AVX2) == 0) {
+        fprintf(stderr, "patch unexpectedly succeeded under exec protection failure\n");
+        return 1;
+    }
+    err = tsd_test_last_patch_error();
+    if (!err || strstr(err, "mprotect(trampoline exec)") == NULL) {
+        fprintf(stderr, "expected exec patch error message, got '%s'\n", err ? err : "<null>");
+        return 1;
+    }
+    int inactive_writable = tsd_test_inactive_page_writable();
+    if (inactive_writable != 0) {
+        fprintf(stderr, "inactive page left writable after failure\n");
+        return 1;
+    }
+    tsd_test_force_patch_failure(TSD_PATCH_FAIL_NONE);
     tsd_test_clear_patch_overrides();
     return 0;
 }

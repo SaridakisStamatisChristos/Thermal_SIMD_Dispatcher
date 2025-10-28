@@ -4,6 +4,7 @@
 #include <inttypes.h>
 #include <pthread.h>
 #include <signal.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -91,6 +92,19 @@ static void serialize_instruction_stream(void) {
     );
 }
 
+static int* lookup_page_protection(void *page) {
+    if (!page) {
+        return NULL;
+    }
+    if (page == g_tsd_trampoline_ctx.page_a) {
+        return &g_tsd_trampoline_ctx.page_a_prot;
+    }
+    if (page == g_tsd_trampoline_ctx.page_b) {
+        return &g_tsd_trampoline_ctx.page_b_prot;
+    }
+    return NULL;
+}
+
 int tsd_trampoline_init(void) {
     long pagesize_long = sysconf(_SC_PAGESIZE);
     if (pagesize_long <= 0) {
@@ -104,6 +118,9 @@ int tsd_trampoline_init(void) {
         log_errno_message("failed to allocate RX trampoline pages", errno ? errno : ENOMEM);
         return -1;
     }
+    g_tsd_trampoline_ctx.page_size = pagesize;
+    g_tsd_trampoline_ctx.page_a_prot = PROT_READ | PROT_WRITE;
+    g_tsd_trampoline_ctx.page_b_prot = PROT_READ | PROT_WRITE;
     g_tsd_trampoline_ctx.active = (tsd_patch_slot_t*)g_tsd_trampoline_ctx.page_a;
     g_tsd_trampoline_ctx.inactive = (tsd_patch_slot_t*)g_tsd_trampoline_ctx.page_b;
     if (mprotect(g_tsd_trampoline_ctx.page_a, pagesize, PROT_READ | PROT_EXEC) != 0 ||
@@ -111,6 +128,8 @@ int tsd_trampoline_init(void) {
         report_patch_error("mprotect(initial RX)", errno);
         return -1;
     }
+    g_tsd_trampoline_ctx.page_a_prot = PROT_READ | PROT_EXEC;
+    g_tsd_trampoline_ctx.page_b_prot = PROT_READ | PROT_EXEC;
     atomic_store_explicit(&g_tsd_active_trampoline, g_tsd_trampoline_ctx.active, memory_order_seq_cst);
     atomic_store_explicit(&g_tsd_current_width, SIMD_SSE41, memory_order_relaxed);
     atomic_store_explicit(&g_tsd_current_width_byte, (unsigned char)SIMD_SSE41, memory_order_relaxed);
@@ -160,22 +179,34 @@ int tsd_trampoline_patch(simd_width_t new_width) {
 
     size_t patch_size = 0;
     const uint8_t *patch_data = select_patch(new_width, &patch_size);
+    void *inactive_page = NULL;
+    size_t pagesize = 0;
+    int *inactive_prot_ptr = NULL;
+    int original_prot = PROT_NONE;
+    int restore_prot = PROT_NONE;
+    bool made_writable = false;
     if (!patch_data || patch_size == 0) {
         report_patch_error("invalid SIMD width", EINVAL);
         rc = -1;
-        goto out_unlock;
+        goto out_restore;
     }
 
     long pagesize_long = sysconf(_SC_PAGESIZE);
     if (pagesize_long <= 0) {
         report_patch_error("sysconf(_SC_PAGESIZE)", errno ? errno : EINVAL);
         rc = -1;
-        goto out_unlock;
+        goto out_restore;
     }
 
-    size_t pagesize = (size_t)pagesize_long;
+    pagesize = (size_t)pagesize_long;
+    if (g_tsd_trampoline_ctx.page_size == 0) {
+        g_tsd_trampoline_ctx.page_size = pagesize;
+    }
     tsd_patch_slot_t *inactive = g_tsd_trampoline_ctx.inactive;
-    void *inactive_page = page_align(inactive, pagesize);
+    inactive_page = page_align(inactive, pagesize);
+    inactive_prot_ptr = lookup_page_protection(inactive_page);
+    original_prot = inactive_prot_ptr ? *inactive_prot_ptr : PROT_NONE;
+    restore_prot = original_prot;
     atomic_store_explicit(&g_tsd_last_patch_attempt, (unsigned char)new_width, memory_order_release);
 
 #ifdef TSD_ENABLE_TESTS
@@ -183,15 +214,19 @@ int tsd_trampoline_patch(simd_width_t new_width) {
         report_patch_error("mprotect(trampoline write)", EPERM);
         g_test_force_failure_stage = TSD_PATCH_FAIL_NONE;
         rc = -1;
-        goto out_unlock;
+        goto out_restore;
     }
 #endif
 
     if (mprotect(inactive_page, pagesize, PROT_READ | PROT_WRITE) != 0) {
         report_patch_error("mprotect(trampoline write)", errno);
         rc = -1;
-        goto out_unlock;
+        goto out_restore;
     }
+    if (inactive_prot_ptr) {
+        *inactive_prot_ptr = PROT_READ | PROT_WRITE;
+    }
+    made_writable = true;
 
     for (size_t offset = 0; offset < patch_size; offset += sizeof(uint64_t)) {
         size_t chunk = sizeof(uint64_t);
@@ -208,15 +243,19 @@ int tsd_trampoline_patch(simd_width_t new_width) {
         report_patch_error("mprotect(trampoline exec)", EPERM);
         g_test_force_failure_stage = TSD_PATCH_FAIL_NONE;
         rc = -1;
-        goto out_unlock;
+        goto out_restore;
     }
 #endif
 
     if (mprotect(inactive_page, pagesize, PROT_READ | PROT_EXEC) != 0) {
         report_patch_error("mprotect(trampoline exec)", errno);
         rc = -1;
-        goto out_unlock;
+        goto out_restore;
     }
+    if (inactive_prot_ptr) {
+        *inactive_prot_ptr = PROT_READ | PROT_EXEC;
+    }
+    made_writable = false;
 
     atomic_store_explicit(&g_tsd_current_width, new_width, memory_order_release);
     atomic_store_explicit(&g_tsd_current_width_byte, (unsigned char)new_width, memory_order_release);
@@ -229,7 +268,17 @@ int tsd_trampoline_patch(simd_width_t new_width) {
     printf("Patched to %s (strict W^X)\n", new_width == SIMD_AVX512 ? "AVX-512" : new_width == SIMD_AVX2 ? "AVX2" : "SSE4.1");
     rc = 0;
 
-out_unlock:
+out_restore:
+    if (rc != 0 && made_writable && inactive_page && pagesize > 0) {
+        int target_prot = restore_prot;
+        if (mprotect(inactive_page, pagesize, target_prot) != 0) {
+            int err = errno;
+            log_errno_message("mprotect(trampoline restore)", err);
+        } else if (inactive_prot_ptr) {
+            *inactive_prot_ptr = target_prot;
+        }
+        made_writable = false;
+    }
     pthread_mutex_unlock(&g_tsd_patch_lock);
     return rc;
 }
@@ -260,5 +309,25 @@ void tsd_trampoline_force_failure(int stage) {
 
 const char* tsd_trampoline_last_error(void) {
     return g_test_last_patch_error;
+}
+
+int tsd_trampoline_inactive_page_writable(void) {
+    size_t pagesize = g_tsd_trampoline_ctx.page_size;
+    if (pagesize == 0) {
+        long ps = sysconf(_SC_PAGESIZE);
+        if (ps <= 0) {
+            return -1;
+        }
+        pagesize = (size_t)ps;
+    }
+    if (!g_tsd_trampoline_ctx.inactive) {
+        return -1;
+    }
+    void *inactive_page = page_align(g_tsd_trampoline_ctx.inactive, pagesize);
+    int *prot_ptr = lookup_page_protection(inactive_page);
+    if (!prot_ptr) {
+        return -1;
+    }
+    return (*prot_ptr & PROT_WRITE) ? 1 : 0;
 }
 #endif
