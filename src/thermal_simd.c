@@ -71,6 +71,8 @@ static void print_configuration(simd_width_t max_width) {
     printf("  Minimum dwell: %d ms per width\n", g_tsd_config.min_dwell_ms);
     printf("  Memory guard: divisor=%d offset=%d milli\n",
            g_tsd_config.memory_guard_divisor, g_tsd_config.memory_guard_offset_milli);
+    printf("  Telemetry weights: temp=%d ratio=%d (milli)\n",
+           g_tsd_config.thermal_temp_weight_milli, g_tsd_config.thermal_ratio_weight_milli);
     printf("  Cooldown ticks: down=%d up=%d min-dwell=%d\n",
            g_tsd_config.cooldown_down_ticks,
            g_tsd_config.cooldown_up_ticks,
@@ -115,12 +117,28 @@ void* thermal_monitor_thread(void *arg) {
             throttle_count++;
             stable_count = 0;
             if (throttle_count >= g_tsd_config.down_count && width > SIMD_SSE41) {
-                printf("\nThermal throttle: ratio=%u.%03u (trimmed %u.%03u) severity=+%lu.%03lu MPKI=%lu.%03lu%s\n",
+                printf("\nThermal throttle: ratio=%u.%03u (trimmed %u.%03u)"
+                       " severity=+%lu.%03lu (thermal %lu.%03lu) MPKI=%lu.%03lu",
                        eval.ratio_milli / 1000, eval.ratio_milli % 1000,
                        eval.trimmed_ratio_milli / 1000, eval.trimmed_ratio_milli % 1000,
                        eval.severity_milli / 1000, eval.severity_milli % 1000,
-                       eval.llc_mpki_milli / 1000, eval.llc_mpki_milli % 1000,
-                       eval.memory_bound ? " [memory bound guard raised]" : "");
+                       eval.thermal_severity_milli / 1000, eval.thermal_severity_milli % 1000,
+                       eval.llc_mpki_milli / 1000, eval.llc_mpki_milli % 1000);
+                if (eval.temp_available) {
+                    int32_t temp_whole = eval.package_temp_millic / 1000;
+                    int32_t temp_frac = eval.package_temp_millic % 1000;
+                    if (temp_frac < 0) {
+                        temp_frac = -temp_frac;
+                    }
+                    printf(" temp=%d.%03dC", temp_whole, temp_frac);
+                }
+                if (eval.freq_ratio_available) {
+                    printf(" freq=%u.%03ux", eval.freq_ratio_milli / 1000, eval.freq_ratio_milli % 1000);
+                }
+                if (eval.memory_bound) {
+                    printf(" [memory bound guard raised]");
+                }
+                printf("\n");
                 simd_width_t target = width - 1;
                 int patch_rc = tsd_trampoline_patch(target);
                 if (patch_rc == 0) {
@@ -345,6 +363,10 @@ const uint8_t* tsd_test_patch_bytes(simd_width_t width, size_t *len) {
 
 void tsd_test_set_fake_perf_script(const uint32_t *ratios, size_t count, uint32_t mpki) {
     tsd_perf_set_fake_script(ratios, count, mpki);
+}
+
+void tsd_test_set_fake_telemetry(const tsd_telemetry_sample_t *samples, size_t count) {
+    tsd_perf_set_fake_telemetry(samples, count);
 }
 
 void tsd_test_clear_fake_perf_script(void) {

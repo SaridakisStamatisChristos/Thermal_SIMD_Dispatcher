@@ -25,6 +25,8 @@ static const tsd_runtime_config k_default_config = {
     .cooldown_down_ticks = 0,
     .cooldown_up_ticks = 0,
     .min_dwell_ticks = 0,
+    .thermal_temp_weight_milli = 0,
+    .thermal_ratio_weight_milli = 0,
 };
 
 tsd_runtime_config g_tsd_config;
@@ -95,6 +97,8 @@ void tsd_runtime_config_print_usage(const char *prog) {
     printf("  --no-avx512            Explicitly disable AVX-512\n");
     printf("  --memory-guard-div=N   Memory guard divisor [1-1000] (default: 5)\n");
     printf("  --memory-guard-offset=M Additional memory guard in milli-ratio [0-1000000] (default: 200)\n");
+    printf("  --thermal-temp-weight=W Temperature severity weight in milli [0-100000] (default: 0)\n");
+    printf("  --thermal-ratio-weight=W Frequency ratio severity weight in milli [0-100000] (default: 0)\n");
     printf("  --duration-sec=S       Demo duration (default: 10)\n");
     printf("  --work-iters=N         Inner work iterations per second (default: 10000000)\n");
     printf("  --help                 Show this help\n");
@@ -146,6 +150,14 @@ int tsd_runtime_config_parse_cli(tsd_runtime_config *cfg, int argc, char **argv)
         } else if (!strncmp(argv[i], "--memory-guard-offset=", 23)) {
             if (tsd_parse_int_option(argv[i] + 23, 0, 1000000, &cfg->memory_guard_offset_milli) != 0) {
                 die_invalid_option("--memory-guard-offset", argv[i] + 23);
+            }
+        } else if (!strncmp(argv[i], "--thermal-temp-weight=", 22)) {
+            if (tsd_parse_int_option(argv[i] + 22, 0, 100000, &cfg->thermal_temp_weight_milli) != 0) {
+                die_invalid_option("--thermal-temp-weight", argv[i] + 22);
+            }
+        } else if (!strncmp(argv[i], "--thermal-ratio-weight=", 23)) {
+            if (tsd_parse_int_option(argv[i] + 23, 0, 100000, &cfg->thermal_ratio_weight_milli) != 0) {
+                die_invalid_option("--thermal-ratio-weight", argv[i] + 23);
             }
         } else if (!strncmp(argv[i], "--duration-sec=", 15)) {
             if (tsd_parse_int_option(argv[i] + 15, 1, 86400, &cfg->demo_duration_sec) != 0) {

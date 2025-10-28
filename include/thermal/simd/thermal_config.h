@@ -20,6 +20,8 @@ typedef struct {
     int cooldown_down_ticks;
     int cooldown_up_ticks;
     int min_dwell_ticks;
+    int thermal_temp_weight_milli;
+    int thermal_ratio_weight_milli;
 } tsd_runtime_config;
 
 extern tsd_runtime_config g_tsd_config;

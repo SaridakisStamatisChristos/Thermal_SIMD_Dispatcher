@@ -6,6 +6,8 @@
 #include <string.h>
 #include <unistd.h>
 
+#include <thermal/simd/thermal_config.h>
+
 #include "thermal_simd_test.h"
 
 static simd_width_t force_avx2(void) {
@@ -269,6 +271,78 @@ out:
     return rc;
 }
 
+static int run_telemetry_weight_test(void) {
+    int rc = 0;
+    perf_ctx_t *ctx = NULL;
+    tsd_test_reset_runtime();
+    tsd_test_set_policy_counts(1, 1);
+    tsd_test_set_timing(1000, 1, 1, 1);
+    g_tsd_config.thermal_temp_weight_milli = 20;
+    g_tsd_config.thermal_ratio_weight_milli = 30;
+    if (tsd_test_refresh_ticks() != 0) {
+        fprintf(stderr, "failed to refresh ticks for telemetry test\n");
+        rc = 1;
+        goto out;
+    }
+    ctx = tsd_test_perf_create_dummy_context();
+    if (!ctx) {
+        fprintf(stderr, "failed to create dummy perf context for telemetry test\n");
+        rc = 1;
+        goto out;
+    }
+    tsd_test_perf_set_mode(ctx, TSD_PERF_MODE_SOFTWARE);
+    const uint32_t ratios[] = {1400, 1400, 1400, 1400};
+    tsd_test_set_fake_perf_script(ratios, sizeof(ratios) / sizeof(ratios[0]), 0);
+    const tsd_telemetry_sample_t telemetry[] = {
+        {.temp_available = 1, .freq_ratio_available = 1, .package_temp_millic = 95000, .freq_ratio_milli = 900},
+        {.temp_available = 1, .freq_ratio_available = 1, .package_temp_millic = 90000, .freq_ratio_milli = 950},
+        {.temp_available = 0, .freq_ratio_available = 0, .package_temp_millic = 0, .freq_ratio_milli = 0},
+        {.temp_available = 0, .freq_ratio_available = 0, .package_temp_millic = 0, .freq_ratio_milli = 0},
+    };
+    tsd_test_set_fake_telemetry(telemetry, sizeof(telemetry) / sizeof(telemetry[0]));
+    tsd_thermal_eval_t eval = {0};
+    int triggered = 0;
+    for (size_t i = 0; i < sizeof(ratios) / sizeof(ratios[0]); ++i) {
+        if (tsd_perf_evaluate(ctx, &eval, &g_tsd_config)) {
+            triggered = 1;
+            break;
+        }
+    }
+    if (!triggered) {
+        fprintf(stderr, "telemetry weighting did not trigger severity\n");
+        rc = 1;
+        goto out;
+    }
+    if (eval.thermal_severity_milli != 203) {
+        fprintf(stderr, "unexpected thermal severity (got %lu)\n", eval.thermal_severity_milli);
+        rc = 1;
+        goto out;
+    }
+    if (eval.severity_milli != eval.thermal_severity_milli) {
+        fprintf(stderr, "overall severity did not match thermal component\n");
+        rc = 1;
+        goto out;
+    }
+    if (!eval.temp_available || eval.package_temp_millic != 95000) {
+        fprintf(stderr, "temperature telemetry not propagated\n");
+        rc = 1;
+        goto out;
+    }
+    if (!eval.freq_ratio_available || eval.freq_ratio_milli != 900) {
+        fprintf(stderr, "frequency telemetry not propagated\n");
+        rc = 1;
+        goto out;
+    }
+
+out:
+    tsd_test_clear_fake_perf_script();
+    tsd_test_set_fake_telemetry(NULL, 0);
+    if (ctx) {
+        tsd_test_perf_destroy_dummy_context(ctx);
+    }
+    return rc;
+}
+
 int main(void) {
     tsd_test_reset_runtime();
     if (init_double_buffer_trampoline() != 0) {
@@ -276,6 +350,9 @@ int main(void) {
         return 1;
     }
     if (run_perf_read_retry_test() != 0) {
+        return 1;
+    }
+    if (run_telemetry_weight_test() != 0) {
         return 1;
     }
     if (run_monitor_thread_scenario() != 0) {

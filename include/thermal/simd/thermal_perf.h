@@ -5,6 +5,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include <thermal/simd/telemetry_helper.h>
 #include <thermal/simd/thermal_config.h>
 
 #ifdef __cplusplus
@@ -25,7 +26,12 @@ typedef struct {
     uint32_t trimmed_ratio_milli;
     uint64_t llc_mpki_milli;
     uint64_t severity_milli;
+    uint64_t thermal_severity_milli;
     int memory_bound;
+    int temp_available;
+    int freq_ratio_available;
+    int32_t package_temp_millic;
+    uint32_t freq_ratio_milli;
 } tsd_thermal_eval_t;
 
 typedef void (*tsd_workload_fn)(void);
@@ -61,6 +67,7 @@ typedef struct {
 } tsd_perf_test_read_stream_t;
 
 void tsd_perf_set_fake_script(const uint32_t *ratios, size_t count, uint32_t mpki);
+void tsd_perf_set_fake_telemetry(const tsd_telemetry_sample_t *samples, size_t count);
 void tsd_perf_clear_fake_script(void);
 perf_ctx_t* tsd_perf_test_create_dummy_context(void);
 void tsd_perf_test_destroy_dummy_context(perf_ctx_t *ctx);
