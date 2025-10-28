@@ -17,6 +17,9 @@ typedef struct {
     tsd_patch_slot_t *inactive;
     void *page_a;
     void *page_b;
+    size_t page_size;
+    int page_a_prot;
+    int page_b_prot;
 } tsd_trampoline_ctx_t;
 
 extern tsd_trampoline_ctx_t g_tsd_trampoline_ctx;
@@ -38,6 +41,7 @@ void tsd_trampoline_clear_overrides(void);
 const uint8_t* tsd_trampoline_patch_bytes(simd_width_t width, size_t *len);
 void tsd_trampoline_force_failure(int stage);
 const char* tsd_trampoline_last_error(void);
+int tsd_trampoline_inactive_page_writable(void);
 #endif
 
 #endif /* TSD_THERMAL_TRAMPOLINE_H */

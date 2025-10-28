@@ -375,6 +375,10 @@ int tsd_test_patch(simd_width_t width) {
     return tsd_trampoline_patch(width);
 }
 
+int tsd_test_inactive_page_writable(void) {
+    return tsd_trampoline_inactive_page_writable();
+}
+
 perf_ctx_t* tsd_test_init_perf(void) {
     return tsd_perf_init(workload_once);
 }
