@@ -11,6 +11,14 @@
 
 #define LOG_COMPONENT "config"
 
+static const tsd_policy_config k_default_policy_config = {
+    .slo_ratio_milli = 1500,
+    .slo_temp_millic = 85000,
+    .transition_penalty_up_milli = 750,
+    .transition_penalty_down_milli = 1000,
+    .forecast_horizon = 5,
+};
+
 static const tsd_runtime_config k_default_config = {
     .check_interval_us = 50000,
     .down_count = 3,
@@ -34,6 +42,7 @@ static const tsd_runtime_config k_default_config = {
     .degraded_policy_active = 0,
     .health_check_mode = 0,
     .log_level = TSD_LOG_LEVEL_INFO,
+    .policy = {0},
 };
 
 tsd_runtime_config g_tsd_config;
@@ -46,6 +55,8 @@ void tsd_runtime_config_set_defaults(tsd_runtime_config *cfg) {
         return;
     }
     *cfg = k_default_config;
+    cfg->policy = k_default_policy_config;
+    tsd_policy_config_apply_bounds(&cfg->policy);
     cfg->degraded_policy_active = 0;
     g_tsd_degraded_active = 0;
     memset(&g_tsd_degraded_backup, 0, sizeof(g_tsd_degraded_backup));
@@ -187,6 +198,16 @@ void tsd_runtime_config_print_usage(const char *prog) {
     printf("  --work-iters=N         Inner work iterations per second (default: 10000000)\n");
     printf("  --degraded-timeout-sec=S Fail closed if hardware counters missing for S seconds (default: %d)\n",
            k_default_config.degraded_timeout_sec);
+    printf("  --policy-slo-ratio=R   Predictive policy CPI target ratio (default: %.3f)\n",
+           (double)k_default_policy_config.slo_ratio_milli / 1000.0);
+    printf("  --policy-slo-temp=C    Predictive policy package temperature target in Celsius (default: %.1f)\n",
+           (double)k_default_policy_config.slo_temp_millic / 1000.0);
+    printf("  --policy-penalty-up=M  Predictive policy upgrade penalty in milli-cost (default: %u)\n",
+           k_default_policy_config.transition_penalty_up_milli);
+    printf("  --policy-penalty-down=M Predictive policy downgrade penalty in milli-cost (default: %u)\n",
+           k_default_policy_config.transition_penalty_down_milli);
+    printf("  --policy-forecast=N    Predictive policy forecast horizon in samples (default: %u)\n",
+           k_default_policy_config.forecast_horizon);
     printf("  --health-check         Run diagnostics and exit with status\n");
     printf("  --log-level=LEVEL      Log verbosity (error, warn, info, debug)\n");
     printf("  --help                 Show this help\n");
@@ -271,6 +292,37 @@ int tsd_runtime_config_parse_cli(tsd_runtime_config *cfg, int argc, char **argv)
             if (tsd_parse_int_option(argv[i] + 23, 1, 86400, &cfg->degraded_timeout_sec) != 0) {
                 die_invalid_option("--degraded-timeout-sec", argv[i] + 23);
             }
+        } else if (!strncmp(argv[i], "--policy-slo-ratio=", 19)) {
+            double ratio = 0.0;
+            uint64_t scaled = 0;
+            if (tsd_parse_ratio_option(argv[i] + 19, 0.5, 10.0, &ratio, &scaled) != 0) {
+                die_invalid_option("--policy-slo-ratio", argv[i] + 19);
+            }
+            cfg->policy.slo_ratio_milli = (uint32_t)scaled;
+        } else if (!strncmp(argv[i], "--policy-slo-temp=", 18)) {
+            int temp_c = 0;
+            if (tsd_parse_int_option(argv[i] + 18, -100, 200, &temp_c) != 0) {
+                die_invalid_option("--policy-slo-temp", argv[i] + 18);
+            }
+            cfg->policy.slo_temp_millic = temp_c * 1000;
+        } else if (!strncmp(argv[i], "--policy-penalty-up=", 20)) {
+            int penalty = 0;
+            if (tsd_parse_int_option(argv[i] + 20, 0, 1000000, &penalty) != 0) {
+                die_invalid_option("--policy-penalty-up", argv[i] + 20);
+            }
+            cfg->policy.transition_penalty_up_milli = (uint32_t)penalty;
+        } else if (!strncmp(argv[i], "--policy-penalty-down=", 22)) {
+            int penalty = 0;
+            if (tsd_parse_int_option(argv[i] + 22, 0, 1000000, &penalty) != 0) {
+                die_invalid_option("--policy-penalty-down", argv[i] + 22);
+            }
+            cfg->policy.transition_penalty_down_milli = (uint32_t)penalty;
+        } else if (!strncmp(argv[i], "--policy-forecast=", 19)) {
+            int horizon = 0;
+            if (tsd_parse_int_option(argv[i] + 19, 0, 1000, &horizon) != 0) {
+                die_invalid_option("--policy-forecast", argv[i] + 19);
+            }
+            cfg->policy.forecast_horizon = (uint32_t)horizon;
         } else if (!strcmp(argv[i], "--health-check")) {
             cfg->health_check_mode = 1;
         } else if (!strncmp(argv[i], "--log-level=", 12)) {
@@ -293,6 +345,8 @@ int tsd_runtime_config_parse_cli(tsd_runtime_config *cfg, int argc, char **argv)
     if (cfg->down_ratio_milli == 0) {
         cfg->down_ratio_milli = 1;
     }
+
+    tsd_policy_config_apply_bounds(&cfg->policy);
 
     if (tsd_runtime_config_refresh_ticks(cfg) != 0) {
         exit(1);
