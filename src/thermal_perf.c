@@ -17,7 +17,9 @@
 
 #include <thermal/simd/statistics.h>
 #include <thermal/simd/telemetry_helper.h>
+#include <thermal/simd/logging.h>
 
+#define LOG_COMPONENT "perf"
 #define RATIO_HISTORY TSD_RATIO_HISTORY
 #define FAST_EWMA_SHIFT 2
 #define SLOW_EWMA_SHIFT 5
@@ -244,7 +246,8 @@ static void try_perf_ioctl(int fd, unsigned long request, const char *what) {
         return;
     }
     if (ioctl(fd, request, 0) != 0) {
-        fprintf(stderr, "[thermal_simd] %s: %s\n", what, strerror(errno));
+        char errbuf[128];
+        tsd_log_warn(LOG_COMPONENT, "%s: %s", what, tsd_log_strerror(errno, errbuf, sizeof(errbuf)));
     }
 }
 
@@ -328,12 +331,16 @@ perf_ctx_t* tsd_perf_init(tsd_workload_fn workload_cb) {
     long fd_cycles = perf_event_open_sys(&pe, 0, ctx->pinned_cpu, -1, 0);
     if (fd_cycles < 0) {
         int err = errno;
+        char errbuf[128];
         if (should_fallback_to_software(err)) {
-            fprintf(stderr, "[thermal_simd] perf_event_open cycles (falling back to software): %s\n", strerror(err));
+            tsd_log_warn(LOG_COMPONENT,
+                         "perf_event_open cycles (falling back to software): %s",
+                         tsd_log_strerror(err, errbuf, sizeof(errbuf)));
             ctx->mode = TSD_PERF_MODE_SOFTWARE;
             return ctx;
         }
-        fprintf(stderr, "[thermal_simd] perf_event_open cycles: %s\n", strerror(err));
+        tsd_log_error(LOG_COMPONENT, "perf_event_open cycles: %s",
+                      tsd_log_strerror(err, errbuf, sizeof(errbuf)));
         free(ctx);
         return NULL;
     }
@@ -343,14 +350,18 @@ perf_ctx_t* tsd_perf_init(tsd_workload_fn workload_cb) {
     long fd_insns = perf_event_open_sys(&pe, 0, ctx->pinned_cpu, ctx->fd_cycles, 0);
     if (fd_insns < 0) {
         int err = errno;
+        char errbuf[128];
         close(ctx->fd_cycles);
         ctx->fd_cycles = -1;
         if (should_fallback_to_software(err)) {
-            fprintf(stderr, "[thermal_simd] perf_event_open instructions (falling back to software): %s\n", strerror(err));
+            tsd_log_warn(LOG_COMPONENT,
+                         "perf_event_open instructions (falling back to software): %s",
+                         tsd_log_strerror(err, errbuf, sizeof(errbuf)));
             ctx->mode = TSD_PERF_MODE_SOFTWARE;
             return ctx;
         }
-        fprintf(stderr, "[thermal_simd] perf_event_open instructions: %s\n", strerror(err));
+        tsd_log_error(LOG_COMPONENT, "perf_event_open instructions: %s",
+                      tsd_log_strerror(err, errbuf, sizeof(errbuf)));
         free(ctx);
         return NULL;
     }
@@ -363,9 +374,10 @@ perf_ctx_t* tsd_perf_init(tsd_workload_fn workload_cb) {
         int err = errno;
         ctx->fd_llc_misses = -1;
         if (!warned_llc_unavailable) {
-            fprintf(stderr,
-                    "warning: LLC miss counter unavailable (perf_event_open: %s); memory-bound guard disabled\n",
-                    strerror(err));
+            char errbuf[128];
+            tsd_log_warn(LOG_COMPONENT,
+                         "LLC miss counter unavailable (perf_event_open: %s); memory-bound guard disabled",
+                         tsd_log_strerror(err, errbuf, sizeof(errbuf)));
             warned_llc_unavailable = 1;
         }
     } else {
@@ -452,8 +464,10 @@ void tsd_perf_measure_baseline(perf_ctx_t *ctx, const tsd_runtime_config *cfg) {
         ctx->software_adaptation = 1;
         ctx->sw_last_iterations = atomic_load_explicit(&g_tsd_workload_iterations, memory_order_relaxed);
         clock_gettime(CLOCK_MONOTONIC, &ctx->sw_last_timestamp);
-        printf("Baseline (software) CPI surrogate: %lu.%03lu\n", surrogate_cpi / 1000, surrogate_cpi % 1000);
-        printf("Baseline MPKI surrogate: %lu.%03lu\n", ctx->baseline_llc_mpki_milli / 1000, ctx->baseline_llc_mpki_milli % 1000);
+        tsd_log_info(LOG_COMPONENT, "Baseline (software) CPI surrogate: %lu.%03lu",
+                     surrogate_cpi / 1000, surrogate_cpi % 1000);
+        tsd_log_info(LOG_COMPONENT, "Baseline MPKI surrogate: %lu.%03lu",
+                     ctx->baseline_llc_mpki_milli / 1000, ctx->baseline_llc_mpki_milli % 1000);
         return;
     }
 
@@ -502,8 +516,10 @@ void tsd_perf_measure_baseline(perf_ctx_t *ctx, const tsd_runtime_config *cfg) {
     ctx->last_group_read = rd_after;
     ctx->last_group_valid = 1;
     ctx->last_llc_value = llc_after;
-    printf("Baseline CPI: %lu.%03lu\n", ctx->baseline_cpi / 1000, ctx->baseline_cpi % 1000);
-    printf("Baseline MPKI: %lu.%03lu\n", ctx->baseline_llc_mpki_milli / 1000, ctx->baseline_llc_mpki_milli % 1000);
+    tsd_log_info(LOG_COMPONENT, "Baseline CPI: %lu.%03lu",
+                 ctx->baseline_cpi / 1000, ctx->baseline_cpi % 1000);
+    tsd_log_info(LOG_COMPONENT, "Baseline MPKI: %lu.%03lu",
+                 ctx->baseline_llc_mpki_milli / 1000, ctx->baseline_llc_mpki_milli % 1000);
     tsd_telemetry_sample_t baseline_sample = {0};
     tsd_telemetry_helper_sample(&ctx->telemetry, &baseline_sample);
     (void)baseline_sample;
@@ -664,9 +680,9 @@ int tsd_perf_evaluate(perf_ctx_t *ctx, tsd_thermal_eval_t *out, const tsd_runtim
     perf_group_read_t rd_now = {0};
     uint64_t llc_now = 0;
     if (tsd_perf_read_exact(ctx->fd_cycles, &rd_now, sizeof(rd_now)) == 0 && rd_now.nr != 2 && !warned_perf_group_layout) {
-        fprintf(stderr,
-                "warning: perf group returned %" PRIu64 " counters (expected 2); cycle telemetry disabled\n",
-                (uint64_t)rd_now.nr);
+        tsd_log_warn(LOG_COMPONENT,
+                     "perf group returned %" PRIu64 " counters (expected 2); cycle telemetry disabled",
+                     (uint64_t)rd_now.nr);
         warned_perf_group_layout = 1;
     }
     if (rd_now.nr != 2) {

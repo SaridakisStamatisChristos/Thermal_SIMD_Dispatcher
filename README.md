@@ -35,6 +35,10 @@ cmake --build build --config Release -j
 - `--no-avx512` disable AVX‑512 usage
 - `--duration-sec=S` runtime duration for demo (default 10)
 - `--work-iters=N` inner work iterations per tick (default 10,000,000)
+- `--log-level=LEVEL` set log verbosity (`error`, `warn`, `info`, `debug`; default `info`)
+
+Environment override:
+- `TSD_LOG_LEVEL` mirrors `--log-level` for non-interactive deployments.
 
 ## Tests
 Run smoke tests (build + basic run):

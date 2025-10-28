@@ -2,6 +2,7 @@
 #include <errno.h>
 #include <inttypes.h>
 #include <stdint.h>
+#include <stdarg.h>
 #include <stdatomic.h>
 #include <pthread.h>
 #include <sched.h>
@@ -16,6 +17,7 @@
 #include <thermal/simd/thermal_perf.h>
 #include <thermal/simd/thermal_signals.h>
 #include <thermal/simd/thermal_trampoline.h>
+#include <thermal/simd/logging.h>
 
 #ifdef TSD_ENABLE_TESTS
 #include "thermal_simd_test.h"
@@ -55,30 +57,61 @@ static void workload_loop(int iterations) {
     }
 }
 
+#define LOG_COMPONENT "runtime"
+
+#ifdef TSD_ENABLE_TESTS
+#define TSD_MAYBE_UNUSED __attribute__((unused))
+#else
+#define TSD_MAYBE_UNUSED
+#endif
+
+static void print_configuration(simd_width_t max_width) TSD_MAYBE_UNUSED;
 static void print_configuration(simd_width_t max_width) {
-    printf("Maximum supported: %s%s\n",
-           max_width == SIMD_AVX512 ? "AVX-512 (XMM-only)" :
-           max_width == SIMD_AVX2 ? "AVX2 (XMM-only)" : "SSE4.1",
-           g_tsd_config.allow_avx512 ? "" : " [AVX-512 disabled by policy]");
-    printf("AVX transition guard: %s\n", g_tsd_avx_available ? "enabled" : "disabled");
-    printf("Configuration:\n");
-    printf("  Check interval: %d ms\n", g_tsd_config.check_interval_us / 1000);
-    printf("  Down threshold: %.1fx CPI (after %d events)\n",
-           g_tsd_config.down_ratio, g_tsd_config.down_count);
-    printf("  Up threshold: %d stable events\n", g_tsd_config.up_count);
-    printf("  Cooldown: %d ms down, %d ms up\n",
-           g_tsd_config.cooldown_down_ms, g_tsd_config.cooldown_up_ms);
-    printf("  Minimum dwell: %d ms per width\n", g_tsd_config.min_dwell_ms);
-    printf("  Memory guard: divisor=%d offset=%d milli\n",
-           g_tsd_config.memory_guard_divisor, g_tsd_config.memory_guard_offset_milli);
-    printf("  Telemetry weights: temp=%d ratio=%d (milli)\n",
-           g_tsd_config.thermal_temp_weight_milli, g_tsd_config.thermal_ratio_weight_milli);
-    printf("  Cooldown ticks: down=%d up=%d min-dwell=%d\n",
-           g_tsd_config.cooldown_down_ticks,
-           g_tsd_config.cooldown_up_ticks,
-           g_tsd_config.min_dwell_ticks);
-    printf("  Demo: %d sec, work iters: %d\n\n",
-           g_tsd_config.demo_duration_sec, g_tsd_config.work_iters);
+    const char *max_width_str = (max_width == SIMD_AVX512)
+        ? "AVX-512 (XMM-only)"
+        : (max_width == SIMD_AVX2 ? "AVX2 (XMM-only)" : "SSE4.1");
+    tsd_log_info(LOG_COMPONENT, "Maximum supported: %s%s",
+                 max_width_str,
+                 g_tsd_config.allow_avx512 ? "" : " [AVX-512 disabled by policy]");
+    tsd_log_info(LOG_COMPONENT, "AVX transition guard: %s",
+                 g_tsd_avx_available ? "enabled" : "disabled");
+    tsd_log_info(LOG_COMPONENT, "Policy configuration:");
+    tsd_log_info(LOG_COMPONENT, "  Check interval: %d ms", g_tsd_config.check_interval_us / 1000);
+    tsd_log_info(LOG_COMPONENT, "  Down threshold: %.1fx CPI (after %d events)",
+                 g_tsd_config.down_ratio, g_tsd_config.down_count);
+    tsd_log_info(LOG_COMPONENT, "  Up threshold: %d stable events", g_tsd_config.up_count);
+    tsd_log_info(LOG_COMPONENT, "  Cooldown: %d ms down, %d ms up",
+                 g_tsd_config.cooldown_down_ms, g_tsd_config.cooldown_up_ms);
+    tsd_log_info(LOG_COMPONENT, "  Minimum dwell: %d ms per width", g_tsd_config.min_dwell_ms);
+    tsd_log_info(LOG_COMPONENT, "  Memory guard: divisor=%d offset=%d milli",
+                 g_tsd_config.memory_guard_divisor, g_tsd_config.memory_guard_offset_milli);
+    tsd_log_info(LOG_COMPONENT, "  Telemetry weights: temp=%d ratio=%d (milli)",
+                 g_tsd_config.thermal_temp_weight_milli, g_tsd_config.thermal_ratio_weight_milli);
+    tsd_log_info(LOG_COMPONENT, "  Cooldown ticks: down=%d up=%d min-dwell=%d",
+                 g_tsd_config.cooldown_down_ticks,
+                 g_tsd_config.cooldown_up_ticks,
+                 g_tsd_config.min_dwell_ticks);
+    tsd_log_info(LOG_COMPONENT, "  Demo: %d sec, work iters: %d",
+                 g_tsd_config.demo_duration_sec, g_tsd_config.work_iters);
+}
+
+static void append_message(char *buf, size_t buf_size, size_t *cursor, const char *fmt, ...) {
+    if (!buf || buf_size == 0 || !cursor || *cursor >= buf_size) {
+        return;
+    }
+    va_list args;
+    va_start(args, fmt);
+    int written = vsnprintf(buf + *cursor, buf_size - *cursor, fmt, args);
+    va_end(args);
+    if (written < 0) {
+        return;
+    }
+    if ((size_t)written >= buf_size - *cursor) {
+        *cursor = buf_size - 1;
+        buf[*cursor] = '\0';
+    } else {
+        *cursor += (size_t)written;
+    }
 }
 
 static int evaluate_thermal(perf_ctx_t *ctx, tsd_thermal_eval_t *out) {
@@ -117,28 +150,34 @@ void* thermal_monitor_thread(void *arg) {
             throttle_count++;
             stable_count = 0;
             if (throttle_count >= g_tsd_config.down_count && width > SIMD_SSE41) {
-                printf("\nThermal throttle: ratio=%u.%03u (trimmed %u.%03u)"
-                       " severity=+%lu.%03lu (thermal %lu.%03lu) MPKI=%lu.%03lu",
-                       eval.ratio_milli / 1000, eval.ratio_milli % 1000,
-                       eval.trimmed_ratio_milli / 1000, eval.trimmed_ratio_milli % 1000,
-                       eval.severity_milli / 1000, eval.severity_milli % 1000,
-                       eval.thermal_severity_milli / 1000, eval.thermal_severity_milli % 1000,
-                       eval.llc_mpki_milli / 1000, eval.llc_mpki_milli % 1000);
+                char message[512] = {0};
+                size_t cursor = 0;
+                append_message(message, sizeof(message), &cursor,
+                               "Thermal throttle: ratio=%u.%03u (trimmed %u.%03u) severity=+%lu.%03lu (thermal %lu.%03lu) MPKI=%lu.%03lu",
+                               eval.ratio_milli / 1000, eval.ratio_milli % 1000,
+                               eval.trimmed_ratio_milli / 1000, eval.trimmed_ratio_milli % 1000,
+                               eval.severity_milli / 1000, eval.severity_milli % 1000,
+                               eval.thermal_severity_milli / 1000, eval.thermal_severity_milli % 1000,
+                               eval.llc_mpki_milli / 1000, eval.llc_mpki_milli % 1000);
                 if (eval.temp_available) {
                     int32_t temp_whole = eval.package_temp_millic / 1000;
                     int32_t temp_frac = eval.package_temp_millic % 1000;
                     if (temp_frac < 0) {
                         temp_frac = -temp_frac;
                     }
-                    printf(" temp=%d.%03dC", temp_whole, temp_frac);
+                    append_message(message, sizeof(message), &cursor,
+                                   " temp=%d.%03dC", temp_whole, temp_frac);
                 }
                 if (eval.freq_ratio_available) {
-                    printf(" freq=%u.%03ux", eval.freq_ratio_milli / 1000, eval.freq_ratio_milli % 1000);
+                    append_message(message, sizeof(message), &cursor,
+                                   " freq=%u.%03ux",
+                                   eval.freq_ratio_milli / 1000, eval.freq_ratio_milli % 1000);
                 }
                 if (eval.memory_bound) {
-                    printf(" [memory bound guard raised]");
+                    append_message(message, sizeof(message), &cursor,
+                                   " [memory bound guard raised]");
                 }
-                printf("\n");
+                tsd_log_warn(LOG_COMPONENT, "%s", message);
                 simd_width_t target = width - 1;
                 int patch_rc = tsd_trampoline_patch(target);
                 if (patch_rc == 0) {
@@ -149,13 +188,15 @@ void* thermal_monitor_thread(void *arg) {
 #ifdef TSD_ENABLE_TESTS
                     const char *patch_err_msg = tsd_trampoline_last_error();
                     if (patch_err_msg && patch_err_msg[0] != '\0') {
-                        fprintf(stderr, "[thermal_simd] downgrade patch failed: %s\n", patch_err_msg);
+                        tsd_log_error(LOG_COMPONENT, "downgrade patch failed: %s", patch_err_msg);
                     } else
 #endif
                     if (patch_err != 0) {
-                        fprintf(stderr, "[thermal_simd] downgrade patch failed: %s\n", strerror(patch_err));
+                        char errbuf[128];
+                        tsd_log_error(LOG_COMPONENT, "downgrade patch failed: %s",
+                                      tsd_log_strerror(patch_err, errbuf, sizeof(errbuf)));
                     } else {
-                        fprintf(stderr, "[thermal_simd] downgrade patch failed\n");
+                        tsd_log_error(LOG_COMPONENT, "downgrade patch failed");
                     }
                 }
                 throttle_count = 0;
@@ -166,10 +207,11 @@ void* thermal_monitor_thread(void *arg) {
             stable_count++;
             throttle_count = 0;
             if (stable_count >= g_tsd_config.up_count && width < max_width_cached) {
-                printf("\nRecovered: ratio=%u.%03u (trimmed %u.%03u) MPKI=%lu.%03lu\n",
-                       eval.ratio_milli / 1000, eval.ratio_milli % 1000,
-                       eval.trimmed_ratio_milli / 1000, eval.trimmed_ratio_milli % 1000,
-                       eval.llc_mpki_milli / 1000, eval.llc_mpki_milli % 1000);
+                tsd_log_info(LOG_COMPONENT,
+                             "Recovered: ratio=%u.%03u (trimmed %u.%03u) MPKI=%lu.%03lu",
+                             eval.ratio_milli / 1000, eval.ratio_milli % 1000,
+                             eval.trimmed_ratio_milli / 1000, eval.trimmed_ratio_milli % 1000,
+                             eval.llc_mpki_milli / 1000, eval.llc_mpki_milli % 1000);
                 simd_width_t target = width + 1;
                 int patch_rc = tsd_trampoline_patch(target);
                 if (patch_rc == 0) {
@@ -180,13 +222,15 @@ void* thermal_monitor_thread(void *arg) {
 #ifdef TSD_ENABLE_TESTS
                     const char *patch_err_msg = tsd_trampoline_last_error();
                     if (patch_err_msg && patch_err_msg[0] != '\0') {
-                        fprintf(stderr, "[thermal_simd] upgrade patch failed: %s\n", patch_err_msg);
+                        tsd_log_error(LOG_COMPONENT, "upgrade patch failed: %s", patch_err_msg);
                     } else
 #endif
                     if (patch_err != 0) {
-                        fprintf(stderr, "[thermal_simd] upgrade patch failed: %s\n", strerror(patch_err));
+                        char errbuf[128];
+                        tsd_log_error(LOG_COMPONENT, "upgrade patch failed: %s",
+                                      tsd_log_strerror(patch_err, errbuf, sizeof(errbuf)));
                     } else {
-                        fprintf(stderr, "[thermal_simd] upgrade patch failed\n");
+                        tsd_log_error(LOG_COMPONENT, "upgrade patch failed");
                     }
                 }
                 stable_count = 0;
@@ -198,15 +242,12 @@ void* thermal_monitor_thread(void *arg) {
     return NULL;
 }
 
+static void run_demo(void) TSD_MAYBE_UNUSED;
 static void run_demo(void) {
     perf_ctx_t *perf = tsd_perf_init(workload_once);
     if (!perf) {
-        printf("\nPerformance monitoring unavailable.\n");
-        printf("Suggestions:\n");
-        printf("  - Run as root: sudo ./thermal_simd\n");
-        printf("  - Or: sudo sysctl kernel.perf_event_paranoid=0\n");
-        printf("  - Container: add --cap-add=SYS_ADMIN or --privileged\n\n");
-        printf("Running without thermal adaptation...\n");
+        tsd_log_warn(LOG_COMPONENT, "Performance monitoring unavailable; running without thermal adaptation.");
+        tsd_log_info(LOG_COMPONENT, "Suggestions: run as root, adjust kernel.perf_event_paranoid, or add container capabilities.");
         workload_loop(100000000);
         return;
     }
@@ -215,38 +256,44 @@ static void run_demo(void) {
     if (mode == TSD_PERF_MODE_HARDWARE) {
         tsd_perf_enable(perf);
         tsd_perf_measure_baseline(perf, &g_tsd_config);
-        printf("Perf target CPU: %d (monitor thread on CPU %d)\n",
-               tsd_perf_get_pinned_cpu(perf), tsd_perf_get_monitor_cpu(perf));
+        tsd_log_info(LOG_COMPONENT, "Perf target CPU: %d (monitor thread on CPU %d)",
+                     tsd_perf_get_pinned_cpu(perf), tsd_perf_get_monitor_cpu(perf));
     } else {
-        printf("\nHardware performance counters unavailable; using software telemetry fallback.\n");
+        tsd_log_warn(LOG_COMPONENT, "Hardware performance counters unavailable; using software telemetry fallback.");
         tsd_perf_measure_baseline(perf, &g_tsd_config);
     }
 
     pthread_t monitor;
     int monitor_err = pthread_create(&monitor, NULL, thermal_monitor_thread, perf);
     if (monitor_err != 0) {
-        fprintf(stderr, "ERROR: Failed to start monitor thread: %s\n", strerror(monitor_err));
+        char errbuf[128];
+        tsd_log_error(LOG_COMPONENT, "Failed to start monitor thread: %s",
+                      tsd_log_strerror(monitor_err, errbuf, sizeof(errbuf)));
         atomic_store_explicit(&g_tsd_running, 0, memory_order_release);
         tsd_perf_cleanup(perf);
         return;
     }
 
-    printf("\nRunning workload for %d seconds...\n", g_tsd_config.demo_duration_sec);
-    printf("Try: stress-ng --cpu 8 --cpu-load 100  (to simulate thermal load)\n\n");
+    tsd_log_info(LOG_COMPONENT, "Running workload for %d seconds (work iterations per tick: %d)",
+                 g_tsd_config.demo_duration_sec, g_tsd_config.work_iters);
+    tsd_log_info(LOG_COMPONENT, "Tip: stress-ng --cpu 8 --cpu-load 100 to simulate thermal load");
     for (int sec = 0; sec < g_tsd_config.demo_duration_sec; sec++) {
         workload_loop(g_tsd_config.work_iters);
-        printf(".");
-        fflush(stdout);
+        if (tsd_log_should_log(TSD_LOG_LEVEL_DEBUG)) {
+            tsd_log_debug(LOG_COMPONENT, "Completed demo second %d/%d", sec + 1, g_tsd_config.demo_duration_sec);
+        }
     }
-    printf("\n\nDone.\n");
+    tsd_log_info(LOG_COMPONENT, "Workload demo complete");
     atomic_store_explicit(&g_tsd_running, 0, memory_order_release);
     pthread_join(monitor, NULL);
     tsd_perf_cleanup(perf);
 }
 
+#undef TSD_MAYBE_UNUSED
+
 #ifndef TSD_ENABLE_TESTS
 int main(int argc, char **argv) {
-    printf("=== Production Thermal-Aware SIMD Dispatcher ===\n\n");
+    tsd_log_info(LOG_COMPONENT, "=== Production Thermal-Aware SIMD Dispatcher ===");
     tsd_runtime_config_parse_cli(&g_tsd_config, argc, argv);
     tsd_install_patch_signal_handlers();
     atomic_store_explicit(&g_tsd_last_patch_attempt, (unsigned char)SIMD_SSE41, memory_order_relaxed);
@@ -257,18 +304,18 @@ int main(int argc, char **argv) {
     sched_setaffinity(0, sizeof(cpuset), &cpuset);
 
     if (tsd_trampoline_init() != 0) {
-        fprintf(stderr, "Failed to create trampolines\n");
+        tsd_log_error(LOG_COMPONENT, "Failed to create trampolines");
         return 1;
     }
 
     simd_width_t max_width = tsd_detect_max_simd(&g_tsd_config);
     if (max_width == SIMD_SSE41 && !tsd_cpu_has_sse41()) {
-        fprintf(stderr, "ERROR: SSE4.1 required but not available\n");
+        tsd_log_error(LOG_COMPONENT, "SSE4.1 required but not available");
         return 1;
     }
 
     if (tsd_trampoline_patch(max_width) != 0) {
-        fprintf(stderr, "Failed to install initial trampoline patch\n");
+        tsd_log_error(LOG_COMPONENT, "Failed to install initial trampoline patch");
         return 1;
     }
     print_configuration(max_width);

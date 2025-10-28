@@ -14,6 +14,7 @@ configure_file(
 )
 
 set(THERMAL_SIMD_CORE_SOURCES
+    src/logging.c
     src/config_parser.c
     src/statistics.c
     src/telemetry_helper.c

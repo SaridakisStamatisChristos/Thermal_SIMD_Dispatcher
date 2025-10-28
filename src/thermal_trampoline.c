@@ -14,6 +14,7 @@
 #include <unistd.h>
 
 #include <thermal/simd/thermal_cpu.h>
+#include <thermal/simd/logging.h>
 
 #ifdef TSD_ENABLE_TESTS
 #include "thermal_simd_test.h"
@@ -43,13 +44,20 @@ _Static_assert(sizeof(k_patch_sse41) == 16, "SSE41 payload must be 16 bytes");
 _Static_assert(sizeof(k_patch_avx2) == 16, "AVX2 payload must be 16 bytes");
 _Static_assert(sizeof(k_patch_avx512) == 16, "AVX512 payload must be 16 bytes");
 
+#define LOG_COMPONENT "patch"
+
 static void log_errno_message(const char *prefix, int err) {
     if (!prefix) {
         return;
     }
-    fprintf(stderr, "[thermal_simd] %s: %s\n", prefix, strerror(err));
+    if (err == 0) {
+        err = errno;
+    }
+    char errbuf[128];
+    const char *errstr = tsd_log_strerror(err, errbuf, sizeof(errbuf));
+    tsd_log_error(LOG_COMPONENT, "%s: %s", prefix, errstr);
 #ifdef TSD_ENABLE_TESTS
-    snprintf(g_test_last_patch_error, sizeof(g_test_last_patch_error), "%s: %s", prefix, strerror(err));
+    snprintf(g_test_last_patch_error, sizeof(g_test_last_patch_error), "%s: %s", prefix, errstr);
 #endif
 }
 
@@ -265,7 +273,9 @@ int tsd_trampoline_patch(simd_width_t new_width) {
     g_tsd_trampoline_ctx.inactive = tmp;
     atomic_store_explicit(&g_tsd_trampoline_initialized, 1, memory_order_release);
     atomic_store_explicit(&g_tsd_last_patched_width, (unsigned char)new_width, memory_order_release);
-    printf("Patched to %s (strict W^X)\n", new_width == SIMD_AVX512 ? "AVX-512" : new_width == SIMD_AVX2 ? "AVX2" : "SSE4.1");
+    tsd_log_info(LOG_COMPONENT, "Patched to %s (strict W^X)",
+                 new_width == SIMD_AVX512 ? "AVX-512" :
+                 new_width == SIMD_AVX2 ? "AVX2" : "SSE4.1");
     rc = 0;
 
 out_restore:
