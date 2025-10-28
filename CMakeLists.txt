@@ -16,6 +16,7 @@ configure_file(
 set(THERMAL_SIMD_CORE_SOURCES
     src/config_parser.c
     src/statistics.c
+    src/telemetry_helper.c
     src/thermal_config.c
     src/thermal_cpu.c
     src/thermal_trampoline.c

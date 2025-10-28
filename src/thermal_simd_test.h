@@ -34,6 +34,7 @@ void tsd_test_override_patch(simd_width_t width, const uint8_t *bytes, size_t le
 void tsd_test_clear_patch_overrides(void);
 const uint8_t* tsd_test_patch_bytes(simd_width_t width, size_t *len);
 void tsd_test_set_fake_perf_script(const uint32_t *ratios, size_t count, uint32_t mpki);
+void tsd_test_set_fake_telemetry(const tsd_telemetry_sample_t *samples, size_t count);
 void tsd_test_clear_fake_perf_script(void);
 const char* tsd_test_last_patch_error(void);
 void tsd_test_force_patch_failure(tsd_patch_fail_stage_t stage);

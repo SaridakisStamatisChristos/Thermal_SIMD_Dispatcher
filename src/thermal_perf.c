@@ -16,11 +16,14 @@
 #include <unistd.h>
 
 #include <thermal/simd/statistics.h>
+#include <thermal/simd/telemetry_helper.h>
 
 #define RATIO_HISTORY TSD_RATIO_HISTORY
 #define FAST_EWMA_SHIFT 2
 #define SLOW_EWMA_SHIFT 5
 #define MPKI_SCALE 1000000ULL
+#define TSD_TEMP_REF_MILLIC 85000
+#define TSD_FREQ_REF_MILLI 1000
 
 typedef struct {
     uint64_t nr;
@@ -53,6 +56,7 @@ struct perf_ctx {
     struct timespec sw_last_timestamp;
     uint64_t sw_last_iterations;
     tsd_workload_fn workload;
+    tsd_telemetry_helper_t telemetry;
 };
 
 _Atomic uint64_t g_tsd_workload_iterations = 0;
@@ -223,6 +227,8 @@ typedef struct {
     size_t index;
     uint32_t mpki;
     int enabled;
+    tsd_telemetry_sample_t telemetry[128];
+    size_t telemetry_count;
 } test_perf_script_t;
 
 static test_perf_script_t g_test_perf_script = {0};
@@ -300,6 +306,8 @@ perf_ctx_t* tsd_perf_init(tsd_workload_fn workload_cb) {
             ctx->monitor_cpu = ctx->pinned_cpu;
         }
     }
+
+    tsd_telemetry_helper_init(&ctx->telemetry, ctx->monitor_cpu);
 
     const char *force_sw_env = getenv("TSD_FAKE_PERF");
     int force_sw = force_sw_env && force_sw_env[0] != '\0' && strcmp(force_sw_env, "0") != 0;
@@ -403,6 +411,7 @@ void tsd_perf_cleanup(perf_ctx_t *ctx) {
     if (ctx->fd_llc_misses >= 0) {
         close(ctx->fd_llc_misses);
     }
+    tsd_telemetry_helper_destroy(&ctx->telemetry);
     free(ctx);
 }
 
@@ -495,10 +504,14 @@ void tsd_perf_measure_baseline(perf_ctx_t *ctx, const tsd_runtime_config *cfg) {
     ctx->last_llc_value = llc_after;
     printf("Baseline CPI: %lu.%03lu\n", ctx->baseline_cpi / 1000, ctx->baseline_cpi % 1000);
     printf("Baseline MPKI: %lu.%03lu\n", ctx->baseline_llc_mpki_milli / 1000, ctx->baseline_llc_mpki_milli % 1000);
+    tsd_telemetry_sample_t baseline_sample = {0};
+    tsd_telemetry_helper_sample(&ctx->telemetry, &baseline_sample);
+    (void)baseline_sample;
 }
 
 static int process_measurement(perf_ctx_t *ctx, tsd_thermal_eval_t *out, uint64_t current_cpi,
-                               uint64_t mpki_milli, const tsd_runtime_config *cfg) {
+                               uint64_t mpki_milli, const tsd_runtime_config *cfg,
+                               const tsd_telemetry_sample_t *telemetry) {
     if (!ctx) {
         return 0;
     }
@@ -549,7 +562,26 @@ static int process_measurement(perf_ctx_t *ctx, tsd_thermal_eval_t *out, uint64_
     }
 
     uint64_t consensus_ratio = (ratio_milli + ctx->ratio_trimmed_milli) / 2;
-    uint64_t severity = (consensus_ratio > dynamic_threshold) ? (consensus_ratio - dynamic_threshold) : 0;
+    uint64_t base_severity = (consensus_ratio > dynamic_threshold) ?
+                             (consensus_ratio - dynamic_threshold) : 0;
+
+    uint64_t thermal_severity = 0;
+    if (cfg && telemetry) {
+        if (telemetry->temp_available && cfg->thermal_temp_weight_milli > 0) {
+            int64_t temp_excess = (int64_t)telemetry->package_temp_millic - (int64_t)TSD_TEMP_REF_MILLIC;
+            if (temp_excess > 0) {
+                thermal_severity += ((uint64_t)temp_excess * (uint64_t)cfg->thermal_temp_weight_milli) / 1000ULL;
+            }
+        }
+        if (telemetry->freq_ratio_available && cfg->thermal_ratio_weight_milli > 0) {
+            int64_t freq_deficit = (int64_t)TSD_FREQ_REF_MILLI - (int64_t)telemetry->freq_ratio_milli;
+            if (freq_deficit > 0) {
+                thermal_severity += ((uint64_t)freq_deficit * (uint64_t)cfg->thermal_ratio_weight_milli) / 1000ULL;
+            }
+        }
+    }
+
+    uint64_t severity = base_severity + thermal_severity;
 
     if (out) {
         out->cpi_milli = current_cpi;
@@ -557,7 +589,19 @@ static int process_measurement(perf_ctx_t *ctx, tsd_thermal_eval_t *out, uint64_
         out->trimmed_ratio_milli = ctx->ratio_trimmed_milli;
         out->llc_mpki_milli = mpki_milli;
         out->severity_milli = severity;
+        out->thermal_severity_milli = thermal_severity;
         out->memory_bound = memory_bound;
+        if (telemetry) {
+            out->temp_available = telemetry->temp_available;
+            out->freq_ratio_available = telemetry->freq_ratio_available;
+            out->package_temp_millic = telemetry->package_temp_millic;
+            out->freq_ratio_milli = telemetry->freq_ratio_milli;
+        } else {
+            out->temp_available = 0;
+            out->freq_ratio_available = 0;
+            out->package_temp_millic = 0;
+            out->freq_ratio_milli = 0;
+        }
     }
     return severity > 0;
 }
@@ -569,7 +613,8 @@ int tsd_perf_evaluate(perf_ctx_t *ctx, tsd_thermal_eval_t *out, const tsd_runtim
     if (ctx->mode == TSD_PERF_MODE_SOFTWARE) {
 #ifdef TSD_ENABLE_TESTS
         if (g_test_perf_script.enabled && g_test_perf_script.count > 0) {
-            uint32_t ratio = g_test_perf_script.ratios[g_test_perf_script.index];
+            size_t script_index = g_test_perf_script.index;
+            uint32_t ratio = g_test_perf_script.ratios[script_index];
             if (g_test_perf_script.index + 1 < g_test_perf_script.count) {
                 g_test_perf_script.index++;
             }
@@ -578,7 +623,17 @@ int tsd_perf_evaluate(perf_ctx_t *ctx, tsd_thermal_eval_t *out, const tsd_runtim
                 baseline = 1000;
             }
             uint64_t current_cpi = (uint64_t)(((__uint128_t)baseline * ratio + 500u) / 1000u);
-            return process_measurement(ctx, out, current_cpi, g_test_perf_script.mpki, cfg);
+            tsd_telemetry_sample_t scripted_telemetry = {0};
+            if (g_test_perf_script.telemetry_count > 0) {
+                size_t tele_index = script_index;
+                if (tele_index >= g_test_perf_script.telemetry_count) {
+                    tele_index = g_test_perf_script.telemetry_count - 1;
+                }
+                scripted_telemetry = g_test_perf_script.telemetry[tele_index];
+            } else {
+                tsd_telemetry_helper_sample(&ctx->telemetry, &scripted_telemetry);
+            }
+            return process_measurement(ctx, out, current_cpi, g_test_perf_script.mpki, cfg, &scripted_telemetry);
         }
 #endif
         if (!ctx->software_adaptation) {
@@ -601,7 +656,9 @@ int tsd_perf_evaluate(perf_ctx_t *ctx, tsd_thermal_eval_t *out, const tsd_runtim
         if (current_cpi == 0) {
             current_cpi = ctx->baseline_cpi ?: 1000;
         }
-        return process_measurement(ctx, out, current_cpi, 0, cfg);
+        tsd_telemetry_sample_t telemetry = {0};
+        tsd_telemetry_helper_sample(&ctx->telemetry, &telemetry);
+        return process_measurement(ctx, out, current_cpi, 0, cfg, &telemetry);
     }
 
     perf_group_read_t rd_now = {0};
@@ -642,7 +699,9 @@ int tsd_perf_evaluate(perf_ctx_t *ctx, tsd_thermal_eval_t *out, const tsd_runtim
     ctx->last_group_read = rd_now;
     ctx->last_llc_value = llc_now;
 
-    return process_measurement(ctx, out, current_cpi, mpki_milli, cfg);
+    tsd_telemetry_sample_t telemetry = {0};
+    tsd_telemetry_helper_sample(&ctx->telemetry, &telemetry);
+    return process_measurement(ctx, out, current_cpi, mpki_milli, cfg, &telemetry);
 }
 
 tsd_perf_mode_t tsd_perf_get_mode(const perf_ctx_t *ctx) {
@@ -668,6 +727,22 @@ void tsd_perf_set_fake_script(const uint32_t *ratios, size_t count, uint32_t mpk
     g_test_perf_script.index = 0;
     g_test_perf_script.mpki = mpki;
     g_test_perf_script.enabled = 1;
+    memset(g_test_perf_script.telemetry, 0, sizeof(g_test_perf_script.telemetry));
+    g_test_perf_script.telemetry_count = 0;
+}
+
+void tsd_perf_set_fake_telemetry(const tsd_telemetry_sample_t *samples, size_t count) {
+    size_t max_entries = sizeof(g_test_perf_script.telemetry) / sizeof(g_test_perf_script.telemetry[0]);
+    if (!samples || count == 0) {
+        g_test_perf_script.telemetry_count = 0;
+        memset(g_test_perf_script.telemetry, 0, sizeof(g_test_perf_script.telemetry));
+        return;
+    }
+    if (count > max_entries) {
+        count = max_entries;
+    }
+    memcpy(g_test_perf_script.telemetry, samples, count * sizeof(tsd_telemetry_sample_t));
+    g_test_perf_script.telemetry_count = count;
 }
 
 void tsd_perf_clear_fake_script(void) {
