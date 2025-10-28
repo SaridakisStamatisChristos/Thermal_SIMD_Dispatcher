@@ -51,6 +51,7 @@ void tsd_test_perf_destroy_dummy_context(perf_ctx_t *ctx);
 void tsd_test_perf_set_group_fd(perf_ctx_t *ctx, int fd);
 void tsd_test_perf_set_llc_fd(perf_ctx_t *ctx, int fd);
 void tsd_test_perf_set_mode(perf_ctx_t *ctx, tsd_perf_mode_t mode);
+void tsd_test_perf_rewind_mode(perf_ctx_t *ctx, int seconds);
 void tsd_test_perf_set_read_streams(const tsd_perf_test_read_stream_t *streams, size_t count);
 void tsd_test_perf_clear_read_streams(void);
 uint64_t tsd_test_perf_get_baseline_cpi(const perf_ctx_t *ctx);

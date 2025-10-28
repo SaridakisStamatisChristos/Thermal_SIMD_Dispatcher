@@ -18,6 +18,7 @@
 #include <thermal/simd/thermal_signals.h>
 #include <thermal/simd/thermal_trampoline.h>
 #include <thermal/simd/logging.h>
+#include <thermal/simd/health_check.h>
 
 #ifdef TSD_ENABLE_TESTS
 #include "thermal_simd_test.h"
@@ -143,6 +144,21 @@ void* thermal_monitor_thread(void *arg) {
             continue;
         }
         if (dwell_ticks < g_tsd_config.min_dwell_ticks) {
+            continue;
+        }
+        if (tsd_perf_check_software_timeout(ctx, g_tsd_config.degraded_timeout_sec)) {
+            simd_width_t current_width = atomic_load_explicit(&g_tsd_current_width, memory_order_acquire);
+            if (current_width != SIMD_SSE41) {
+                if (tsd_trampoline_patch(SIMD_SSE41) == 0) {
+                    width = SIMD_SSE41;
+                } else {
+                    tsd_log_error(LOG_COMPONENT, "fail-closed patch to SSE4.1 failed");
+                }
+            } else {
+                width = current_width;
+            }
+            cooldown = g_tsd_config.cooldown_down_ticks;
+            dwell_ticks = 0;
             continue;
         }
         tsd_thermal_eval_t eval = {0};
@@ -319,6 +335,10 @@ int main(int argc, char **argv) {
         return 1;
     }
     print_configuration(max_width);
+    if (g_tsd_config.health_check_mode) {
+        tsd_log_info(LOG_COMPONENT, "Running health check mode");
+        return tsd_run_health_check();
+    }
     run_demo();
     return 0;
 }

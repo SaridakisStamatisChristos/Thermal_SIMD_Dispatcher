@@ -34,6 +34,7 @@ extern _Atomic unsigned char g_tsd_last_patched_width;
 int tsd_trampoline_init(void);
 int tsd_trampoline_patch(simd_width_t new_width);
 int init_double_buffer_trampoline(void);
+int tsd_trampoline_self_validate(char *reason, size_t reason_len);
 
 #ifdef TSD_ENABLE_TESTS
 void tsd_trampoline_override_patch(simd_width_t width, const uint8_t *bytes, size_t len);

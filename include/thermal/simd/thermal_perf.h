@@ -46,6 +46,7 @@ int tsd_perf_evaluate(perf_ctx_t *ctx, tsd_thermal_eval_t *out, const tsd_runtim
 tsd_perf_mode_t tsd_perf_get_mode(const perf_ctx_t *ctx);
 int tsd_perf_get_pinned_cpu(const perf_ctx_t *ctx);
 int tsd_perf_get_monitor_cpu(const perf_ctx_t *ctx);
+int tsd_perf_check_software_timeout(perf_ctx_t *ctx, int timeout_sec);
 
 #ifdef TSD_ENABLE_TESTS
 typedef enum {

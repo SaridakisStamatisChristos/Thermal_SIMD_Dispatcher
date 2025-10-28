@@ -24,6 +24,9 @@ typedef struct {
     int min_dwell_ticks;
     int thermal_temp_weight_milli;
     int thermal_ratio_weight_milli;
+    int degraded_timeout_sec;
+    int degraded_policy_active;
+    int health_check_mode;
     tsd_log_level_t log_level;
 } tsd_runtime_config;
 
@@ -31,6 +34,9 @@ extern tsd_runtime_config g_tsd_config;
 
 void tsd_runtime_config_set_defaults(tsd_runtime_config *cfg);
 int tsd_runtime_config_refresh_ticks(tsd_runtime_config *cfg);
+void tsd_runtime_config_enter_degraded_mode(tsd_runtime_config *cfg, const char *reason);
+void tsd_runtime_config_exit_degraded_mode(tsd_runtime_config *cfg, const char *reason);
+int tsd_runtime_config_is_degraded(void);
 
 #ifndef TSD_ENABLE_TESTS
 int tsd_runtime_config_parse_cli(tsd_runtime_config *cfg, int argc, char **argv);

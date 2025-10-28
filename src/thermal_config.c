@@ -1,6 +1,7 @@
 #include <thermal/simd/thermal_config.h>
 
 #include <errno.h>
+#include <inttypes.h>
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -29,16 +30,96 @@ static const tsd_runtime_config k_default_config = {
     .min_dwell_ticks = 0,
     .thermal_temp_weight_milli = 0,
     .thermal_ratio_weight_milli = 0,
+    .degraded_timeout_sec = 120,
+    .degraded_policy_active = 0,
+    .health_check_mode = 0,
     .log_level = TSD_LOG_LEVEL_INFO,
 };
 
 tsd_runtime_config g_tsd_config;
+
+static tsd_runtime_config g_tsd_degraded_backup;
+static int g_tsd_degraded_active = 0;
 
 void tsd_runtime_config_set_defaults(tsd_runtime_config *cfg) {
     if (!cfg) {
         return;
     }
     *cfg = k_default_config;
+    cfg->degraded_policy_active = 0;
+    g_tsd_degraded_active = 0;
+    memset(&g_tsd_degraded_backup, 0, sizeof(g_tsd_degraded_backup));
+}
+
+static void log_policy_change(const tsd_runtime_config *cfg, const char *reason, const char *state) {
+    if (!cfg) {
+        return;
+    }
+    tsd_log_warn(LOG_COMPONENT,
+                 "event=policy_state state=%s reason=%s down_count=%d up_count=%d cooldown_down_ms=%d cooldown_up_ms=%d min_dwell_ms=%d down_ratio_milli=%" PRIu64,
+                 state ? state : "unknown",
+                 reason ? reason : "unknown",
+                 cfg->down_count,
+                 cfg->up_count,
+                 cfg->cooldown_down_ms,
+                 cfg->cooldown_up_ms,
+                 cfg->min_dwell_ms,
+                 cfg->down_ratio_milli);
+}
+
+void tsd_runtime_config_enter_degraded_mode(tsd_runtime_config *cfg, const char *reason) {
+    if (!cfg) {
+        return;
+    }
+    if (g_tsd_degraded_active) {
+        return;
+    }
+    g_tsd_degraded_backup = *cfg;
+    g_tsd_degraded_active = 1;
+    cfg->degraded_policy_active = 1;
+    if (cfg->down_count > 1) {
+        cfg->down_count = cfg->down_count - 1;
+    }
+    if (cfg->up_count < 10) {
+        cfg->up_count = cfg->up_count + 2;
+    }
+    if (cfg->cooldown_down_ms < 2000) {
+        cfg->cooldown_down_ms = 2000;
+    } else {
+        cfg->cooldown_down_ms *= 2;
+    }
+    if (cfg->cooldown_up_ms < 4000) {
+        cfg->cooldown_up_ms = 4000;
+    } else {
+        cfg->cooldown_up_ms *= 2;
+    }
+    if (cfg->min_dwell_ms < 500) {
+        cfg->min_dwell_ms = 500;
+    }
+    if (cfg->down_ratio_milli > 1300) {
+        cfg->down_ratio_milli = 1300;
+        cfg->down_ratio = (double)cfg->down_ratio_milli / 1000.0;
+    }
+    tsd_runtime_config_refresh_ticks(cfg);
+    log_policy_change(cfg, reason, "degraded");
+}
+
+void tsd_runtime_config_exit_degraded_mode(tsd_runtime_config *cfg, const char *reason) {
+    if (!cfg) {
+        return;
+    }
+    if (!g_tsd_degraded_active) {
+        return;
+    }
+    *cfg = g_tsd_degraded_backup;
+    cfg->degraded_policy_active = 0;
+    g_tsd_degraded_active = 0;
+    tsd_runtime_config_refresh_ticks(cfg);
+    log_policy_change(cfg, reason, "recovered");
+}
+
+int tsd_runtime_config_is_degraded(void) {
+    return g_tsd_degraded_active;
 }
 
 int tsd_runtime_config_refresh_ticks(tsd_runtime_config *cfg) {
@@ -104,6 +185,9 @@ void tsd_runtime_config_print_usage(const char *prog) {
     printf("  --thermal-ratio-weight=W Frequency ratio severity weight in milli [0-100000] (default: 0)\n");
     printf("  --duration-sec=S       Demo duration (default: 10)\n");
     printf("  --work-iters=N         Inner work iterations per second (default: 10000000)\n");
+    printf("  --degraded-timeout-sec=S Fail closed if hardware counters missing for S seconds (default: %d)\n",
+           k_default_config.degraded_timeout_sec);
+    printf("  --health-check         Run diagnostics and exit with status\n");
     printf("  --log-level=LEVEL      Log verbosity (error, warn, info, debug)\n");
     printf("  --help                 Show this help\n");
 }
@@ -183,6 +267,12 @@ int tsd_runtime_config_parse_cli(tsd_runtime_config *cfg, int argc, char **argv)
             if (tsd_parse_int_option(argv[i] + 13, 1, INT_MAX, &cfg->work_iters) != 0) {
                 die_invalid_option("--work-iters", argv[i] + 13);
             }
+        } else if (!strncmp(argv[i], "--degraded-timeout-sec=", 23)) {
+            if (tsd_parse_int_option(argv[i] + 23, 1, 86400, &cfg->degraded_timeout_sec) != 0) {
+                die_invalid_option("--degraded-timeout-sec", argv[i] + 23);
+            }
+        } else if (!strcmp(argv[i], "--health-check")) {
+            cfg->health_check_mode = 1;
         } else if (!strncmp(argv[i], "--log-level=", 12)) {
             tsd_log_level_t parsed_level;
             if (tsd_log_level_from_string(argv[i] + 12, &parsed_level) != 0) {

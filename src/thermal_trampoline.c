@@ -15,6 +15,7 @@
 
 #include <thermal/simd/thermal_cpu.h>
 #include <thermal/simd/logging.h>
+#include <thermal/simd/metrics.h>
 
 #ifdef TSD_ENABLE_TESTS
 #include "thermal_simd_test.h"
@@ -179,6 +180,7 @@ int tsd_trampoline_patch(simd_width_t new_width) {
     int rc = 0;
     pthread_mutex_lock(&g_tsd_patch_lock);
     simd_width_t width = atomic_load_explicit(&g_tsd_current_width, memory_order_acquire);
+    simd_width_t previous_width = width;
     int initialized = atomic_load_explicit(&g_tsd_trampoline_initialized, memory_order_acquire);
     if (initialized && new_width == width) {
         pthread_mutex_unlock(&g_tsd_patch_lock);
@@ -289,8 +291,51 @@ out_restore:
         }
         made_writable = false;
     }
+    tsd_metrics_record_width_transition(previous_width, new_width, rc);
     pthread_mutex_unlock(&g_tsd_patch_lock);
     return rc;
+}
+
+int tsd_trampoline_self_validate(char *reason, size_t reason_len) {
+    if (reason && reason_len > 0) {
+        reason[0] = '\0';
+    }
+    if (!atomic_load_explicit(&g_tsd_trampoline_initialized, memory_order_acquire)) {
+        if (reason && reason_len > 0) {
+            snprintf(reason, reason_len, "%s", "trampoline not initialised");
+        }
+        return -1;
+    }
+    simd_width_t width = atomic_load_explicit(&g_tsd_current_width, memory_order_acquire);
+    size_t expected_len = 0;
+    const uint8_t *expected = select_patch(width, &expected_len);
+    if (!expected || expected_len == 0) {
+        if (reason && reason_len > 0) {
+            snprintf(reason, reason_len, "unknown width %d", (int)width);
+        }
+        return -1;
+    }
+    tsd_patch_slot_t *active = atomic_load_explicit(&g_tsd_active_trampoline, memory_order_acquire);
+    if (!active) {
+        if (reason && reason_len > 0) {
+            snprintf(reason, reason_len, "%s", "active slot null");
+        }
+        return -1;
+    }
+    if (memcmp(active->code, expected, expected_len) != 0) {
+        if (reason && reason_len > 0) {
+            snprintf(reason, reason_len, "%s", "active slot checksum mismatch");
+        }
+        return -1;
+    }
+    if ((g_tsd_trampoline_ctx.page_a_prot & PROT_WRITE) ||
+        (g_tsd_trampoline_ctx.page_b_prot & PROT_WRITE)) {
+        if (reason && reason_len > 0) {
+            snprintf(reason, reason_len, "%s", "trampoline page writable");
+        }
+        return -1;
+    }
+    return 0;
 }
 
 #ifdef TSD_ENABLE_TESTS

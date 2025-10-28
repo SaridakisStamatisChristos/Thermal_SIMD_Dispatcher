@@ -5,8 +5,8 @@ LDFLAGS ?= -pthread
 
 BIN := thermal_simd
 SRC := src/thermal_simd.c src/logging.c src/config_parser.c src/statistics.c \
-src/telemetry_helper.c src/thermal_config.c src/thermal_cpu.c src/thermal_trampoline.c \
-src/thermal_perf.c src/thermal_signals.c
+src/runtime_metrics.c src/health_check.c src/telemetry_helper.c src/thermal_config.c \
+src/thermal_cpu.c src/thermal_trampoline.c src/thermal_perf.c src/thermal_signals.c
 
 .PHONY: all clean run
 

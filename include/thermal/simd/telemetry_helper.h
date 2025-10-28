@@ -2,6 +2,7 @@
 #define TSD_TELEMETRY_HELPER_H
 
 #include <stdint.h>
+#include <time.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -25,6 +26,12 @@ typedef struct {
     uint64_t last_mperf;
     char temp_path[256];
     char freq_cur_path[256];
+    time_t temp_retry_deadline;
+    time_t freq_retry_deadline;
+    time_t msr_retry_deadline;
+    int temp_backoff_seconds;
+    int freq_backoff_seconds;
+    int msr_backoff_seconds;
 } tsd_telemetry_helper_t;
 
 int tsd_telemetry_helper_init(tsd_telemetry_helper_t *helper, int cpu);

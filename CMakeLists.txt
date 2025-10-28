@@ -17,6 +17,8 @@ set(THERMAL_SIMD_CORE_SOURCES
     src/logging.c
     src/config_parser.c
     src/statistics.c
+    src/runtime_metrics.c
+    src/health_check.c
     src/telemetry_helper.c
     src/thermal_config.c
     src/thermal_cpu.c
