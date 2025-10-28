@@ -22,6 +22,9 @@ set(THERMAL_SIMD_CORE_SOURCES
     src/runtime_metrics.c
     src/health_check.c
     src/telemetry_helper.c
+    src/telemetry/evaluator.cpp
+    src/telemetry/history_store.cpp
+    src/telemetry/sensors.cpp
     src/thermal_config.c
     src/thermal_cpu.c
     src/thermal_trampoline.c
@@ -80,6 +83,11 @@ if(BUILD_TESTING)
     target_link_libraries(test_policy_controller PRIVATE thermal_simd_core_tests)
     target_compile_options(test_policy_controller PRIVATE -Wall -Wextra)
     add_test(NAME policy_controller COMMAND test_policy_controller)
+
+    add_executable(test_telemetry tests/telemetry/test_telemetry.cpp)
+    target_link_libraries(test_telemetry PRIVATE thermal_simd_core_tests)
+    target_compile_options(test_telemetry PRIVATE -Wall -Wextra)
+    add_test(NAME telemetry_adapters COMMAND test_telemetry)
 endif()
 
 install(TARGETS thermal_simd_core
