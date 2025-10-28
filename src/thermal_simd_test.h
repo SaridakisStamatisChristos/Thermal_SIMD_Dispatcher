@@ -5,6 +5,7 @@
 #include <stdint.h>
 
 #include <thermal/simd/simd_width.h>
+#include <thermal/simd/thermal_perf.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -44,6 +45,17 @@ int tsd_test_inactive_page_writable(void);
 perf_ctx_t* tsd_test_init_perf(void);
 void tsd_test_measure_baseline(perf_ctx_t *ctx);
 void tsd_test_cleanup_perf(perf_ctx_t *ctx);
+perf_ctx_t* tsd_test_perf_create_dummy_context(void);
+void tsd_test_perf_destroy_dummy_context(perf_ctx_t *ctx);
+void tsd_test_perf_set_group_fd(perf_ctx_t *ctx, int fd);
+void tsd_test_perf_set_llc_fd(perf_ctx_t *ctx, int fd);
+void tsd_test_perf_set_mode(perf_ctx_t *ctx, tsd_perf_mode_t mode);
+void tsd_test_perf_set_read_streams(const tsd_perf_test_read_stream_t *streams, size_t count);
+void tsd_test_perf_clear_read_streams(void);
+uint64_t tsd_test_perf_get_baseline_cpi(const perf_ctx_t *ctx);
+uint64_t tsd_test_perf_get_baseline_mpki(const perf_ctx_t *ctx);
+int tsd_test_perf_get_last_group_valid(const perf_ctx_t *ctx);
+uint64_t tsd_test_perf_get_last_llc_value(const perf_ctx_t *ctx);
 int init_double_buffer_trampoline(void);
 void* thermal_monitor_thread(void *arg);
 

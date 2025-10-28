@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include <pthread.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -158,10 +159,123 @@ static int run_patch_failure_diagnostic(void) {
     return 0;
 }
 
+static int run_perf_read_retry_test(void) {
+    typedef struct {
+        uint64_t nr;
+        uint64_t time_enabled;
+        uint64_t time_running;
+        uint64_t values[2];
+    } perf_group_read_test_t;
+
+    int rc = 0;
+    perf_ctx_t *ctx = tsd_test_perf_create_dummy_context();
+    if (!ctx) {
+        fprintf(stderr, "failed to create dummy perf context\n");
+        return 1;
+    }
+    tsd_test_perf_set_mode(ctx, TSD_PERF_MODE_HARDWARE);
+    tsd_test_perf_set_group_fd(ctx, 100);
+    tsd_test_perf_set_llc_fd(ctx, 101);
+
+    const perf_group_read_test_t rd_before = {
+        .nr = 2,
+        .time_enabled = 100,
+        .time_running = 100,
+        .values = {1000, 500},
+    };
+    const perf_group_read_test_t rd_after = {
+        .nr = 2,
+        .time_enabled = 200,
+        .time_running = 200,
+        .values = {3000, 2500},
+    };
+    uint8_t group_bytes[sizeof(rd_before) + sizeof(rd_after)] = {0};
+    memcpy(group_bytes, &rd_before, sizeof(rd_before));
+    memcpy(group_bytes + sizeof(rd_before), &rd_after, sizeof(rd_after));
+
+    const uint64_t llc_values[2] = {10, 30};
+
+    const tsd_perf_test_read_step_t group_steps[] = {
+        {TSD_PERF_TEST_STEP_EINTR, 0},
+        {TSD_PERF_TEST_STEP_DATA, 16},
+        {TSD_PERF_TEST_STEP_DATA, sizeof(rd_before) - 16},
+        {TSD_PERF_TEST_STEP_EINTR, 0},
+        {TSD_PERF_TEST_STEP_DATA, 8},
+        {TSD_PERF_TEST_STEP_DATA, sizeof(rd_after) - 8},
+    };
+    const tsd_perf_test_read_step_t llc_steps[] = {
+        {TSD_PERF_TEST_STEP_EINTR, 0},
+        {TSD_PERF_TEST_STEP_DATA, 5},
+        {TSD_PERF_TEST_STEP_DATA, 3},
+        {TSD_PERF_TEST_STEP_EINTR, 0},
+        {TSD_PERF_TEST_STEP_DATA, 2},
+        {TSD_PERF_TEST_STEP_DATA, 6},
+    };
+    const tsd_perf_test_read_stream_t baseline_streams[] = {
+        {100, group_steps, sizeof(group_steps) / sizeof(group_steps[0]), group_bytes, sizeof(group_bytes)},
+        {101, llc_steps, sizeof(llc_steps) / sizeof(llc_steps[0]), (const uint8_t *)llc_values, sizeof(llc_values)},
+    };
+    tsd_test_perf_set_read_streams(baseline_streams, sizeof(baseline_streams) / sizeof(baseline_streams[0]));
+    tsd_perf_measure_baseline(ctx, NULL);
+    tsd_test_perf_clear_read_streams();
+
+    if (tsd_test_perf_get_baseline_cpi(ctx) != 1000 ||
+        tsd_test_perf_get_baseline_mpki(ctx) == 0 ||
+        !tsd_test_perf_get_last_group_valid(ctx) ||
+        tsd_test_perf_get_last_llc_value(ctx) != llc_values[1]) {
+        fprintf(stderr, "baseline read retry verification failed\n");
+        rc = 1;
+        goto out;
+    }
+
+    const perf_group_read_test_t rd_next = {
+        .nr = 2,
+        .time_enabled = 300,
+        .time_running = 300,
+        .values = {7000, 4500},
+    };
+    const tsd_perf_test_read_step_t eval_group_steps[] = {
+        {TSD_PERF_TEST_STEP_EINTR, 0},
+        {TSD_PERF_TEST_STEP_DATA, 12},
+        {TSD_PERF_TEST_STEP_DATA, sizeof(rd_next) - 12},
+    };
+    const uint64_t llc_next = 60;
+    const tsd_perf_test_read_step_t eval_llc_steps[] = {
+        {TSD_PERF_TEST_STEP_EINTR, 0},
+        {TSD_PERF_TEST_STEP_DATA, 5},
+        {TSD_PERF_TEST_STEP_DATA, 3},
+    };
+    uint8_t eval_group_bytes[sizeof(rd_next)] = {0};
+    memcpy(eval_group_bytes, &rd_next, sizeof(rd_next));
+    const tsd_perf_test_read_stream_t eval_streams[] = {
+        {100, eval_group_steps, sizeof(eval_group_steps) / sizeof(eval_group_steps[0]), eval_group_bytes, sizeof(eval_group_bytes)},
+        {101, eval_llc_steps, sizeof(eval_llc_steps) / sizeof(eval_llc_steps[0]), (const uint8_t *)&llc_next, sizeof(llc_next)},
+    };
+    tsd_test_perf_set_read_streams(eval_streams, sizeof(eval_streams) / sizeof(eval_streams[0]));
+    tsd_thermal_eval_t eval = {0};
+    int triggered = tsd_perf_evaluate(ctx, &eval, NULL);
+    tsd_test_perf_clear_read_streams();
+
+    if (!tsd_test_perf_get_last_group_valid(ctx) ||
+        tsd_test_perf_get_last_llc_value(ctx) != llc_next ||
+        eval.cpi_milli == 0 ||
+        triggered == 0) {
+        fprintf(stderr, "evaluation read retry verification failed\n");
+        rc = 1;
+    }
+
+out:
+    tsd_test_perf_destroy_dummy_context(ctx);
+    return rc;
+}
+
 int main(void) {
     tsd_test_reset_runtime();
     if (init_double_buffer_trampoline() != 0) {
         fprintf(stderr, "initial trampoline init failed\n");
+        return 1;
+    }
+    if (run_perf_read_retry_test() != 0) {
         return 1;
     }
     if (run_monitor_thread_scenario() != 0) {
