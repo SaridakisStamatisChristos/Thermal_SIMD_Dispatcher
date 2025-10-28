@@ -28,7 +28,7 @@ set(THERMAL_SIMD_CORE_SOURCES
     src/observability/metrics.cpp
     src/thermal_config.c
     src/thermal_cpu.c
-    src/thermal_trampoline.c
+    src/patcher/trampoline.cpp
     src/thermal_perf.c
     src/thermal_signals.c
     src/policy/policy_config.c
@@ -103,6 +103,13 @@ if(BUILD_TESTING)
     target_link_libraries(test_telemetry PRIVATE thermal_simd_core_tests)
     target_compile_options(test_telemetry PRIVATE -Wall -Wextra)
     add_test(NAME telemetry_adapters COMMAND test_telemetry)
+
+    add_executable(test_trampoline_security tests/patcher/test_trampoline_security.cpp)
+    target_link_libraries(test_trampoline_security PRIVATE thermal_simd_core_tests pthread)
+    target_compile_definitions(test_trampoline_security PRIVATE TSD_ENABLE_TESTS)
+    target_compile_options(test_trampoline_security PRIVATE -Wall -Wextra -pthread)
+    target_include_directories(test_trampoline_security PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME trampoline_security COMMAND test_trampoline_security)
 
     add_executable(test_integration_metrics_tuner tests/integration/metrics_tuner.cpp)
     target_link_libraries(test_integration_metrics_tuner PRIVATE tsd_policy_tuner pthread)
