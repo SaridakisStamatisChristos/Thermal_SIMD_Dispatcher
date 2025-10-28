@@ -61,6 +61,162 @@ static int warned_llc_unavailable = 0;
 static int warned_perf_group_layout = 0;
 
 #ifdef TSD_ENABLE_TESTS
+#define TSD_PERF_TEST_MAX_STREAMS 4
+#define TSD_PERF_TEST_READ_DEFER ((ssize_t)-2)
+
+typedef struct {
+    tsd_perf_test_read_stream_t spec;
+    size_t step_index;
+    size_t data_offset;
+} tsd_perf_test_read_stream_state_t;
+
+static tsd_perf_test_read_stream_state_t g_test_read_streams[TSD_PERF_TEST_MAX_STREAMS] = {0};
+static size_t g_test_read_stream_count = 0;
+#endif
+
+#ifdef TSD_ENABLE_TESTS
+typedef ssize_t (*tsd_perf_test_read_hook_t)(int fd, void *buf, size_t count);
+static tsd_perf_test_read_hook_t g_test_read_hook = NULL;
+#endif
+
+static ssize_t tsd_perf_sys_read(int fd, void *buf, size_t count) {
+#ifdef TSD_ENABLE_TESTS
+    if (g_test_read_hook) {
+        ssize_t rv = g_test_read_hook(fd, buf, count);
+        if (rv != TSD_PERF_TEST_READ_DEFER) {
+            return rv;
+        }
+    }
+#endif
+    return read(fd, buf, count);
+}
+
+static int tsd_perf_read_exact(int fd, void *buf, size_t size) {
+    if (fd < 0 || !buf || size == 0) {
+        return -1;
+    }
+    uint8_t *out = buf;
+    size_t total = 0;
+    while (total < size) {
+        ssize_t n = tsd_perf_sys_read(fd, out + total, size - total);
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return -1;
+        }
+        if (n == 0) {
+            return -1;
+        }
+        total += (size_t)n;
+    }
+    return 0;
+}
+#ifdef TSD_ENABLE_TESTS
+static ssize_t tsd_perf_test_stream_hook(int fd, void *buf, size_t count) {
+    for (size_t i = 0; i < g_test_read_stream_count; ++i) {
+        tsd_perf_test_read_stream_state_t *stream = &g_test_read_streams[i];
+        if (stream->spec.fd != fd) {
+            continue;
+        }
+        if (stream->step_index >= stream->spec.step_count) {
+            return -1;
+        }
+        const tsd_perf_test_read_step_t *step = &stream->spec.steps[stream->step_index++];
+        if (step->type == TSD_PERF_TEST_STEP_EINTR) {
+            errno = EINTR;
+            return -1;
+        }
+        size_t remaining = stream->spec.data_len - stream->data_offset;
+        size_t to_copy = step->bytes;
+        if (to_copy > remaining) {
+            to_copy = remaining;
+        }
+        if (to_copy > count) {
+            to_copy = count;
+        }
+        if (to_copy == 0) {
+            return 0;
+        }
+        memcpy(buf, stream->spec.data + stream->data_offset, to_copy);
+        stream->data_offset += to_copy;
+        return (ssize_t)to_copy;
+    }
+    return TSD_PERF_TEST_READ_DEFER;
+}
+
+void tsd_perf_test_set_read_streams(const tsd_perf_test_read_stream_t *streams, size_t count) {
+    g_test_read_stream_count = (count > TSD_PERF_TEST_MAX_STREAMS) ? TSD_PERF_TEST_MAX_STREAMS : count;
+    for (size_t i = 0; i < g_test_read_stream_count; ++i) {
+        g_test_read_streams[i].spec = streams[i];
+        g_test_read_streams[i].step_index = 0;
+        g_test_read_streams[i].data_offset = 0;
+    }
+    g_test_read_hook = tsd_perf_test_stream_hook;
+}
+
+void tsd_perf_test_clear_read_streams(void) {
+    g_test_read_stream_count = 0;
+    memset(g_test_read_streams, 0, sizeof(g_test_read_streams));
+    g_test_read_hook = NULL;
+}
+
+perf_ctx_t* tsd_perf_test_create_dummy_context(void) {
+    perf_ctx_t *ctx = calloc(1, sizeof(perf_ctx_t));
+    if (!ctx) {
+        return NULL;
+    }
+    ctx->fd_cycles = -1;
+    ctx->fd_insns = -1;
+    ctx->fd_llc_misses = -1;
+    ctx->baseline_cpi = 1000;
+    ctx->baseline_llc_mpki_milli = 1000;
+    ctx->mode = TSD_PERF_MODE_NONE;
+    ctx->pinned_cpu = 0;
+    ctx->monitor_cpu = 0;
+    return ctx;
+}
+
+void tsd_perf_test_destroy_dummy_context(perf_ctx_t *ctx) {
+    free(ctx);
+}
+
+void tsd_perf_test_set_group_fd(perf_ctx_t *ctx, int fd) {
+    if (ctx) {
+        ctx->fd_cycles = fd;
+    }
+}
+
+void tsd_perf_test_set_llc_fd(perf_ctx_t *ctx, int fd) {
+    if (ctx) {
+        ctx->fd_llc_misses = fd;
+    }
+}
+
+void tsd_perf_test_set_mode(perf_ctx_t *ctx, tsd_perf_mode_t mode) {
+    if (ctx) {
+        ctx->mode = mode;
+    }
+}
+
+uint64_t tsd_perf_test_get_baseline_cpi(const perf_ctx_t *ctx) {
+    return ctx ? ctx->baseline_cpi : 0;
+}
+
+uint64_t tsd_perf_test_get_baseline_mpki(const perf_ctx_t *ctx) {
+    return ctx ? ctx->baseline_llc_mpki_milli : 0;
+}
+
+int tsd_perf_test_get_last_group_valid(const perf_ctx_t *ctx) {
+    return ctx ? ctx->last_group_valid : 0;
+}
+
+uint64_t tsd_perf_test_get_last_llc_value(const perf_ctx_t *ctx) {
+    return ctx ? ctx->last_llc_value : 0;
+}
+#endif
+
+#ifdef TSD_ENABLE_TESTS
 typedef struct {
     uint32_t ratios[128];
     size_t count;
@@ -294,14 +450,12 @@ void tsd_perf_measure_baseline(perf_ctx_t *ctx, const tsd_runtime_config *cfg) {
 
     perf_group_read_t rd_before = {0}, rd_after = {0};
     uint64_t llc_before = 0, llc_after = 0;
-    ssize_t n = read(ctx->fd_cycles, &rd_before, sizeof(rd_before));
-    if (n < (ssize_t)sizeof(rd_before) || rd_before.nr != 2) {
+    if (tsd_perf_read_exact(ctx->fd_cycles, &rd_before, sizeof(rd_before)) != 0 || rd_before.nr != 2) {
         ctx->baseline_cpi = 1000;
         return;
     }
     if (ctx->fd_llc_misses >= 0) {
-        ssize_t llc_read = read(ctx->fd_llc_misses, &llc_before, sizeof(llc_before));
-        if (llc_read < 0) {
+        if (tsd_perf_read_exact(ctx->fd_llc_misses, &llc_before, sizeof(llc_before)) != 0) {
             llc_before = 0;
         }
     }
@@ -310,14 +464,12 @@ void tsd_perf_measure_baseline(perf_ctx_t *ctx, const tsd_runtime_config *cfg) {
             ctx->workload();
         }
     }
-    n = read(ctx->fd_cycles, &rd_after, sizeof(rd_after));
-    if (n < (ssize_t)sizeof(rd_after) || rd_after.nr != 2) {
+    if (tsd_perf_read_exact(ctx->fd_cycles, &rd_after, sizeof(rd_after)) != 0 || rd_after.nr != 2) {
         ctx->baseline_cpi = 1000;
         return;
     }
     if (ctx->fd_llc_misses >= 0) {
-        ssize_t llc_read = read(ctx->fd_llc_misses, &llc_after, sizeof(llc_after));
-        if (llc_read < 0) {
+        if (tsd_perf_read_exact(ctx->fd_llc_misses, &llc_after, sizeof(llc_after)) != 0) {
             llc_after = llc_before;
         }
     }
@@ -454,20 +606,18 @@ int tsd_perf_evaluate(perf_ctx_t *ctx, tsd_thermal_eval_t *out, const tsd_runtim
 
     perf_group_read_t rd_now = {0};
     uint64_t llc_now = 0;
-    ssize_t n = read(ctx->fd_cycles, &rd_now, sizeof(rd_now));
-    if (n >= (ssize_t)sizeof(rd_now) && rd_now.nr != 2 && !warned_perf_group_layout) {
+    if (tsd_perf_read_exact(ctx->fd_cycles, &rd_now, sizeof(rd_now)) == 0 && rd_now.nr != 2 && !warned_perf_group_layout) {
         fprintf(stderr,
                 "warning: perf group returned %" PRIu64 " counters (expected 2); cycle telemetry disabled\n",
                 (uint64_t)rd_now.nr);
         warned_perf_group_layout = 1;
     }
-    if (n < (ssize_t)sizeof(rd_now) || rd_now.nr != 2) {
+    if (rd_now.nr != 2) {
         ctx->last_group_valid = 0;
         return 0;
     }
     if (ctx->fd_llc_misses >= 0) {
-        ssize_t llc_read = read(ctx->fd_llc_misses, &llc_now, sizeof(llc_now));
-        if (llc_read < 0) {
+        if (tsd_perf_read_exact(ctx->fd_llc_misses, &llc_now, sizeof(llc_now)) != 0) {
             llc_now = ctx->last_llc_value;
         }
     }

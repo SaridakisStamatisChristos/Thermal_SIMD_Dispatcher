@@ -391,4 +391,48 @@ void tsd_test_cleanup_perf(perf_ctx_t *ctx) {
     tsd_perf_cleanup(ctx);
 }
 
+perf_ctx_t* tsd_test_perf_create_dummy_context(void) {
+    return tsd_perf_test_create_dummy_context();
+}
+
+void tsd_test_perf_destroy_dummy_context(perf_ctx_t *ctx) {
+    tsd_perf_test_destroy_dummy_context(ctx);
+}
+
+void tsd_test_perf_set_group_fd(perf_ctx_t *ctx, int fd) {
+    tsd_perf_test_set_group_fd(ctx, fd);
+}
+
+void tsd_test_perf_set_llc_fd(perf_ctx_t *ctx, int fd) {
+    tsd_perf_test_set_llc_fd(ctx, fd);
+}
+
+void tsd_test_perf_set_mode(perf_ctx_t *ctx, tsd_perf_mode_t mode) {
+    tsd_perf_test_set_mode(ctx, mode);
+}
+
+void tsd_test_perf_set_read_streams(const tsd_perf_test_read_stream_t *streams, size_t count) {
+    tsd_perf_test_set_read_streams(streams, count);
+}
+
+void tsd_test_perf_clear_read_streams(void) {
+    tsd_perf_test_clear_read_streams();
+}
+
+uint64_t tsd_test_perf_get_baseline_cpi(const perf_ctx_t *ctx) {
+    return tsd_perf_test_get_baseline_cpi(ctx);
+}
+
+uint64_t tsd_test_perf_get_baseline_mpki(const perf_ctx_t *ctx) {
+    return tsd_perf_test_get_baseline_mpki(ctx);
+}
+
+int tsd_test_perf_get_last_group_valid(const perf_ctx_t *ctx) {
+    return tsd_perf_test_get_last_group_valid(ctx);
+}
+
+uint64_t tsd_test_perf_get_last_llc_value(const perf_ctx_t *ctx) {
+    return tsd_perf_test_get_last_llc_value(ctx);
+}
+
 #endif
