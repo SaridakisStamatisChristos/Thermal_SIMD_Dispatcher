@@ -1,0 +1,17 @@
+[Unit]
+Description=Thermal SIMD Dispatcher
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/thermal_simd --interval=50 --health-check
+Environment=TSD_LOG_LEVEL=info
+CapabilityBoundingSet=CAP_PERFMON CAP_SYS_ADMIN
+AmbientCapabilities=CAP_PERFMON CAP_SYS_ADMIN
+Restart=on-failure
+RestartSec=5s
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

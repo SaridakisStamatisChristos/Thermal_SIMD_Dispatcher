@@ -31,6 +31,7 @@ static int run_monitor_thread_scenario(void) {
     perf_ctx_t *ctx = NULL;
 
     setenv("TSD_FAKE_PERF", "1", 1);
+    setenv("TSD_ALLOW_SOFTWARE_UPGRADES", "1", 1);
     tsd_test_reset_runtime();
     tsd_test_set_policy_counts(1, 1);
     tsd_test_set_timing(1000, 1, 1, 1);
@@ -60,6 +61,8 @@ static int run_monitor_thread_scenario(void) {
         rc = 1;
         goto out;
     }
+    tsd_runtime_config_exit_degraded_mode(&g_tsd_config, "tests");
+    g_tsd_config.degraded_policy_active = 0;
     tsd_test_measure_baseline(ctx);
     tsd_test_set_fake_perf_script((const uint32_t[]){2100, 900, 900, 900, 900, 900}, 6, 0);
     if (tsd_test_patch(SIMD_AVX2) != 0) {
@@ -119,6 +122,7 @@ out:
     tsd_test_clear_fake_perf_script();
     tsd_test_clear_patch_overrides();
     unsetenv("TSD_FAKE_PERF");
+    unsetenv("TSD_ALLOW_SOFTWARE_UPGRADES");
     return rc;
 }
 
@@ -159,6 +163,53 @@ static int run_patch_failure_diagnostic(void) {
     tsd_test_force_patch_failure(TSD_PATCH_FAIL_NONE);
     tsd_test_clear_patch_overrides();
     return 0;
+}
+
+static int run_software_timeout_trip(void) {
+    int rc = 0;
+    perf_ctx_t *ctx = NULL;
+    setenv("TSD_FAKE_PERF", "1", 1);
+    tsd_test_reset_runtime();
+    if (init_double_buffer_trampoline() != 0) {
+        fprintf(stderr, "failed to init trampoline for timeout test\n");
+        rc = 1;
+        goto out;
+    }
+    if (tsd_test_patch(SIMD_SSE41) != 0) {
+        fprintf(stderr, "failed to patch baseline for timeout test\n");
+        rc = 1;
+        goto out;
+    }
+    ctx = tsd_test_init_perf();
+    if (!ctx) {
+        fprintf(stderr, "failed to init perf context for timeout test\n");
+        rc = 1;
+        goto out;
+    }
+    tsd_test_perf_set_mode(ctx, TSD_PERF_MODE_SOFTWARE);
+    tsd_test_perf_rewind_mode(ctx, 3600);
+    if (!tsd_perf_check_software_timeout(ctx, 5)) {
+        fprintf(stderr, "software timeout did not trigger\n");
+        rc = 1;
+        goto out;
+    }
+    if (tsd_perf_check_software_timeout(ctx, 5)) {
+        fprintf(stderr, "software timeout retriggered unexpectedly\n");
+        rc = 1;
+        goto out;
+    }
+    tsd_test_perf_rewind_mode(ctx, 0);
+    if (tsd_perf_check_software_timeout(ctx, 5)) {
+        fprintf(stderr, "software timeout triggered without elapsed time\n");
+        rc = 1;
+    }
+
+out:
+    if (ctx) {
+        tsd_test_cleanup_perf(ctx);
+    }
+    unsetenv("TSD_FAKE_PERF");
+    return rc;
 }
 
 static int run_perf_read_retry_test(void) {
@@ -359,6 +410,9 @@ int main(void) {
         return 1;
     }
     if (run_patch_failure_diagnostic() != 0) {
+        return 1;
+    }
+    if (run_software_timeout_trip() != 0) {
         return 1;
     }
     return 0;

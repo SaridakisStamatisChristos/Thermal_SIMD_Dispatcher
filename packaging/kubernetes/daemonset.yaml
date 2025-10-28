@@ -1,0 +1,49 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: thermal-simd-dispatcher
+  labels:
+    app: thermal-simd
+spec:
+  selector:
+    matchLabels:
+      app: thermal-simd
+  template:
+    metadata:
+      labels:
+        app: thermal-simd
+    spec:
+      serviceAccountName: thermal-simd
+      tolerations:
+        - effect: NoSchedule
+          key: node-role.kubernetes.io/control-plane
+          operator: Exists
+      containers:
+        - name: dispatcher
+          image: registry.example.com/thermal-simd:latest
+          args:
+            - "--interval=50"
+            - "--health-check"
+          env:
+            - name: TSD_LOG_LEVEL
+              value: info
+          securityContext:
+            privileged: true
+            capabilities:
+              add:
+                - CAP_PERFMON
+                - CAP_SYS_ADMIN
+          volumeMounts:
+            - name: cpu-msr
+              mountPath: /dev/cpu
+              readOnly: true
+            - name: perf-events
+              mountPath: /sys/bus/event_source
+              readOnly: true
+      volumes:
+        - name: cpu-msr
+          hostPath:
+            path: /dev/cpu
+        - name: perf-events
+          hostPath:
+            path: /sys/bus/event_source

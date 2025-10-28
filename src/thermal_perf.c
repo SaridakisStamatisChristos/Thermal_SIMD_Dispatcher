@@ -18,6 +18,8 @@
 #include <thermal/simd/statistics.h>
 #include <thermal/simd/telemetry_helper.h>
 #include <thermal/simd/logging.h>
+#include <thermal/simd/metrics.h>
+#include <thermal/simd/thermal_trampoline.h>
 
 #define LOG_COMPONENT "perf"
 #define RATIO_HISTORY TSD_RATIO_HISTORY
@@ -59,12 +61,30 @@ struct perf_ctx {
     uint64_t sw_last_iterations;
     tsd_workload_fn workload;
     tsd_telemetry_helper_t telemetry;
+    struct timespec mode_entered_at;
+    int timeout_notified;
 };
 
 _Atomic uint64_t g_tsd_workload_iterations = 0;
 
 static int warned_llc_unavailable = 0;
 static int warned_perf_group_layout = 0;
+
+static uint64_t timespec_diff_ns(const struct timespec *start, const struct timespec *end);
+
+static int allow_software_upgrades(void) {
+    static int cached = -1;
+    if (cached >= 0) {
+        return cached;
+    }
+    const char *env = getenv("TSD_ALLOW_SOFTWARE_UPGRADES");
+    if (env && env[0] != '\0' && strcmp(env, "0") != 0) {
+        cached = 1;
+    } else {
+        cached = 0;
+    }
+    return cached;
+}
 
 #ifdef TSD_ENABLE_TESTS
 #define TSD_PERF_TEST_MAX_STREAMS 4
@@ -95,6 +115,53 @@ static ssize_t tsd_perf_sys_read(int fd, void *buf, size_t count) {
     }
 #endif
     return read(fd, buf, count);
+}
+
+static void perf_set_mode(perf_ctx_t *ctx, tsd_perf_mode_t mode, const char *reason) {
+    if (!ctx) {
+        return;
+    }
+    if (ctx->mode == mode) {
+        clock_gettime(CLOCK_MONOTONIC, &ctx->mode_entered_at);
+        return;
+    }
+    ctx->mode = mode;
+    clock_gettime(CLOCK_MONOTONIC, &ctx->mode_entered_at);
+    ctx->timeout_notified = 0;
+    const char *why = reason ? reason : "unknown";
+    if (mode == TSD_PERF_MODE_SOFTWARE) {
+        tsd_metrics_increment(TSD_METRIC_PERF_FALLBACKS);
+        tsd_runtime_config_enter_degraded_mode(&g_tsd_config, why);
+        tsd_log_warn(LOG_COMPONENT,
+                     "event=perf_mode state=software reason=%s pinned_cpu=%d monitor_cpu=%d",
+                     why, ctx->pinned_cpu, ctx->monitor_cpu);
+        if (!allow_software_upgrades() &&
+            atomic_load_explicit(&g_tsd_current_width, memory_order_relaxed) != SIMD_SSE41) {
+            if (tsd_trampoline_patch(SIMD_SSE41) == 0) {
+                tsd_log_warn(LOG_COMPONENT, "event=perf_mode action=forced-width width=SSE4.1 reason=%s", why);
+            }
+        }
+    } else if (mode == TSD_PERF_MODE_HARDWARE) {
+        tsd_metrics_increment(TSD_METRIC_PERF_RECOVERIES);
+        tsd_runtime_config_exit_degraded_mode(&g_tsd_config, why);
+        tsd_log_info(LOG_COMPONENT,
+                     "event=perf_mode state=hardware reason=%s pinned_cpu=%d monitor_cpu=%d",
+                     why, ctx->pinned_cpu, ctx->monitor_cpu);
+    }
+}
+
+static int perf_software_timeout_exceeded(perf_ctx_t *ctx, int timeout_sec) {
+    if (!ctx || timeout_sec <= 0) {
+        return 0;
+    }
+    if (ctx->mode != TSD_PERF_MODE_SOFTWARE) {
+        return 0;
+    }
+    struct timespec now = {0};
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    uint64_t elapsed_ns = timespec_diff_ns(&ctx->mode_entered_at, &now);
+    uint64_t limit_ns = (uint64_t)timeout_sec * UINT64_C(1000000000);
+    return elapsed_ns >= limit_ns;
 }
 
 static int tsd_perf_read_exact(int fd, void *buf, size_t size) {
@@ -202,7 +269,24 @@ void tsd_perf_test_set_llc_fd(perf_ctx_t *ctx, int fd) {
 void tsd_perf_test_set_mode(perf_ctx_t *ctx, tsd_perf_mode_t mode) {
     if (ctx) {
         ctx->mode = mode;
+        ctx->timeout_notified = 0;
+        clock_gettime(CLOCK_MONOTONIC, &ctx->mode_entered_at);
     }
+}
+
+void tsd_test_perf_rewind_mode(perf_ctx_t *ctx, int seconds) {
+    if (!ctx) {
+        return;
+    }
+    clock_gettime(CLOCK_MONOTONIC, &ctx->mode_entered_at);
+    if (seconds > 0) {
+        if (ctx->mode_entered_at.tv_sec > seconds) {
+            ctx->mode_entered_at.tv_sec -= seconds;
+        } else {
+            ctx->mode_entered_at.tv_sec = 0;
+        }
+    }
+    ctx->timeout_notified = 0;
 }
 
 uint64_t tsd_perf_test_get_baseline_cpi(const perf_ctx_t *ctx) {
@@ -295,6 +379,8 @@ perf_ctx_t* tsd_perf_init(tsd_workload_fn workload_cb) {
     ctx->sw_last_timestamp.tv_sec = 0;
     ctx->sw_last_timestamp.tv_nsec = 0;
     ctx->workload = workload_cb;
+    clock_gettime(CLOCK_MONOTONIC, &ctx->mode_entered_at);
+    ctx->timeout_notified = 0;
 
     cpu_set_t cpuset;
     CPU_ZERO(&cpuset);
@@ -315,7 +401,7 @@ perf_ctx_t* tsd_perf_init(tsd_workload_fn workload_cb) {
     const char *force_sw_env = getenv("TSD_FAKE_PERF");
     int force_sw = force_sw_env && force_sw_env[0] != '\0' && strcmp(force_sw_env, "0") != 0;
     if (force_sw) {
-        ctx->mode = TSD_PERF_MODE_SOFTWARE;
+        perf_set_mode(ctx, TSD_PERF_MODE_SOFTWARE, "forced");
         return ctx;
     }
 
@@ -336,7 +422,7 @@ perf_ctx_t* tsd_perf_init(tsd_workload_fn workload_cb) {
             tsd_log_warn(LOG_COMPONENT,
                          "perf_event_open cycles (falling back to software): %s",
                          tsd_log_strerror(err, errbuf, sizeof(errbuf)));
-            ctx->mode = TSD_PERF_MODE_SOFTWARE;
+            perf_set_mode(ctx, TSD_PERF_MODE_SOFTWARE, "cycles-permission");
             return ctx;
         }
         tsd_log_error(LOG_COMPONENT, "perf_event_open cycles: %s",
@@ -357,7 +443,7 @@ perf_ctx_t* tsd_perf_init(tsd_workload_fn workload_cb) {
             tsd_log_warn(LOG_COMPONENT,
                          "perf_event_open instructions (falling back to software): %s",
                          tsd_log_strerror(err, errbuf, sizeof(errbuf)));
-            ctx->mode = TSD_PERF_MODE_SOFTWARE;
+            perf_set_mode(ctx, TSD_PERF_MODE_SOFTWARE, "instructions-permission");
             return ctx;
         }
         tsd_log_error(LOG_COMPONENT, "perf_event_open instructions: %s",
@@ -384,7 +470,7 @@ perf_ctx_t* tsd_perf_init(tsd_workload_fn workload_cb) {
         ctx->fd_llc_misses = (int)fd_llc;
     }
 
-    ctx->mode = TSD_PERF_MODE_HARDWARE;
+    perf_set_mode(ctx, TSD_PERF_MODE_HARDWARE, "init");
     return ctx;
 }
 
@@ -730,6 +816,24 @@ int tsd_perf_get_pinned_cpu(const perf_ctx_t *ctx) {
 
 int tsd_perf_get_monitor_cpu(const perf_ctx_t *ctx) {
     return ctx ? ctx->monitor_cpu : -1;
+}
+
+int tsd_perf_check_software_timeout(perf_ctx_t *ctx, int timeout_sec) {
+    if (!ctx || timeout_sec <= 0) {
+        return 0;
+    }
+    if (ctx->timeout_notified) {
+        return 0;
+    }
+    if (!perf_software_timeout_exceeded(ctx, timeout_sec)) {
+        return 0;
+    }
+    ctx->timeout_notified = 1;
+    tsd_metrics_increment(TSD_METRIC_SOFTWARE_TIMEOUT_ESCALATIONS);
+    tsd_log_error(LOG_COMPONENT,
+                  "event=perf_mode state=software action=fail-closed timeout_sec=%d",
+                  timeout_sec);
+    return 1;
 }
 
 #ifdef TSD_ENABLE_TESTS

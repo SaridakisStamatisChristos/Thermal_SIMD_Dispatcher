@@ -8,6 +8,7 @@
 #include <sys/types.h>
 #include <unistd.h>
 #include <dirent.h>
+#include <time.h>
 
 #ifndef MSR_IA32_APERF
 #define MSR_IA32_APERF 0xE8
@@ -16,6 +17,81 @@
 #ifndef MSR_IA32_MPERF
 #define MSR_IA32_MPERF 0xE7
 #endif
+
+#include <thermal/simd/logging.h>
+#include <thermal/simd/metrics.h>
+
+#define LOG_COMPONENT "telemetry"
+#define INITIAL_BACKOFF_SEC 5
+#define MAX_BACKOFF_SEC 600
+
+static time_t tsd_now_seconds(void) {
+    time_t now = time(NULL);
+    if (now < 0) {
+        return 0;
+    }
+    return now;
+}
+
+static void schedule_retry(time_t *deadline, int *backoff) {
+    if (!deadline || !backoff) {
+        return;
+    }
+    if (*backoff <= 0) {
+        *backoff = INITIAL_BACKOFF_SEC;
+    }
+    int next = *backoff;
+    if (next > MAX_BACKOFF_SEC) {
+        next = MAX_BACKOFF_SEC;
+    }
+    time_t now = tsd_now_seconds();
+    *deadline = now + (time_t)next;
+    if (*backoff < MAX_BACKOFF_SEC) {
+        int new_backoff = *backoff * 2;
+        if (new_backoff > MAX_BACKOFF_SEC) {
+            new_backoff = MAX_BACKOFF_SEC;
+        }
+        *backoff = new_backoff;
+    }
+}
+
+static void reset_retry(time_t *deadline, int *backoff) {
+    if (deadline) {
+        *deadline = 0;
+    }
+    if (backoff) {
+        *backoff = INITIAL_BACKOFF_SEC;
+    }
+}
+
+static int reopen_msr(tsd_telemetry_helper_t *helper, int emit_events) {
+    if (!helper) {
+        return -1;
+    }
+    char msr_path[128];
+    int written = snprintf(msr_path, sizeof(msr_path), "/dev/cpu/%d/msr", helper->cpu);
+    if (written < 0 || (size_t)written >= sizeof(msr_path)) {
+        return -1;
+    }
+    int fd = open(msr_path, O_RDONLY);
+    if (fd >= 0) {
+        helper->msr_fd = fd;
+        helper->msr_available = 1;
+        reset_retry(&helper->msr_retry_deadline, &helper->msr_backoff_seconds);
+        if (emit_events) {
+            tsd_metrics_increment(TSD_METRIC_TELEMETRY_MSR_RECOVERIES);
+            tsd_log_info(LOG_COMPONENT, "event=telemetry_sensor state=recovered sensor=msr path=%s", msr_path);
+        }
+        return 0;
+    }
+    helper->msr_fd = -1;
+    helper->msr_available = 0;
+    schedule_retry(&helper->msr_retry_deadline, &helper->msr_backoff_seconds);
+    if (emit_events) {
+        tsd_log_debug(LOG_COMPONENT, "event=telemetry_sensor state=pending sensor=msr errno=%d", errno);
+    }
+    return -1;
+}
 
 static int read_long_from_path(const char *path, long long *value) {
     if (!path || !value) {
@@ -43,6 +119,11 @@ static int read_long_from_path(const char *path, long long *value) {
 }
 
 static int detect_temp_sensor(tsd_telemetry_helper_t *helper) {
+    if (!helper) {
+        return 0;
+    }
+    helper->temp_available = 0;
+    helper->temp_path[0] = '\0';
     DIR *dir = opendir("/sys/class/thermal");
     if (!dir) {
         return 0;
@@ -92,7 +173,10 @@ static int detect_temp_sensor(tsd_telemetry_helper_t *helper) {
     return 0;
 }
 
-static void detect_cpufreq_paths(tsd_telemetry_helper_t *helper) {
+static int detect_cpufreq_paths(tsd_telemetry_helper_t *helper) {
+    if (!helper) {
+        return 0;
+    }
     char path[256];
     int written = snprintf(path, sizeof(path),
                            "/sys/devices/system/cpu/cpu%d/cpufreq/scaling_cur_freq", helper->cpu);
@@ -100,14 +184,14 @@ static void detect_cpufreq_paths(tsd_telemetry_helper_t *helper) {
         helper->freq_sysfs_available = 0;
         helper->freq_cur_path[0] = '\0';
         helper->freq_max_khz = 0;
-        return;
+        return 0;
     }
     written = snprintf(helper->freq_cur_path, sizeof(helper->freq_cur_path), "%s", path);
     if (written < 0 || (size_t)written >= sizeof(helper->freq_cur_path)) {
         helper->freq_sysfs_available = 0;
         helper->freq_cur_path[0] = '\0';
         helper->freq_max_khz = 0;
-        return;
+        return 0;
     }
     long long max_khz = 0;
     written = snprintf(path, sizeof(path),
@@ -120,11 +204,12 @@ static void detect_cpufreq_paths(tsd_telemetry_helper_t *helper) {
             helper->freq_sysfs_available = 0;
             helper->freq_max_khz = 0;
             helper->freq_cur_path[0] = '\0';
-            return;
+            return 0;
         }
     }
     helper->freq_sysfs_available = 1;
     helper->freq_max_khz = (uint64_t)max_khz;
+    return 1;
 }
 
 static int read_msr64(int fd, off_t offset, uint64_t *value) {
@@ -149,21 +234,20 @@ int tsd_telemetry_helper_init(tsd_telemetry_helper_t *helper, int cpu) {
     memset(helper, 0, sizeof(*helper));
     helper->cpu = cpu;
     helper->msr_fd = -1;
+    reset_retry(&helper->temp_retry_deadline, &helper->temp_backoff_seconds);
+    reset_retry(&helper->freq_retry_deadline, &helper->freq_backoff_seconds);
+    reset_retry(&helper->msr_retry_deadline, &helper->msr_backoff_seconds);
     detect_temp_sensor(helper);
-    detect_cpufreq_paths(helper);
-
-    char msr_path[128];
-    int written = snprintf(msr_path, sizeof(msr_path), "/dev/cpu/%d/msr", helper->cpu);
-    if (written < 0 || (size_t)written >= sizeof(msr_path)) {
-        return 0;
+    if (helper->temp_available) {
+        reset_retry(&helper->temp_retry_deadline, &helper->temp_backoff_seconds);
     }
-    int fd = open(msr_path, O_RDONLY);
-    if (fd >= 0) {
-        helper->msr_fd = fd;
-        helper->msr_available = 1;
-    } else {
-        helper->msr_fd = -1;
-        helper->msr_available = 0;
+    if (detect_cpufreq_paths(helper)) {
+        reset_retry(&helper->freq_retry_deadline, &helper->freq_backoff_seconds);
+    }
+
+    if (reopen_msr(helper, 0) != 0) {
+        tsd_metrics_increment(TSD_METRIC_TELEMETRY_MSR_DROPS);
+        tsd_log_warn(LOG_COMPONENT, "event=telemetry_sensor state=degraded sensor=msr errno=%d", errno);
     }
     return 0;
 }
@@ -179,21 +263,52 @@ void tsd_telemetry_helper_destroy(tsd_telemetry_helper_t *helper) {
 }
 
 static void sample_temperature(tsd_telemetry_helper_t *helper, tsd_telemetry_sample_t *out) {
-    if (!helper->temp_available || helper->temp_path[0] == '\0') {
+    if (!helper || !out) {
         return;
     }
+    if (!helper->temp_available || helper->temp_path[0] == '\0') {
+        time_t now = tsd_now_seconds();
+        if (helper->temp_retry_deadline == 0 || now >= helper->temp_retry_deadline) {
+            if (detect_temp_sensor(helper)) {
+                reset_retry(&helper->temp_retry_deadline, &helper->temp_backoff_seconds);
+                tsd_metrics_increment(TSD_METRIC_TELEMETRY_TEMP_RECOVERIES);
+                tsd_log_info(LOG_COMPONENT, "event=telemetry_sensor state=recovered sensor=temp path=%s", helper->temp_path);
+            } else {
+                schedule_retry(&helper->temp_retry_deadline, &helper->temp_backoff_seconds);
+            }
+        }
+        if (!helper->temp_available) {
+            return;
+        }
+    }
     long long temp_value = 0;
+    char path_copy[256];
+    strncpy(path_copy, helper->temp_path, sizeof(path_copy));
+    path_copy[sizeof(path_copy) - 1] = '\0';
     if (read_long_from_path(helper->temp_path, &temp_value) == 0) {
         out->temp_available = 1;
         out->package_temp_millic = (int32_t)temp_value;
     } else {
         helper->temp_available = 0;
+        tsd_metrics_increment(TSD_METRIC_TELEMETRY_TEMP_DROPS);
+        tsd_log_warn(LOG_COMPONENT, "event=telemetry_sensor state=degraded sensor=temp path=%s errno=%d", path_copy, errno);
+        helper->temp_path[0] = '\0';
+        schedule_retry(&helper->temp_retry_deadline, &helper->temp_backoff_seconds);
     }
 }
 
 static void sample_msr_ratio(tsd_telemetry_helper_t *helper, tsd_telemetry_sample_t *out) {
-    if (!helper->msr_available || helper->msr_fd < 0) {
+    if (!helper || !out) {
         return;
+    }
+    if (!helper->msr_available || helper->msr_fd < 0) {
+        time_t now = tsd_now_seconds();
+        if (helper->msr_retry_deadline == 0 || now >= helper->msr_retry_deadline) {
+            reopen_msr(helper, 1);
+        }
+        if (!helper->msr_available || helper->msr_fd < 0) {
+            return;
+        }
     }
     uint64_t aperf = 0;
     uint64_t mperf = 0;
@@ -202,6 +317,9 @@ static void sample_msr_ratio(tsd_telemetry_helper_t *helper, tsd_telemetry_sampl
         close(helper->msr_fd);
         helper->msr_fd = -1;
         helper->msr_available = 0;
+        tsd_metrics_increment(TSD_METRIC_TELEMETRY_MSR_DROPS);
+        tsd_log_warn(LOG_COMPONENT, "event=telemetry_sensor state=degraded sensor=msr cpu=%d errno=%d", helper->cpu, errno);
+        schedule_retry(&helper->msr_retry_deadline, &helper->msr_backoff_seconds);
         return;
     }
     if (helper->last_mperf != 0 && mperf > helper->last_mperf && aperf >= helper->last_aperf) {
@@ -218,12 +336,31 @@ static void sample_msr_ratio(tsd_telemetry_helper_t *helper, tsd_telemetry_sampl
 }
 
 static void sample_cpufreq_ratio(tsd_telemetry_helper_t *helper, tsd_telemetry_sample_t *out) {
-    if (!helper->freq_sysfs_available || helper->freq_cur_path[0] == '\0' || helper->freq_max_khz == 0) {
+    if (!helper || !out) {
         return;
+    }
+    if (!helper->freq_sysfs_available || helper->freq_cur_path[0] == '\0' || helper->freq_max_khz == 0) {
+        time_t now = tsd_now_seconds();
+        if (helper->freq_retry_deadline == 0 || now >= helper->freq_retry_deadline) {
+            if (detect_cpufreq_paths(helper)) {
+                reset_retry(&helper->freq_retry_deadline, &helper->freq_backoff_seconds);
+                tsd_metrics_increment(TSD_METRIC_TELEMETRY_FREQ_RECOVERIES);
+                tsd_log_info(LOG_COMPONENT, "event=telemetry_sensor state=recovered sensor=cpufreq path=%s", helper->freq_cur_path);
+            } else {
+                schedule_retry(&helper->freq_retry_deadline, &helper->freq_backoff_seconds);
+            }
+        }
+        if (!helper->freq_sysfs_available) {
+            return;
+        }
     }
     long long cur_khz = 0;
     if (read_long_from_path(helper->freq_cur_path, &cur_khz) != 0 || cur_khz <= 0) {
         helper->freq_sysfs_available = 0;
+        tsd_metrics_increment(TSD_METRIC_TELEMETRY_FREQ_DROPS);
+        tsd_log_warn(LOG_COMPONENT, "event=telemetry_sensor state=degraded sensor=cpufreq path=%s errno=%d", helper->freq_cur_path, errno);
+        helper->freq_cur_path[0] = '\0';
+        schedule_retry(&helper->freq_retry_deadline, &helper->freq_backoff_seconds);
         return;
     }
     __uint128_t num = (__uint128_t)cur_khz * 1000u;
