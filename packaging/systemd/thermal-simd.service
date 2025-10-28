@@ -4,7 +4,7 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/thermal_simd --interval=50 --health-check
+ExecStart=/usr/local/bin/thermal_simd --interval=50 --health-check --metrics-bind=127.0.0.1 --metrics-port=9464
 Environment=TSD_LOG_LEVEL=info
 CapabilityBoundingSet=CAP_PERFMON CAP_SYS_ADMIN
 AmbientCapabilities=CAP_PERFMON CAP_SYS_ADMIN
@@ -12,6 +12,8 @@ Restart=on-failure
 RestartSec=5s
 StandardOutput=journal
 StandardError=journal
+IPAddressAllow=127.0.0.1
+IPAddressDeny=any
 
 [Install]
 WantedBy=multi-user.target

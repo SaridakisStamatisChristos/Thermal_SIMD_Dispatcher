@@ -28,6 +28,9 @@ typedef struct {
     int degraded_timeout_sec;
     int degraded_policy_active;
     int health_check_mode;
+    int metrics_enabled;
+    int metrics_port;
+    char metrics_bind_host[64];
     tsd_log_level_t log_level;
     tsd_policy_config policy;
 } tsd_runtime_config;

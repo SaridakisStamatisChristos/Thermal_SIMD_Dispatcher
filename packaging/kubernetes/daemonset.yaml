@@ -24,6 +24,8 @@ spec:
           args:
             - "--interval=50"
             - "--health-check"
+            - "--metrics-bind=0.0.0.0"
+            - "--metrics-port=9464"
           env:
             - name: TSD_LOG_LEVEL
               value: info
@@ -33,6 +35,10 @@ spec:
               add:
                 - CAP_PERFMON
                 - CAP_SYS_ADMIN
+          ports:
+            - name: metrics
+              containerPort: 9464
+              protocol: TCP
           volumeMounts:
             - name: cpu-msr
               mountPath: /dev/cpu

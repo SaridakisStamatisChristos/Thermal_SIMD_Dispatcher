@@ -20,6 +20,7 @@
 #include <thermal/simd/logging.h>
 #include <thermal/simd/health_check.h>
 #include <thermal/simd/policy/dispatcher_policy.h>
+#include <observability/metrics_exporter.h>
 
 #ifdef TSD_ENABLE_TESTS
 #include "thermal_simd_test.h"
@@ -32,6 +33,21 @@ static int32_t simd_shim(int32_t a, int32_t b);
 static inline void workload_once(void) {
     (void)simd_shim(42, 7);
     atomic_fetch_add_explicit(&g_tsd_workload_iterations, 1, memory_order_relaxed);
+}
+
+static uint64_t compute_dwell_ms_from_ticks(int dwell_ticks) {
+    if (dwell_ticks <= 0) {
+        return 0;
+    }
+    uint64_t interval_us = (uint64_t)g_tsd_config.check_interval_us;
+    return (interval_us * (uint64_t)dwell_ticks) / 1000ULL;
+}
+
+static void record_dwell_metric(simd_width_t width, int dwell_ticks) {
+    uint64_t dwell_ms = compute_dwell_ms_from_ticks(dwell_ticks);
+    if (dwell_ms > 0) {
+        tsd_metrics_exporter_observe_dwell(width, dwell_ms);
+    }
 }
 
 __attribute__((naked))
@@ -150,6 +166,7 @@ void* thermal_monitor_thread(void *arg) {
         }
         if (tsd_perf_check_software_timeout(ctx, g_tsd_config.degraded_timeout_sec)) {
             simd_width_t current_width = atomic_load_explicit(&g_tsd_current_width, memory_order_acquire);
+            record_dwell_metric(current_width, dwell_ticks);
             if (current_width != SIMD_SSE41) {
                 if (tsd_trampoline_patch(SIMD_SSE41) == 0) {
                     width = SIMD_SSE41;
@@ -182,6 +199,7 @@ void* thermal_monitor_thread(void *arg) {
             }
             if (used_predictive > 0 && target != width) {
                 simd_width_t previous = width;
+                record_dwell_metric(previous, dwell_ticks);
                 int patch_rc = tsd_trampoline_patch(target);
                 if (patch_rc == 0) {
                     width = target;
@@ -232,6 +250,7 @@ void* thermal_monitor_thread(void *arg) {
                 }
                 tsd_log_warn(LOG_COMPONENT, "%s", message);
                 simd_width_t target = width - 1;
+                record_dwell_metric(width, dwell_ticks);
                 int patch_rc = tsd_trampoline_patch(target);
                 if (patch_rc == 0) {
                     width = target;
@@ -266,6 +285,7 @@ void* thermal_monitor_thread(void *arg) {
                              eval.trimmed_ratio_milli / 1000, eval.trimmed_ratio_milli % 1000,
                              eval.llc_mpki_milli / 1000, eval.llc_mpki_milli % 1000);
                 simd_width_t target = width + 1;
+                record_dwell_metric(width, dwell_ticks);
                 int patch_rc = tsd_trampoline_patch(target);
                 if (patch_rc == 0) {
                     width = target;
@@ -359,27 +379,60 @@ int main(int argc, char **argv) {
     CPU_SET(0, &cpuset);
     sched_setaffinity(0, sizeof(cpuset), &cpuset);
 
+    int metrics_started = 0;
+    if (g_tsd_config.metrics_enabled && g_tsd_config.metrics_port > 0) {
+        if (tsd_metrics_exporter_start(g_tsd_config.metrics_bind_host, (uint16_t)g_tsd_config.metrics_port) == 0) {
+            metrics_started = 1;
+            uint16_t actual_port = tsd_metrics_exporter_listen_port();
+            tsd_log_info(LOG_COMPONENT,
+                         "Metrics exporter listening on %s:%u",
+                         g_tsd_config.metrics_bind_host,
+                         (unsigned)actual_port);
+        } else {
+            tsd_log_warn(LOG_COMPONENT,
+                         "Failed to start metrics exporter on %s:%d",
+                         g_tsd_config.metrics_bind_host,
+                         g_tsd_config.metrics_port);
+        }
+    }
+
     if (tsd_trampoline_init() != 0) {
         tsd_log_error(LOG_COMPONENT, "Failed to create trampolines");
+        if (metrics_started) {
+            tsd_metrics_exporter_stop();
+        }
         return 1;
     }
 
     simd_width_t max_width = tsd_detect_max_simd(&g_tsd_config);
     if (max_width == SIMD_SSE41 && !tsd_cpu_has_sse41()) {
         tsd_log_error(LOG_COMPONENT, "SSE4.1 required but not available");
+        if (metrics_started) {
+            tsd_metrics_exporter_stop();
+        }
         return 1;
     }
 
     if (tsd_trampoline_patch(max_width) != 0) {
         tsd_log_error(LOG_COMPONENT, "Failed to install initial trampoline patch");
+        if (metrics_started) {
+            tsd_metrics_exporter_stop();
+        }
         return 1;
     }
     print_configuration(max_width);
     if (g_tsd_config.health_check_mode) {
         tsd_log_info(LOG_COMPONENT, "Running health check mode");
-        return tsd_run_health_check();
+        int rc = tsd_run_health_check();
+        if (metrics_started) {
+            tsd_metrics_exporter_stop();
+        }
+        return rc;
     }
     run_demo();
+    if (metrics_started) {
+        tsd_metrics_exporter_stop();
+    }
     return 0;
 }
 #endif
