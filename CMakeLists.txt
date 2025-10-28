@@ -108,6 +108,37 @@ if(BUILD_TESTING)
     target_link_libraries(test_integration_metrics_tuner PRIVATE tsd_policy_tuner pthread)
     target_compile_options(test_integration_metrics_tuner PRIVATE -Wall -Wextra)
     add_test(NAME integration_metrics_tuner COMMAND test_integration_metrics_tuner)
+
+    add_library(tsd_stress_common STATIC
+        tests/stress/stress_common.c
+        src/thermal_simd.c)
+    target_link_libraries(tsd_stress_common
+        PUBLIC
+            thermal_simd_core_tests
+            pthread)
+    target_compile_definitions(tsd_stress_common PUBLIC TSD_ENABLE_TESTS)
+    target_include_directories(tsd_stress_common
+        PUBLIC
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/stress
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+            ${CMAKE_CURRENT_BINARY_DIR}/include)
+    target_compile_options(tsd_stress_common PRIVATE -Wall -Wextra -pthread)
+
+    add_executable(stress_patch_request tests/stress/patch_request_stress.c)
+    target_link_libraries(stress_patch_request PRIVATE tsd_stress_common)
+    target_compile_definitions(stress_patch_request PRIVATE TSD_ENABLE_TESTS)
+    target_compile_options(stress_patch_request PRIVATE -Wall -Wextra -pthread)
+
+    add_executable(stress_signal_storm tests/stress/signal_storm.c)
+    target_link_libraries(stress_signal_storm PRIVATE tsd_stress_common pthread)
+    target_compile_definitions(stress_signal_storm PRIVATE TSD_ENABLE_TESTS)
+    target_compile_options(stress_signal_storm PRIVATE -Wall -Wextra -pthread)
+
+    add_executable(stress_telemetry_faults tests/stress/telemetry_faults.c)
+    target_link_libraries(stress_telemetry_faults PRIVATE tsd_stress_common pthread)
+    target_compile_definitions(stress_telemetry_faults PRIVATE TSD_ENABLE_TESTS)
+    target_compile_options(stress_telemetry_faults PRIVATE -Wall -Wextra -pthread)
 endif()
 
 install(TARGETS thermal_simd_core
