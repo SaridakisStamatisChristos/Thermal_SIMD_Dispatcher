@@ -7,6 +7,7 @@
 
 #include <thermal/simd/telemetry_helper.h>
 #include <thermal/simd/thermal_config.h>
+#include <thermal/simd/thermal_eval_types.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -20,23 +21,9 @@ typedef enum {
     TSD_PERF_MODE_SOFTWARE
 } tsd_perf_mode_t;
 
-typedef struct {
-    uint64_t cpi_milli;
-    uint32_t ratio_milli;
-    uint32_t trimmed_ratio_milli;
-    uint64_t llc_mpki_milli;
-    uint64_t severity_milli;
-    uint64_t thermal_severity_milli;
-    int memory_bound;
-    int temp_available;
-    int freq_ratio_available;
-    int32_t package_temp_millic;
-    uint32_t freq_ratio_milli;
-} tsd_thermal_eval_t;
-
 typedef void (*tsd_workload_fn)(void);
 
-extern _Atomic uint64_t g_tsd_workload_iterations;
+extern _Atomic(uint64_t) g_tsd_workload_iterations;
 
 perf_ctx_t* tsd_perf_init(tsd_workload_fn workload_cb);
 void tsd_perf_enable(perf_ctx_t *ctx);

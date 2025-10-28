@@ -4,6 +4,7 @@
 #include <stdint.h>
 
 #include <thermal/simd/logging.h>
+#include <config/policy_config.h>
 
 typedef struct {
     int check_interval_us;
@@ -28,6 +29,7 @@ typedef struct {
     int degraded_policy_active;
     int health_check_mode;
     tsd_log_level_t log_level;
+    tsd_policy_config policy;
 } tsd_runtime_config;
 
 extern tsd_runtime_config g_tsd_config;

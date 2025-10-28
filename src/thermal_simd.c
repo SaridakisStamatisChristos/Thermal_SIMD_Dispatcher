@@ -19,6 +19,7 @@
 #include <thermal/simd/thermal_trampoline.h>
 #include <thermal/simd/logging.h>
 #include <thermal/simd/health_check.h>
+#include <thermal/simd/policy/dispatcher_policy.h>
 
 #ifdef TSD_ENABLE_TESTS
 #include "thermal_simd_test.h"
@@ -127,6 +128,7 @@ void* thermal_monitor_thread(void *arg) {
     int stable_count = 0;
     int cooldown = 0;
     int dwell_ticks = 0;
+    tsd_dispatcher_policy_state *policy_state = tsd_dispatcher_policy_create(&g_tsd_config.policy);
     cpu_set_t cpuset;
     CPU_ZERO(&cpuset);
     CPU_SET((size_t)tsd_perf_get_monitor_cpu(ctx), &cpuset);
@@ -151,6 +153,9 @@ void* thermal_monitor_thread(void *arg) {
             if (current_width != SIMD_SSE41) {
                 if (tsd_trampoline_patch(SIMD_SSE41) == 0) {
                     width = SIMD_SSE41;
+                    if (policy_state) {
+                        tsd_dispatcher_policy_reset(policy_state, &g_tsd_config.policy);
+                    }
                 } else {
                     tsd_log_error(LOG_COMPONENT, "fail-closed patch to SSE4.1 failed");
                 }
@@ -162,7 +167,39 @@ void* thermal_monitor_thread(void *arg) {
             continue;
         }
         tsd_thermal_eval_t eval = {0};
-        if (evaluate_thermal(ctx, &eval)) {
+        int predictive_fallback = 0;
+        int evaluation_rc = evaluate_thermal(ctx, &eval);
+        if (policy_state) {
+            tsd_dispatcher_policy_record(policy_state, &eval, width);
+        }
+
+        if (cooldown <= 0 && dwell_ticks >= g_tsd_config.min_dwell_ticks && policy_state) {
+            simd_width_t target = width;
+            int used_predictive = tsd_dispatcher_policy_recommend(policy_state, width, max_width_cached,
+                                                                  &target, &predictive_fallback);
+            if (predictive_fallback && tsd_log_should_log(TSD_LOG_LEVEL_DEBUG)) {
+                tsd_log_debug(LOG_COMPONENT, "Predictive controller unavailable; using hysteresis fallback");
+            }
+            if (used_predictive > 0 && target != width) {
+                simd_width_t previous = width;
+                int patch_rc = tsd_trampoline_patch(target);
+                if (patch_rc == 0) {
+                    width = target;
+                    throttle_count = 0;
+                    stable_count = 0;
+                    dwell_ticks = 0;
+                    cooldown = (target < previous) ? g_tsd_config.cooldown_down_ticks
+                                                   : g_tsd_config.cooldown_up_ticks;
+                    continue;
+                }
+                tsd_dispatcher_policy_force_fallback(policy_state);
+                if (tsd_log_should_log(TSD_LOG_LEVEL_WARN)) {
+                    tsd_log_warn(LOG_COMPONENT, "Predictive patch failed; reverting to hysteresis policy");
+                }
+            }
+        }
+
+        if (evaluation_rc) {
             throttle_count++;
             stable_count = 0;
             if (throttle_count >= g_tsd_config.down_count && width > SIMD_SSE41) {
@@ -254,6 +291,9 @@ void* thermal_monitor_thread(void *arg) {
                 dwell_ticks = 0;
             }
         }
+    }
+    if (policy_state) {
+        tsd_dispatcher_policy_destroy(policy_state);
     }
     return NULL;
 }

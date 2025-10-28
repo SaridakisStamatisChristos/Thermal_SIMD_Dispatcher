@@ -1,0 +1,138 @@
+#include <thermal/simd/policy/dispatcher_policy.h>
+
+#include <memory>
+
+#include "mpc_controller.h"
+
+namespace {
+
+struct DispatcherPolicyState {
+    tsd_policy_config config;
+    bool fallback_active;
+    std::unique_ptr<tsd::policy::MPCController> controller;
+
+    DispatcherPolicyState() : config{}, fallback_active(false), controller(nullptr) {}
+};
+
+}  // namespace
+
+extern "C" {
+
+tsd_dispatcher_policy_state* tsd_dispatcher_policy_create(const tsd_policy_config *config) {
+    DispatcherPolicyState *state = nullptr;
+    try {
+        state = new DispatcherPolicyState();
+        if (config) {
+            state->config = *config;
+        } else {
+            tsd_policy_config defaults;
+            tsd_policy_config_set_defaults(&defaults);
+            state->config = defaults;
+        }
+        state->controller = std::make_unique<tsd::policy::MPCController>(state->config);
+        state->fallback_active = false;
+    } catch (...) {
+        delete state;
+        return nullptr;
+    }
+    return reinterpret_cast<tsd_dispatcher_policy_state*>(state);
+}
+
+void tsd_dispatcher_policy_destroy(tsd_dispatcher_policy_state *opaque) {
+    if (!opaque) {
+        return;
+    }
+    auto *state = reinterpret_cast<DispatcherPolicyState*>(opaque);
+    delete state;
+}
+
+void tsd_dispatcher_policy_reset(tsd_dispatcher_policy_state *opaque, const tsd_policy_config *config) {
+    if (!opaque) {
+        return;
+    }
+    auto *state = reinterpret_cast<DispatcherPolicyState*>(opaque);
+    if (config) {
+        state->config = *config;
+    }
+    if (!state->controller) {
+        try {
+            state->controller = std::make_unique<tsd::policy::MPCController>(state->config);
+        } catch (...) {
+            state->fallback_active = true;
+            return;
+        }
+    }
+    state->controller->reset(state->config);
+    state->fallback_active = false;
+}
+
+void tsd_dispatcher_policy_record(tsd_dispatcher_policy_state *opaque,
+                                  const tsd_thermal_eval_t *sample,
+                                  simd_width_t width) {
+    if (!opaque || !sample) {
+        return;
+    }
+    auto *state = reinterpret_cast<DispatcherPolicyState*>(opaque);
+    if (!state->controller) {
+        try {
+            state->controller = std::make_unique<tsd::policy::MPCController>(state->config);
+        } catch (...) {
+            state->fallback_active = true;
+            return;
+        }
+    }
+    state->controller->pushSample(*sample, width);
+}
+
+int tsd_dispatcher_policy_recommend(tsd_dispatcher_policy_state *opaque,
+                                    simd_width_t current_width,
+                                    simd_width_t max_width,
+                                    simd_width_t *out_width,
+                                    int *fallback_active) {
+    if (fallback_active) {
+        *fallback_active = 0;
+    }
+    if (!opaque) {
+        return 0;
+    }
+    auto *state = reinterpret_cast<DispatcherPolicyState*>(opaque);
+    if (state->fallback_active) {
+        if (fallback_active) {
+            *fallback_active = 1;
+        }
+        return 0;
+    }
+    if (!state->controller) {
+        try {
+            state->controller = std::make_unique<tsd::policy::MPCController>(state->config);
+        } catch (...) {
+            state->fallback_active = true;
+            if (fallback_active) {
+                *fallback_active = 1;
+            }
+            return 0;
+        }
+    }
+    simd_width_t target = current_width;
+    bool changed = state->controller->recommend(current_width, max_width, target);
+    if (!changed) {
+        if (out_width) {
+            *out_width = current_width;
+        }
+        return 0;
+    }
+    if (out_width) {
+        *out_width = target;
+    }
+    return 1;
+}
+
+void tsd_dispatcher_policy_force_fallback(tsd_dispatcher_policy_state *opaque) {
+    if (!opaque) {
+        return;
+    }
+    auto *state = reinterpret_cast<DispatcherPolicyState*>(opaque);
+    state->fallback_active = true;
+}
+
+}  // extern "C"

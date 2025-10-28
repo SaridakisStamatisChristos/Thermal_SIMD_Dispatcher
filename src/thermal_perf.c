@@ -65,7 +65,7 @@ struct perf_ctx {
     int timeout_notified;
 };
 
-_Atomic uint64_t g_tsd_workload_iterations = 0;
+_Atomic(uint64_t) g_tsd_workload_iterations = 0;
 
 static int warned_llc_unavailable = 0;
 static int warned_perf_group_layout = 0;

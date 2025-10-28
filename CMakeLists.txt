@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.15)
-project(thermal_simd_dispatcher VERSION 0.1.0 LANGUAGES C)
+project(thermal_simd_dispatcher VERSION 0.1.0 LANGUAGES C CXX)
 set(CMAKE_C_STANDARD 11)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 set(THERMAL_SIMD_DISPATCHER_CPU_FLAGS "-msse4.1" CACHE STRING "CPU-specific compiler flags for thermal_simd")
 
@@ -25,6 +27,9 @@ set(THERMAL_SIMD_CORE_SOURCES
     src/thermal_trampoline.c
     src/thermal_perf.c
     src/thermal_signals.c
+    src/policy/policy_config.c
+    src/policy/dispatcher_policy.cpp
+    src/policy/mpc_controller.cpp
 )
 
 add_library(thermal_simd_core STATIC ${THERMAL_SIMD_CORE_SOURCES})
@@ -70,6 +75,11 @@ if(BUILD_TESTING)
     target_compile_options(test_thermal_simd PRIVATE -Wall -Wextra -O1 -pthread -fPIC)
     target_include_directories(test_thermal_simd PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME thermal_simd COMMAND test_thermal_simd)
+
+    add_executable(test_policy_controller tests/policy/test_policy_controller.c)
+    target_link_libraries(test_policy_controller PRIVATE thermal_simd_core_tests)
+    target_compile_options(test_policy_controller PRIVATE -Wall -Wextra)
+    add_test(NAME policy_controller COMMAND test_policy_controller)
 endif()
 
 install(TARGETS thermal_simd_core
