@@ -4,7 +4,8 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/thermal_simd --interval=50 --health-check --metrics-bind=127.0.0.1 --metrics-port=9464
+ExecStartPre=/usr/local/bin/thermal_simd --interval=50 --sandbox-only
+ExecStart=/usr/local/bin/thermal_simd --interval=50 --metrics-bind=127.0.0.1 --metrics-port=9464
 Environment=TSD_LOG_LEVEL=info
 CapabilityBoundingSet=CAP_PERFMON CAP_SYS_ADMIN
 AmbientCapabilities=CAP_PERFMON CAP_SYS_ADMIN

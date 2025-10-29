@@ -1,7 +1,11 @@
 #ifndef TSD_THERMAL_PERF_H
 #define TSD_THERMAL_PERF_H
 
+#ifdef __cplusplus
+#include <atomic>
+#else
 #include <stdatomic.h>
+#endif
 #include <stddef.h>
 #include <stdint.h>
 
@@ -23,7 +27,11 @@ typedef enum {
 
 typedef void (*tsd_workload_fn)(void);
 
+#ifdef __cplusplus
+extern std::atomic<uint64_t> g_tsd_workload_iterations;
+#else
 extern _Atomic(uint64_t) g_tsd_workload_iterations;
+#endif
 
 perf_ctx_t* tsd_perf_init(tsd_workload_fn workload_cb);
 void tsd_perf_enable(perf_ctx_t *ctx);

@@ -16,11 +16,13 @@ configure_file(
 )
 
 set(THERMAL_SIMD_CORE_SOURCES
+    src/config/runtime_flags.c
     src/logging.c
     src/config_parser.c
     src/statistics.c
     src/runtime_metrics.c
     src/health_check.c
+    src/healthcheck/sandbox.cpp
     src/telemetry_helper.c
     src/telemetry/evaluator.cpp
     src/telemetry/history_store.cpp
@@ -46,7 +48,7 @@ target_include_directories(thermal_simd_core
         ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 
-add_executable(thermal_simd src/thermal_simd.c)
+add_executable(thermal_simd src/main.cpp src/thermal_simd.c)
 target_compile_options(thermal_simd PRIVATE -O2 -pthread -fPIC -mno-avx ${THERMAL_SIMD_DISPATCHER_CPU_FLAGS})
 target_link_libraries(thermal_simd PRIVATE thermal_simd_core pthread)
 
@@ -98,6 +100,11 @@ if(BUILD_TESTING)
     target_link_libraries(test_policy_controller PRIVATE thermal_simd_core_tests)
     target_compile_options(test_policy_controller PRIVATE -Wall -Wextra)
     add_test(NAME policy_controller COMMAND test_policy_controller)
+
+    add_executable(test_healthcheck_runtime_flags tests/healthcheck/runtime_flags.cpp)
+    target_link_libraries(test_healthcheck_runtime_flags PRIVATE thermal_simd_core_tests)
+    target_compile_options(test_healthcheck_runtime_flags PRIVATE -Wall -Wextra)
+    add_test(NAME healthcheck_runtime_flags COMMAND test_healthcheck_runtime_flags)
 
     add_executable(test_telemetry tests/telemetry/test_telemetry.cpp)
     target_link_libraries(test_telemetry PRIVATE thermal_simd_core_tests)

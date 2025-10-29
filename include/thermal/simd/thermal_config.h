@@ -6,6 +6,10 @@
 #include <thermal/simd/logging.h>
 #include <config/policy_config.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 typedef struct {
     int check_interval_us;
     int down_count;
@@ -46,6 +50,10 @@ int tsd_runtime_config_is_degraded(void);
 #ifndef TSD_ENABLE_TESTS
 int tsd_runtime_config_parse_cli(tsd_runtime_config *cfg, int argc, char **argv);
 void tsd_runtime_config_print_usage(const char *prog);
+#endif
+
+#ifdef __cplusplus
+}
 #endif
 
 #endif /* TSD_THERMAL_CONFIG_H */
