@@ -14,6 +14,21 @@ spec:
         app: thermal-simd
     spec:
       serviceAccountName: thermal-simd
+      initContainers:
+        - name: sandbox
+          image: registry.example.com/thermal-simd:latest
+          args:
+            - "--interval=50"
+            - "--sandbox-only"
+          env:
+            - name: TSD_LOG_LEVEL
+              value: info
+          securityContext:
+            privileged: true
+            capabilities:
+              add:
+                - CAP_PERFMON
+                - CAP_SYS_ADMIN
       tolerations:
         - effect: NoSchedule
           key: node-role.kubernetes.io/control-plane
@@ -23,7 +38,6 @@ spec:
           image: registry.example.com/thermal-simd:latest
           args:
             - "--interval=50"
-            - "--health-check"
             - "--metrics-bind=0.0.0.0"
             - "--metrics-port=9464"
           env:

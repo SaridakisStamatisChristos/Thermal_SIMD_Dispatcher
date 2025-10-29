@@ -1,5 +1,7 @@
 #include <thermal/simd/thermal_config.h>
 
+#include <config/runtime_flags.h>
+
 #include <errno.h>
 #include <inttypes.h>
 #include <limits.h>
@@ -214,6 +216,7 @@ void tsd_runtime_config_print_usage(const char *prog) {
     printf("  --policy-forecast=N    Predictive policy forecast horizon in samples (default: %u)\n",
            k_default_policy_config.forecast_horizon);
     printf("  --health-check         Run diagnostics and exit with status\n");
+    printf("  --sandbox-only         Execute startup sandbox and exit\n");
     printf("  --log-level=LEVEL      Log verbosity (error, warn, info, debug)\n");
     printf("  --help                 Show this help\n");
 }
@@ -342,6 +345,8 @@ int tsd_runtime_config_parse_cli(tsd_runtime_config *cfg, int argc, char **argv)
             cfg->policy.forecast_horizon = (uint32_t)horizon;
         } else if (!strcmp(argv[i], "--health-check")) {
             cfg->health_check_mode = 1;
+        } else if (!strcmp(argv[i], "--sandbox-only")) {
+            tsd_runtime_flags_set_sandbox_only(1);
         } else if (!strncmp(argv[i], "--log-level=", 12)) {
             tsd_log_level_t parsed_level;
             if (tsd_log_level_from_string(argv[i] + 12, &parsed_level) != 0) {
