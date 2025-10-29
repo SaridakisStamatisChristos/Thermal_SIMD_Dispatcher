@@ -387,7 +387,35 @@ int tsd_dispatcher_main(int argc, char **argv) {
 
     int metrics_started = 0;
     if (!tsd_runtime_flags_sandbox_only() && g_tsd_config.metrics_enabled && g_tsd_config.metrics_port > 0) {
-        if (tsd_metrics_exporter_start(g_tsd_config.metrics_bind_host, (uint16_t)g_tsd_config.metrics_port) == 0) {
+        tsd_metrics_exporter_config_t exporter_cfg = {0};
+        exporter_cfg.bind_address = g_tsd_config.metrics_bind_host;
+        exporter_cfg.port = (uint16_t)g_tsd_config.metrics_port;
+
+        tsd_metrics_tls_config_t tls_cfg = {0};
+        if (g_tsd_config.metrics_tls_cert_path[0] != '\0' && g_tsd_config.metrics_tls_key_path[0] != '\0') {
+            tls_cfg.certificate_path = g_tsd_config.metrics_tls_cert_path;
+            tls_cfg.private_key_path = g_tsd_config.metrics_tls_key_path;
+            if (g_tsd_config.metrics_tls_ca_path[0] != '\0') {
+                tls_cfg.ca_certificate_path = g_tsd_config.metrics_tls_ca_path;
+            }
+            tls_cfg.require_client_auth = g_tsd_config.metrics_tls_require_client_auth;
+            exporter_cfg.tls = &tls_cfg;
+        }
+
+        tsd_metrics_basic_auth_t auth_cfg = {0};
+        if (g_tsd_config.metrics_basic_auth_user[0] != '\0' &&
+            g_tsd_config.metrics_basic_auth_pass[0] != '\0') {
+            auth_cfg.username = g_tsd_config.metrics_basic_auth_user;
+            auth_cfg.password = g_tsd_config.metrics_basic_auth_pass;
+            exporter_cfg.basic_auth = &auth_cfg;
+        }
+
+        if (g_tsd_config.statsd_host[0] != '\0' && g_tsd_config.statsd_port > 0) {
+            exporter_cfg.statsd_host = g_tsd_config.statsd_host;
+            exporter_cfg.statsd_port = (uint16_t)g_tsd_config.statsd_port;
+        }
+
+        if (tsd_metrics_exporter_start_with_config(&exporter_cfg) == 0) {
             metrics_started = 1;
             uint16_t actual_port = tsd_metrics_exporter_listen_port();
             tsd_log_info(LOG_COMPONENT,

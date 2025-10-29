@@ -21,6 +21,7 @@ set(THERMAL_SIMD_CORE_SOURCES
     src/config/runtime_flags.c
     src/logging.c
     src/config_parser.c
+    src/third_party/jsmn.c
     src/statistics.c
     src/runtime_metrics.c
     src/health_check.c
@@ -111,6 +112,11 @@ if(BUILD_TESTING)
     target_link_libraries(test_logging_metrics PRIVATE thermal_simd_core_tests pthread)
     target_compile_options(test_logging_metrics PRIVATE -Wall -Wextra -pthread)
     add_test(NAME logging_metrics COMMAND test_logging_metrics)
+
+    add_executable(test_runtime_config_cli tests/config/test_runtime_config_cli.c)
+    target_link_libraries(test_runtime_config_cli PRIVATE thermal_simd_core_tests m)
+    target_compile_options(test_runtime_config_cli PRIVATE -Wall -Wextra)
+    add_test(NAME runtime_config_cli COMMAND test_runtime_config_cli)
 
     add_executable(test_thermal_simd
         tests/test_thermal_simd.c

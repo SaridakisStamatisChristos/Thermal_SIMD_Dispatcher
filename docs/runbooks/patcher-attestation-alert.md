@@ -12,7 +12,7 @@ The security attestation service flagged the dispatcher patcher subsystem due to
 1. **Confirm Alert Context**
    ```bash
    kubectl logs <pod> | grep attestation | tail
-   curl -s http://<pod>:9753/metrics | egrep 'attestation|patch_failures_total'
+   curl -s http://<pod>:9464/metrics | egrep 'attestation|patch_failures_total'
    ```
 2. **Check Dispatcher State**
    ```bash
