@@ -27,6 +27,10 @@ set(THERMAL_SIMD_CORE_SOURCES
     src/telemetry/evaluator.cpp
     src/telemetry/history_store.cpp
     src/telemetry/sensors.cpp
+    src/telemetry/bus.cpp
+    src/telemetry/collector.cpp
+    src/telemetry/fusion.cpp
+    src/telemetry/fusion_bridge.cpp
     src/observability/metrics.cpp
     src/thermal_config.c
     src/thermal_cpu.c
@@ -131,6 +135,16 @@ if(BUILD_TESTING)
     target_link_libraries(test_telemetry PRIVATE thermal_simd_core_tests)
     target_compile_options(test_telemetry PRIVATE -Wall -Wextra)
     add_test(NAME telemetry_adapters COMMAND test_telemetry)
+
+    add_executable(test_telemetry_fusion tests/telemetry/test_fusion_thread.cpp)
+    target_link_libraries(test_telemetry_fusion PRIVATE thermal_simd_core_tests pthread)
+    target_compile_options(test_telemetry_fusion PRIVATE -Wall -Wextra -pthread)
+    add_test(NAME telemetry_fusion_thread COMMAND test_telemetry_fusion)
+
+    add_executable(test_telemetry_fusion_stress tests/telemetry/test_fusion_stress.cpp)
+    target_link_libraries(test_telemetry_fusion_stress PRIVATE thermal_simd_core_tests pthread)
+    target_compile_options(test_telemetry_fusion_stress PRIVATE -Wall -Wextra -pthread)
+    add_test(NAME telemetry_fusion_stress COMMAND test_telemetry_fusion_stress)
 
     add_executable(test_trampoline_security tests/patcher/test_trampoline_security.cpp)
     target_link_libraries(test_trampoline_security PRIVATE thermal_simd_core_tests pthread)
