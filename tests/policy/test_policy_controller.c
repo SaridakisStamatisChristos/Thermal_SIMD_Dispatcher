@@ -41,6 +41,7 @@ static void test_predictive_convergence(void) {
     assert(fallback == 0);
     assert(rc == 1);
     assert(target < SIMD_AVX512);
+    (void)rc;
 
     tsd_dispatcher_policy_destroy(state);
 }
@@ -67,6 +68,7 @@ static void test_predictive_stability(void) {
     assert(fallback == 0);
     assert(rc == 0);
     assert(target == SIMD_AVX2);
+    (void)rc;
 
     tsd_dispatcher_policy_destroy(state);
 }
@@ -86,6 +88,7 @@ static void test_predictive_fallback(void) {
     assert(rc == 0);
     assert(fallback == 1);
     assert(target == SIMD_AVX2);
+    (void)rc;
 
     tsd_dispatcher_policy_destroy(state);
 }

@@ -116,6 +116,17 @@ int main() {
     history_ptr.reset();
     fs::remove(path);
 
+    (void)evaluated;
+    (void)kTolerance;
+    (void)expected_weighted;
+    (void)record;
+    (void)second_value;
+    (void)record_after;
+    (void)expected_mean;
+    (void)expected_variance;
+    (void)persisted;
+    (void)fallback_value;
+
     return 0;
 }
 
