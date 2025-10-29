@@ -17,6 +17,7 @@
 
 #include <thermal/simd/statistics.h>
 #include <thermal/simd/telemetry_helper.h>
+#include <thermal/simd/telemetry_fusion.h>
 #include <thermal/simd/logging.h>
 #include <thermal/simd/metrics.h>
 #include <thermal/simd/thermal_trampoline.h>
@@ -325,6 +326,16 @@ static long perf_event_open_sys(struct perf_event_attr *hw_event, pid_t pid, int
     return syscall(__NR_perf_event_open, hw_event, pid, cpu, group_fd, flags);
 }
 
+static void fetch_fused_telemetry(perf_ctx_t *ctx, tsd_telemetry_sample_t *out) {
+    if (!ctx || !out) {
+        return;
+    }
+    if (tsd_telemetry_fusion_sample(out) == 0) {
+        return;
+    }
+    tsd_telemetry_helper_sample(&ctx->telemetry, out);
+}
+
 static void try_perf_ioctl(int fd, unsigned long request, const char *what) {
     if (fd < 0) {
         return;
@@ -397,6 +408,7 @@ perf_ctx_t* tsd_perf_init(tsd_workload_fn workload_cb) {
     }
 
     tsd_telemetry_helper_init(&ctx->telemetry, ctx->monitor_cpu);
+    tsd_telemetry_fusion_start();
 
     const char *force_sw_env = getenv("TSD_FAKE_PERF");
     int force_sw = force_sw_env && force_sw_env[0] != '\0' && strcmp(force_sw_env, "0") != 0;
@@ -510,6 +522,7 @@ void tsd_perf_cleanup(perf_ctx_t *ctx) {
         close(ctx->fd_llc_misses);
     }
     tsd_telemetry_helper_destroy(&ctx->telemetry);
+    tsd_telemetry_fusion_stop();
     free(ctx);
 }
 
@@ -607,7 +620,7 @@ void tsd_perf_measure_baseline(perf_ctx_t *ctx, const tsd_runtime_config *cfg) {
     tsd_log_info(LOG_COMPONENT, "Baseline MPKI: %lu.%03lu",
                  ctx->baseline_llc_mpki_milli / 1000, ctx->baseline_llc_mpki_milli % 1000);
     tsd_telemetry_sample_t baseline_sample = {0};
-    tsd_telemetry_helper_sample(&ctx->telemetry, &baseline_sample);
+    fetch_fused_telemetry(ctx, &baseline_sample);
     (void)baseline_sample;
 }
 
@@ -733,7 +746,7 @@ int tsd_perf_evaluate(perf_ctx_t *ctx, tsd_thermal_eval_t *out, const tsd_runtim
                 }
                 scripted_telemetry = g_test_perf_script.telemetry[tele_index];
             } else {
-                tsd_telemetry_helper_sample(&ctx->telemetry, &scripted_telemetry);
+                fetch_fused_telemetry(ctx, &scripted_telemetry);
             }
             return process_measurement(ctx, out, current_cpi, g_test_perf_script.mpki, cfg, &scripted_telemetry);
         }
@@ -759,7 +772,7 @@ int tsd_perf_evaluate(perf_ctx_t *ctx, tsd_thermal_eval_t *out, const tsd_runtim
             current_cpi = ctx->baseline_cpi ?: 1000;
         }
         tsd_telemetry_sample_t telemetry = {0};
-        tsd_telemetry_helper_sample(&ctx->telemetry, &telemetry);
+        fetch_fused_telemetry(ctx, &telemetry);
         return process_measurement(ctx, out, current_cpi, 0, cfg, &telemetry);
     }
 
@@ -802,7 +815,7 @@ int tsd_perf_evaluate(perf_ctx_t *ctx, tsd_thermal_eval_t *out, const tsd_runtim
     ctx->last_llc_value = llc_now;
 
     tsd_telemetry_sample_t telemetry = {0};
-    tsd_telemetry_helper_sample(&ctx->telemetry, &telemetry);
+    fetch_fused_telemetry(ctx, &telemetry);
     return process_measurement(ctx, out, current_cpi, mpki_milli, cfg, &telemetry);
 }
 
