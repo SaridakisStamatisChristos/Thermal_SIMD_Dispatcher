@@ -12,7 +12,7 @@ A mandatory telemetry sensor (perf counters, MSR temperature, or frequency sourc
 1. **Confirm Scope**
    ```bash
    kubectl logs <pod> | grep telemetry_sensor | tail
-   curl -s http://<pod>:9753/metrics | grep telemetry_degraded_total
+   curl -s http://<pod>:9464/metrics | grep telemetry_degraded_total
    ```
 2. **Force Health Check**
    ```bash

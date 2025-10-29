@@ -63,6 +63,26 @@ int tsd_parse_ratio_option(const char *value, double min, double max, double *ra
     return 0;
 }
 
+int tsd_parse_double_option(const char *value, double min, double max, double *out) {
+    if (!value || !out) {
+        return -1;
+    }
+    errno = 0;
+    char *end = NULL;
+    double parsed = strtod(value, &end);
+    if (errno != 0 || end == value || *end != '\0') {
+        return -1;
+    }
+    if (isnan(parsed) || isinf(parsed)) {
+        return -1;
+    }
+    if (parsed < min || parsed > max) {
+        return -1;
+    }
+    *out = parsed;
+    return 0;
+}
+
 int tsd_compute_ticks_from_ms(int interval_us, int ms, int *out_ticks, long long *raw_ticks_out) {
     if (raw_ticks_out) {
         *raw_ticks_out = -1;

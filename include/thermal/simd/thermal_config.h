@@ -35,6 +35,23 @@ typedef struct {
     int metrics_enabled;
     int metrics_port;
     char metrics_bind_host[64];
+    char metrics_tls_cert_path[256];
+    char metrics_tls_key_path[256];
+    char metrics_tls_ca_path[256];
+    int metrics_tls_require_client_auth;
+    char metrics_basic_auth_user[128];
+    char metrics_basic_auth_pass[128];
+    char statsd_host[128];
+    int statsd_port;
+    int telemetry_interval_ms;
+    int telemetry_max_skew_ms;
+    double telemetry_ewma_alpha;
+    char telemetry_profile_path[256];
+    int predictive_temp_ceiling_c;
+    int predictive_safety_margin_c;
+    int predictive_emergency_margin_c;
+    double predictive_alpha;
+    char predictive_coeff_path[256];
     tsd_log_level_t log_level;
     tsd_policy_config policy;
 } tsd_runtime_config;
@@ -47,10 +64,8 @@ void tsd_runtime_config_enter_degraded_mode(tsd_runtime_config *cfg, const char 
 void tsd_runtime_config_exit_degraded_mode(tsd_runtime_config *cfg, const char *reason);
 int tsd_runtime_config_is_degraded(void);
 
-#ifndef TSD_ENABLE_TESTS
 int tsd_runtime_config_parse_cli(tsd_runtime_config *cfg, int argc, char **argv);
 void tsd_runtime_config_print_usage(const char *prog);
-#endif
 
 #ifdef __cplusplus
 }

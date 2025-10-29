@@ -6,7 +6,7 @@ The dispatcher exports metrics and health data via a multi-channel strategy tail
 - **In-process registry:** `metrics/registry.c` tracks counters, gauges, and histograms. All subsystems register metrics during initialization.
 - **Snapshot API:** `metrics/snapshot.h` exposes `metrics_snapshot_collect()` which produces a read-only view of the current values.
 - **Exporters:**
-  - **Prometheus text endpoint** on `localhost:9753/metrics` (optional TLS with `--metrics-cert` / `--metrics-key`).
+- **Prometheus text endpoint** on `localhost:9464/metrics` (TLS enabled via `--metrics-cert` / `--metrics-key`).
   - **StatsD UDP exporter** (disabled by default) configured via `--statsd-host` and `--statsd-port`.
   - **Structured logs** that emit metric deltas under `event=metrics_flush` for environments without scrape support.
 
@@ -37,9 +37,11 @@ The dispatcher exports metrics and health data via a multi-channel strategy tail
 ### Configuration Flags
 | Flag | Description | Default |
 | --- | --- | --- |
-| `--metrics-port` | Listen port for HTTP endpoint. | 9753 |
+| `--metrics-port` | Listen port for HTTP endpoint. | 9464 |
 | `--metrics-addr` | Bind address. | `127.0.0.1` |
 | `--metrics-cert` / `--metrics-key` | Enable TLS for Prometheus endpoint. | Disabled |
+| `--metrics-ca` | Client CA bundle for mutual TLS. | Disabled |
+| `--metrics-require-client-auth` | Enforce mTLS for `/metrics` and `/healthz`. | Disabled |
 | `--metrics-basic-auth` | `user:pass` credentials for basic auth. | None |
 | `--statsd-host` | StatsD host for UDP export. | Disabled |
 | `--statsd-port` | StatsD port. | 8125 |

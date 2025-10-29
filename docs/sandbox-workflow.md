@@ -39,7 +39,7 @@ This workflow describes how to exercise the dispatcher in a non-production sandb
 ## Workflow Details
 - The runner starts the dispatcher container with `--health-check` followed by a steady-state workload phase.
 - Telemetry fuzzer attaches over a Unix domain socket exposed by the dispatcher (`/run/tsd/telemetry.sock`).
-- Metrics probe scrapes `localhost:9753` and writes results to `artifacts/metrics.ndjson`.
+- Metrics probe scrapes `localhost:9464` and writes results to `artifacts/metrics.ndjson`.
 - Sandbox artifacts (logs, metrics, telemetry traces) land under `artifacts/YYYYmmdd-HHMMSS/` for upload to CI.
 
 ## Scenarios

@@ -32,29 +32,43 @@ cmake --build build --config Release -j
 ```
 
 ## Flags
-- `--interval=MS` check interval (default 50)
-- `--down-count=N` throttles before downgrade (default 3)
-- `--up-count=N` stable intervals before upgrade (default 5)
-- `--down-ratio=R` throttle threshold as CPI multiple (default 1.5)
-- `--cooldown-down=MS` cooldown after downgrade (default 1000)
-- `--cooldown-up=MS` cooldown after upgrade (default 2000)
-- `--min-dwell=MS` minimum time per SIMD width (default 200)
-- `--no-avx512` disable AVX‑512 usage
-- `--duration-sec=S` runtime duration for demo (default 10)
-- `--work-iters=N` inner work iterations per tick (default 10,000,000)
-- `--degraded-timeout-sec=S` fail closed if hardware counters remain unavailable for S seconds (default 120)
-- `--health-check` run diagnostics (perf counters, telemetry, trampolines) and exit with status
-- `--log-level=LEVEL` set log verbosity (`error`, `warn`, `info`, `debug`; default `info`)
-- `--temp-ceiling=°C` predictive controller ceiling (default 92)
-- `--safety-margin=°C` guard band below ceiling for upgrades (default 4)
-- `--emergency-margin=°C` triggers scalar emergency fallback (default 10)
-- `--telemetry-interval=MS` collector interval (default 50)
-- `--telemetry-max-skew=MS` allowable skew between collectors (default 15)
-- `--telemetry-ewma` CPI EWMA alpha (default 0.25)
-- `--metrics-port=PORT` Prometheus endpoint port (default 9753)
-- `--metrics-basic-auth=user:pass` enable basic auth for metrics
-- `--metrics-cert/--metrics-key` enable TLS for metrics endpoint
-- `--statsd-host/--statsd-port` send metrics to StatsD
+- `--config=FILE` load overrides from a JSON file (see [configuration docs](docs/configuration.md)).
+- `--interval=MS` check interval (default 50).
+- `--down-count=N` throttles before downgrade (default 3).
+- `--up-count=N` stable intervals before upgrade (default 5).
+- `--down-ratio=R` throttle threshold as CPI multiple (default 1.5).
+- `--cooldown-down=MS` cooldown after downgrade (default 1000).
+- `--cooldown-up=MS` cooldown after upgrade (default 2000).
+- `--min-dwell=MS` minimum time per SIMD width (default 200).
+- `--no-avx512` disable AVX‑512 usage.
+- `--duration-sec=S` runtime duration for demo (default 10).
+- `--work-iters=N` inner work iterations per tick (default 10,000,000).
+- `--degraded-timeout-sec=S` fail closed if hardware counters remain unavailable for S seconds (default 120).
+- `--log-level=LEVEL` set log verbosity (`error`, `warn`, `info`, `debug`; default `info`).
+- `--health-check` run diagnostics (perf counters, telemetry, trampolines) and exit with status.
+
+**Predictive controller**
+- `--temp-ceiling=°C` predictive controller ceiling (default 92).
+- `--safety-margin=°C` guard band below the ceiling for upgrades (default 4).
+- `--emergency-margin=°C` additional buffer that triggers scalar fallback (default 10).
+- `--predictive-alpha=A` CPI EWMA alpha in the predictive path (default 0.25).
+- `--coeff-path=PATH` ARX coefficient bundle (default `config/controller_coeffs.json`).
+
+**Telemetry fusion**
+- `--telemetry-interval=MS` collector interval (default 50).
+- `--telemetry-max-skew=MS` allowable skew between collectors (default 150).
+- `--telemetry-ewma=A` telemetry CPI EWMA alpha (default 0.25).
+- `--telemetry-profile=PATH` optional telemetry profile manifest.
+
+**Metrics & observability**
+- `--metrics-port=PORT` Prometheus endpoint port (default 9464, `0` disables).
+- `--metrics-bind=ADDR` bind address (default `127.0.0.1`).
+- `--metrics-cert=PATH` / `--metrics-key=PATH` enable TLS for the metrics endpoint.
+- `--metrics-ca=PATH` optional client CA bundle when using mutual TLS.
+- `--metrics-require-client-auth` enforce mutual TLS for `/metrics` and `/healthz`.
+- `--metrics-basic-auth=user:pass` enable HTTP basic authentication.
+- `--statsd-host=HOST` emit StatsD metrics to the given host (disabled by default).
+- `--statsd-port=PORT` StatsD UDP port (default 8125).
 
 Environment override:
 - `TSD_LOG_LEVEL` mirrors `--log-level` for non-interactive deployments.
