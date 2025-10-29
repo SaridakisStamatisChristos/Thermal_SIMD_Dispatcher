@@ -92,6 +92,8 @@ See dedicated docs for subsystem details:
 - [Sandbox Workflow](docs/sandbox-workflow.md)
 
 ## Tests
+Refer to the [Validation Matrix](docs/testing-matrix.md) for a subsystem → coverage breakdown.
+
 Run smoke tests (build + basic run):
 ```bash
 tests/compile.sh && tests/smoke.sh
@@ -105,13 +107,16 @@ ci/hw-smoke.sh
 
 CI expectations:
 - `.github/workflows/ci.yml` runs the public GitHub Actions pipeline (configure, build, unit and integration tests).
-- `ci/pipeline.yml` runs the default lint/build/test stages used by the OSS mirror.
-- `ci/hw-smoke.sh` executes on bare metal to verify MSR/perf integration and metrics TLS.
+- `ci/pipeline.yml` orchestrates build, `hardware-smoke`, `stress-suite`, and `thermal-soak` hardware stages described in the [Validation Matrix](docs/testing-matrix.md).
+- `ci/hw-smoke.sh` executes on bare metal to verify MSR/perf integration and metrics TLS (see [`docs/ci-hil.md`](docs/ci-hil.md) for provisioning guidance).
+
+> **Infrastructure requirement**
+> Hardware-in-the-loop stages are pinned to runners tagged `hil` and `avx512`. Ensure this fleet is online before expecting counter/MSR regressions to surface automatically.
 
 > **Note**
-> Historical documentation referenced `ci/security.yml` and `ci/sandbox.yml` for supply-chain and fuzzing coverage. Those
-> workflows are not currently part of this repository. Security attestation validation and sandbox fuzzing remain roadmap
-> items and should be treated as future work until corresponding workflows land.
+> Security attestation and sandbox fuzzing now run via `ci/security.yml` and `ci/sandbox.yml`. These jobs require
+> dedicated credentials/runners and currently fail open, so release reviews must still confirm the checklists
+> documented in [`docs/testing-matrix.md`](docs/testing-matrix.md#security--sandbox-coverage) before promotion.
 
 ## Packaging
 

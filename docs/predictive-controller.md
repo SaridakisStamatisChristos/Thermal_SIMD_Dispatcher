@@ -68,6 +68,6 @@ Metrics are exposed through the metrics subsystem documented in [Metrics Endpoin
 | Forecast divergence | `forecast_temp` deviates > `forecast_residual_threshold` for N intervals | Auto-revert to reactive controller and set `controller_state=reactive` until manual intervention. |
 
 ## Testing Strategy
-- `tests/controller_forecast_test.cpp` validates coefficient application and dwell logic.
+- `tests/policy/test_policy_controller.c` validates coefficient application, dwell logic, and emergency fallbacks.
 - Integration tests under `tests/smoke.sh` run with synthetic telemetry via `--health-check` to verify downgrades.
-- CI pipeline (see README) executes these tests on every merge to `main`.
+- CI pipeline (see README) executes these tests on every merge to `main` and is summarized in the [Validation Matrix](testing-matrix.md).
