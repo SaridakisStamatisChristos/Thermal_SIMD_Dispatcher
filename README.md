@@ -4,6 +4,13 @@ Production‑grade, Linux x86‑64 only. Runtime chooses between SSE4.1 / AVX2 /
 
 ## Build
 
+### Prerequisites
+- Linux 5.9+ with `CAP_PERFMON` available to the dispatcher user.
+- `/dev/cpu/*/msr` readable by the runtime (systemd unit grants `CAP_SYS_ADMIN`).
+- Optional metrics TLS materials (certificate + key) if exposing `/metrics` off-host.
+- Attestation bundle (`patcher_measurement.json`, `attestor_pub.pem`) staged under `/etc/tsd/`.
+- Config overrides for telemetry/predictive controller can be provided through `TSD_TELEMETRY_*` and `TSD_PREDICTIVE_*` env vars.
+
 ### Make
 ```bash
 make
@@ -38,9 +45,20 @@ cmake --build build --config Release -j
 - `--degraded-timeout-sec=S` fail closed if hardware counters remain unavailable for S seconds (default 120)
 - `--health-check` run diagnostics (perf counters, telemetry, trampolines) and exit with status
 - `--log-level=LEVEL` set log verbosity (`error`, `warn`, `info`, `debug`; default `info`)
+- `--temp-ceiling=°C` predictive controller ceiling (default 92)
+- `--safety-margin=°C` guard band below ceiling for upgrades (default 4)
+- `--emergency-margin=°C` triggers scalar emergency fallback (default 10)
+- `--telemetry-interval=MS` collector interval (default 50)
+- `--telemetry-max-skew=MS` allowable skew between collectors (default 15)
+- `--telemetry-ewma` CPI EWMA alpha (default 0.25)
+- `--metrics-port=PORT` Prometheus endpoint port (default 9753)
+- `--metrics-basic-auth=user:pass` enable basic auth for metrics
+- `--metrics-cert/--metrics-key` enable TLS for metrics endpoint
+- `--statsd-host/--statsd-port` send metrics to StatsD
 
 Environment override:
 - `TSD_LOG_LEVEL` mirrors `--log-level` for non-interactive deployments.
+- `TSD_TELEMETRY_*`, `TSD_PREDICTIVE_*`, and `TSD_METRICS_*` mirror respective CLI flags.
 
 ## Health Check
 
@@ -61,8 +79,17 @@ Structured log lines (key=value) and in-process counters provide hooks for Prome
 - `patch_transitions` / `patch_failures`
 - `software_timeout_escalations`
 - `health_check_failures`
+- `attestation_verifications`
+- `attestation_failure`
+- `metrics_flush_duration_ms`
 
 Sensor dropouts automatically trigger exponential back-off retries and emit logs such as `event=telemetry_sensor state=degraded sensor=temp` to simplify alert wiring.
+
+See dedicated docs for subsystem details:
+- [Predictive Controller](docs/predictive-controller.md)
+- [Telemetry Fusion](docs/telemetry-fusion.md)
+- [Metrics Endpoints](docs/metrics-endpoints.md)
+- [Sandbox Workflow](docs/sandbox-workflow.md)
 
 ## Tests
 Run smoke tests (build + basic run):
@@ -75,6 +102,11 @@ A hardware-backed nightly can re-use the new helper script:
 ```bash
 ci/hw-smoke.sh
 ```
+
+CI expectations:
+- `ci/security.yml` validates attestation materials and cosign signatures.
+- `ci/sandbox.yml` runs sandbox workflow scenarios with telemetry fuzzing.
+- `ci/hw-smoke.sh` executes on bare metal to verify MSR/perf integration and metrics TLS.
 
 ## Packaging
 
