@@ -31,10 +31,12 @@ std::string FetchMetrics(uint16_t port) {
     ::inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
     int rc = ::connect(fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr));
     assert(rc == 0);
+    (void)rc;
 
     const char request[] = "GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
     ssize_t sent = ::send(fd, request, sizeof(request) - 1, 0);
     assert(sent == static_cast<ssize_t>(sizeof(request) - 1));
+    (void)sent;
 
     std::string response;
     char buffer[1024];
@@ -55,6 +57,7 @@ int main() {
     // Metrics exporter lifecycle
     int start_rc = tsd_metrics_exporter_start("127.0.0.1", 0);
     assert(start_rc == 0);
+    (void)start_rc;
     uint16_t port = tsd_metrics_exporter_listen_port();
     assert(port != 0);
 
@@ -100,6 +103,7 @@ int main() {
     fs::path bundle_path = tmpdir / "policy_bundle.json";
     bool wrote = WritePolicyBundle(bundle_path.string(), result);
     assert(wrote);
+    (void)wrote;
 
     std::ifstream in(bundle_path);
     std::string contents((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());

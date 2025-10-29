@@ -104,9 +104,14 @@ ci/hw-smoke.sh
 ```
 
 CI expectations:
-- `ci/security.yml` validates attestation materials and cosign signatures.
-- `ci/sandbox.yml` runs sandbox workflow scenarios with telemetry fuzzing.
+- `.github/workflows/ci.yml` runs the public GitHub Actions pipeline (configure, build, unit and integration tests).
+- `ci/pipeline.yml` runs the default lint/build/test stages used by the OSS mirror.
 - `ci/hw-smoke.sh` executes on bare metal to verify MSR/perf integration and metrics TLS.
+
+> **Note**
+> Historical documentation referenced `ci/security.yml` and `ci/sandbox.yml` for supply-chain and fuzzing coverage. Those
+> workflows are not currently part of this repository. Security attestation validation and sandbox fuzzing remain roadmap
+> items and should be treated as future work until corresponding workflows land.
 
 ## Packaging
 
