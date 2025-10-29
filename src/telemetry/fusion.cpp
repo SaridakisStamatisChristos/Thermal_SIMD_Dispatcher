@@ -3,6 +3,8 @@
 #include <cmath>
 #include <stdexcept>
 
+#include <observability/telemetry_state.h>
+
 #include <telemetry/bus.h>
 
 namespace telemetry {
@@ -64,6 +66,9 @@ void TelemetryFusion::start() {
     }
     std::lock_guard<std::mutex> lock(thread_mutex_);
     thread_ = std::thread([this] { run(); });
+    tsd_fusion_telemetry_t telemetry{};
+    telemetry.running = 1;
+    tsd_observability_update_fusion(&telemetry);
 }
 
 void TelemetryFusion::stop() {
@@ -77,6 +82,9 @@ void TelemetryFusion::stop() {
             thread_.join();
         }
     }
+    tsd_fusion_telemetry_t telemetry{};
+    telemetry.running = 0;
+    tsd_observability_update_fusion(&telemetry);
 }
 
 bool TelemetryFusion::running() const { return running_.load(); }
@@ -128,6 +136,18 @@ TelemetrySnapshot TelemetryFusion::fuse(std::chrono::steady_clock::time_point no
     if (!snapshot.temp_available || !snapshot.freq_available || !snapshot.cpi_available) {
         snapshot.degraded = true;
     }
+    tsd_fusion_telemetry_t telemetry{};
+    telemetry.running = running_.load() ? 1 : 0;
+    telemetry.degraded = snapshot.degraded ? 1 : 0;
+    telemetry.temp_available = snapshot.temp_available ? 1 : 0;
+    telemetry.package_temp_c = snapshot.package_temp_c;
+    telemetry.freq_available = snapshot.freq_available ? 1 : 0;
+    telemetry.freq_ratio = snapshot.freq_ratio;
+    telemetry.cpi_available = snapshot.cpi_available ? 1 : 0;
+    telemetry.thermal_cpi = snapshot.thermal_cpi;
+    telemetry.power_available = snapshot.power_available ? 1 : 0;
+    telemetry.power_budget_w = snapshot.power_budget_w;
+    tsd_observability_update_fusion(&telemetry);
     return snapshot;
 }
 

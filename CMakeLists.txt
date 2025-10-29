@@ -8,6 +8,8 @@ set(THERMAL_SIMD_DISPATCHER_CPU_FLAGS "-msse4.1" CACHE STRING "CPU-specific comp
 
 include(CTest)
 
+find_package(OpenSSL REQUIRED)
+
 file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/include/thermal/simd)
 configure_file(
     ${CMAKE_CURRENT_SOURCE_DIR}/include/thermal/simd/version.h.in
@@ -32,6 +34,8 @@ set(THERMAL_SIMD_CORE_SOURCES
     src/telemetry/fusion.cpp
     src/telemetry/fusion_bridge.cpp
     src/observability/metrics.cpp
+    src/observability/statsd_exporter.cpp
+    src/observability/telemetry_state.cpp
     src/thermal_config.c
     src/thermal_cpu.c
     src/patcher/trampoline.cpp
@@ -56,6 +60,8 @@ target_compile_definitions(thermal_simd_core
     PRIVATE
         TSD_DEFAULT_COEFF_PATH="${CMAKE_CURRENT_SOURCE_DIR}/config/controller_coeffs.json"
 )
+
+target_link_libraries(thermal_simd_core PRIVATE pthread OpenSSL::SSL OpenSSL::Crypto)
 
 add_executable(thermal_simd src/main.cpp src/thermal_simd.c)
 target_compile_options(thermal_simd PRIVATE -O2 -pthread -fPIC -mno-avx ${THERMAL_SIMD_DISPATCHER_CPU_FLAGS})
@@ -89,6 +95,7 @@ if(BUILD_TESTING)
         PRIVATE
             TSD_DEFAULT_COEFF_PATH="${CMAKE_CURRENT_SOURCE_DIR}/config/controller_coeffs.json"
     )
+    target_link_libraries(thermal_simd_core_tests PUBLIC OpenSSL::SSL OpenSSL::Crypto)
 
     add_executable(test_config_parser tests/test_config_parser.c)
     target_link_libraries(test_config_parser PRIVATE thermal_simd_core_tests)
@@ -157,6 +164,11 @@ if(BUILD_TESTING)
     target_link_libraries(test_integration_metrics_tuner PRIVATE tsd_policy_tuner pthread)
     target_compile_options(test_integration_metrics_tuner PRIVATE -Wall -Wextra)
     add_test(NAME integration_metrics_tuner COMMAND test_integration_metrics_tuner)
+
+    add_executable(test_observability_metrics tests/observability/test_metrics_exporter.cpp)
+    target_link_libraries(test_observability_metrics PRIVATE thermal_simd_core_tests pthread OpenSSL::SSL OpenSSL::Crypto)
+    target_compile_options(test_observability_metrics PRIVATE -Wall -Wextra -pthread)
+    add_test(NAME observability_metrics COMMAND test_observability_metrics)
 
     add_library(tsd_stress_common STATIC
         tests/stress/stress_common.c
