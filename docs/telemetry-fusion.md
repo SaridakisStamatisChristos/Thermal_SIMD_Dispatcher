@@ -65,6 +65,7 @@ Metrics include:
 See [Metrics Endpoints](metrics-endpoints.md) for export details.
 
 ## Testing
-- Unit tests under `tests/telemetry_fusion_test.cpp` mock sensor inputs and verify normalization.
-- Hardware-in-the-loop CI job (`ci/hil.md`) validates sensor integration on nightly runs.
+- Unit tests under `tests/telemetry/test_telemetry.cpp` mock sensor inputs and verify normalization.
+- Hardware-in-the-loop CI job (see [`docs/ci-hil.md`](ci-hil.md)) validates sensor integration on nightly runs when AVX-512 runners tagged `hil` are available.
 - `tests/smoke.sh` exercises the telemetry pipeline using the sandbox workflow.
+- Coverage ownership for this subsystem is tracked in the [Validation Matrix](testing-matrix.md).
