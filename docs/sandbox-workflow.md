@@ -52,7 +52,7 @@ This workflow describes how to exercise the dispatcher in a non-production sandb
 
 ## Exit Criteria
 - Dispatcher exits 0.
-- `artifacts/*/metrics.ndjson` contains expected counters (`predictive_downgrades_total > 0` during spike scenario).
+- `artifacts/*/metrics.ndjson` contains expected counters (`predictive_decisions_total > 0` during spike scenario).
 - No `state=emergency` logs during nominal runs.
 
 ## Automation

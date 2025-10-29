@@ -18,17 +18,24 @@ The predictive controller combines reactive thermal throttling with a short-hori
 Each signal is tagged with a monotonic timestamp. Stale signals (>2 intervals) are discarded and treated as unavailable.
 
 ## Forecast Model
-The controller uses a single-step ARX model:
+The controller uses a single-step ARX/ARMAX model implemented in `src/policy/arx_model.cpp` and driven by coefficients stored in `config/controller_coeffs.json` (see [Controller Coefficients](controller_coeffs.md)). The model consumes a sliding window of recent telemetry samples and projects the next package temperature in millicelsius:
 
 ```
-T[t+1] = a0 + a1 * T[t] + a2 * CPI[t] + a3 * Freq[t] + a4 * Power[t]
+T[t+1] = bias
+         + Σ φᵢ · T[t-i]
+         + Σ θᵢ · Ratio[t-i]
+         + Σ γᵢ · Severity[t-i]
+         + ψ · ε[t]
 ```
 
-- Coefficients `a1..a4` are calibrated offline using lab traces and stored in `config/controller_coeffs.json`.
-- The bias `a0` compensates for ambient temperature.
-- Missing inputs zero out their coefficients and raise the `predictive_input_gaps` metric.
+- `φᵢ`, `θᵢ`, and `γᵢ` are configurable auto-regressive and exogenous coefficients.
+- `ψ` is an optional moving-average gain applied to the most recent residual `ε[t] = T[t] - T̂[t]`.
+- Missing temperature samples disable the prediction path and fall back to a simple moving average.
+- Coefficient files support hot-reload: the controller listens for `SIGHUP` and re-reads `config/controller_coeffs.json` on the next control tick. Successful reloads and failures are logged and exported via metrics.
 
-The forecast produces a projected temperature and CPI value under the current SIMD width. The controller evaluates transitions (`SSE4.1`, `AVX2`, `AVX-512`) and selects the highest width whose projected temperature remains below `temp_ceiling_c - safety_margin_c` and whose CPI ratio is under `up_ratio`.
+Telemetry freshness is enforced prior to forecasting. If the latest sample exceeds the configured `staleness_window_ms`, the controller skips predictive evaluation, logs a warning, and records `predictive_stale_samples_total`.
+
+The forecast produces a projected temperature under the current SIMD width. The controller evaluates transitions (`SSE4.1`, `AVX2`, `AVX-512`) and selects the highest width whose projected temperature remains below `temp_ceiling_c - safety_margin_c` and whose CPI ratio is under `up_ratio`.
 
 ## Decision Pipeline
 1. **Acquire Inputs:** Pull the latest telemetry fusion snapshot (all `TelemetrySnapshot` values share a generation number).
@@ -52,11 +59,12 @@ The forecast produces a projected temperature and CPI value under the current SI
 | `--predictive-alpha` | EWMA alpha applied to CPI history. | 0.25 |
 
 ## Telemetry & Metrics
-- `predictive_forecasts_total`: incremented each control tick.
-- `predictive_downgrades_total`: decision to reduce SIMD width due to forecast.
-- `predictive_input_gaps_total`: missing telemetry inputs for a tick.
-- `predictive_emergency_transitions_total`: emergency scalar fallbacks.
-- `predictive_coeff_reload_errors_total`: failure to read coefficients on reload.
+- `predictive_forecasts_total`: ARX/ARMAX forecasts executed with valid telemetry.
+- `predictive_decisions_total`: control decisions driven by the predictive controller.
+- `predictive_abs_error_millic_total`: accumulated absolute prediction error in millicelsius.
+- `predictive_stale_samples_total`: telemetry snapshots rejected due to staleness.
+- `predictive_coeff_reload_total`: successful coefficient reloads (including on startup).
+- `predictive_coeff_reload_errors_total`: failures to read or parse the coefficient file.
 
 Metrics are exposed through the metrics subsystem documented in [Metrics Endpoints](metrics-endpoints.md).
 

@@ -44,6 +44,12 @@ const char* tsd_metrics_counter_name(tsd_metric_counter_t id) {
         case TSD_METRIC_PATCH_FAILURES: return "patch_failures";
         case TSD_METRIC_HEALTH_CHECK_FAILURES: return "health_check_failures";
         case TSD_METRIC_SOFTWARE_TIMEOUT_ESCALATIONS: return "software_timeout_escalations";
+        case TSD_METRIC_PREDICTIVE_FORECASTS: return "predictive_forecasts_total";
+        case TSD_METRIC_PREDICTIVE_STALE_SAMPLES: return "predictive_stale_samples_total";
+        case TSD_METRIC_PREDICTIVE_RELOADS: return "predictive_coeff_reload_total";
+        case TSD_METRIC_PREDICTIVE_RELOAD_ERRORS: return "predictive_coeff_reload_errors_total";
+        case TSD_METRIC_PREDICTIVE_ABS_ERROR_MILLIC: return "predictive_abs_error_millic_total";
+        case TSD_METRIC_PREDICTIVE_DECISIONS: return "predictive_decisions_total";
         case TSD_METRIC_COUNT: return "invalid";
     }
     return "invalid";

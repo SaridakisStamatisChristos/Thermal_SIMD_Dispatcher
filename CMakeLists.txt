@@ -35,6 +35,7 @@ set(THERMAL_SIMD_CORE_SOURCES
     src/thermal_signals.c
     src/policy/policy_config.c
     src/policy/dispatcher_policy.cpp
+    src/policy/arx_model.cpp
     src/policy/mpc_controller.cpp
 )
 
@@ -46,6 +47,10 @@ target_include_directories(thermal_simd_core
         $<INSTALL_INTERFACE:include>
     PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+target_compile_definitions(thermal_simd_core
+    PRIVATE
+        TSD_DEFAULT_COEFF_PATH="${CMAKE_CURRENT_SOURCE_DIR}/config/controller_coeffs.json"
 )
 
 add_executable(thermal_simd src/main.cpp src/thermal_simd.c)
@@ -76,6 +81,10 @@ if(BUILD_TESTING)
             ${CMAKE_CURRENT_SOURCE_DIR}/src
     )
     target_compile_definitions(thermal_simd_core_tests PRIVATE TSD_ENABLE_TESTS)
+    target_compile_definitions(thermal_simd_core_tests
+        PRIVATE
+            TSD_DEFAULT_COEFF_PATH="${CMAKE_CURRENT_SOURCE_DIR}/config/controller_coeffs.json"
+    )
 
     add_executable(test_config_parser tests/test_config_parser.c)
     target_link_libraries(test_config_parser PRIVATE thermal_simd_core_tests)
@@ -105,6 +114,13 @@ if(BUILD_TESTING)
     target_link_libraries(test_policy_controller PRIVATE thermal_simd_core_tests)
     target_compile_options(test_policy_controller PRIVATE -Wall -Wextra)
     add_test(NAME policy_controller COMMAND test_policy_controller)
+
+    add_executable(test_arx_model tests/policy/test_arx_model.cpp)
+    target_link_libraries(test_arx_model PRIVATE thermal_simd_core_tests)
+    target_compile_options(test_arx_model PRIVATE -Wall -Wextra)
+    target_include_directories(test_arx_model PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_compile_definitions(test_arx_model PRIVATE TSD_ENABLE_TESTS)
+    add_test(NAME policy_arx_model COMMAND test_arx_model)
 
     add_executable(test_healthcheck_runtime_flags tests/healthcheck/runtime_flags.cpp)
     target_link_libraries(test_healthcheck_runtime_flags PRIVATE thermal_simd_core_tests)

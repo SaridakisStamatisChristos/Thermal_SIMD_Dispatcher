@@ -1,0 +1,9 @@
+{
+  "bias": 1200.0,
+  "ar_temperature": [0.85],
+  "ratio": [-0.35],
+  "severity": [0.05],
+  "trimmed_ratio": [0.0],
+  "ma": 0.25,
+  "staleness_window_ms": 750
+}

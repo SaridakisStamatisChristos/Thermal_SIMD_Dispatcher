@@ -21,7 +21,11 @@ The dispatcher exports metrics and health data via a multi-channel strategy tail
 | Metric | Type | Description |
 | --- | --- | --- |
 | `predictive_forecasts_total` | Counter | Forecast cycles executed by the predictive controller. |
-| `predictive_downgrades_total` | Counter | Controller-driven SIMD downgrades. |
+| `predictive_decisions_total` | Counter | Control loop iterations that issued a predictive decision. |
+| `predictive_abs_error_millic_total` | Counter | Accumulated absolute error between forecast and observed temperature. |
+| `predictive_stale_samples_total` | Counter | Telemetry snapshots rejected because they exceeded the staleness window. |
+| `predictive_coeff_reload_total` | Counter | Successful coefficient reloads (startup and SIGHUP). |
+| `predictive_coeff_reload_errors_total` | Counter | Failed attempts to reload the coefficient file. |
 | `telemetry_snapshots_total` | Counter | Telemetry fusion snapshots published. |
 | `telemetry_degraded_total` | Counter | Snapshots flagged as degraded due to missing signals. |
 | `patch_transitions_total` | Counter | Successful SIMD trampoline swaps. |
