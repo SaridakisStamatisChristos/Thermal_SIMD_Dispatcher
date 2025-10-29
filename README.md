@@ -87,6 +87,7 @@ Sensor dropouts automatically trigger exponential back-off retries and emit logs
 
 See dedicated docs for subsystem details:
 - [Predictive Controller](docs/predictive-controller.md)
+- [Controller Coefficient Format](docs/controller_coeffs.md)
 - [Telemetry Fusion](docs/telemetry-fusion.md)
 - [Metrics Endpoints](docs/metrics-endpoints.md)
 - [Sandbox Workflow](docs/sandbox-workflow.md)
