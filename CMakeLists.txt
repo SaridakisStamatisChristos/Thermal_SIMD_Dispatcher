@@ -87,6 +87,11 @@ if(BUILD_TESTING)
     target_compile_options(test_statistics PRIVATE -Wall -Wextra)
     add_test(NAME statistics COMMAND test_statistics)
 
+    add_executable(test_logging_metrics tests/test_logging_metrics.c)
+    target_link_libraries(test_logging_metrics PRIVATE thermal_simd_core_tests pthread)
+    target_compile_options(test_logging_metrics PRIVATE -Wall -Wextra -pthread)
+    add_test(NAME logging_metrics COMMAND test_logging_metrics)
+
     add_executable(test_thermal_simd
         tests/test_thermal_simd.c
         src/thermal_simd.c)
