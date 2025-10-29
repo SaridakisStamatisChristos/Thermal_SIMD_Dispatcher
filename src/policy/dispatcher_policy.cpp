@@ -2,6 +2,8 @@
 
 #include <memory>
 
+#include <observability/telemetry_state.h>
+
 #include "mpc_controller.h"
 
 namespace {
@@ -13,6 +15,18 @@ struct DispatcherPolicyState {
 
     DispatcherPolicyState() : config{}, fallback_active(false), controller(nullptr) {}
 };
+
+void publish_state(const DispatcherPolicyState &state,
+                   simd_width_t current,
+                   simd_width_t recommended,
+                   bool changed) {
+    tsd_controller_telemetry_t telemetry{};
+    telemetry.fallback_active = state.fallback_active ? 1 : 0;
+    telemetry.current_width = current;
+    telemetry.recommended_width = recommended;
+    telemetry.issued_change = changed ? 1 : 0;
+    tsd_observability_update_controller(&telemetry);
+}
 
 }  // namespace
 
@@ -31,6 +45,7 @@ tsd_dispatcher_policy_state* tsd_dispatcher_policy_create(const tsd_policy_confi
         }
         state->controller = std::make_unique<tsd::policy::MPCController>(state->config);
         state->fallback_active = false;
+        publish_state(*state, SIMD_SSE41, SIMD_SSE41, false);
     } catch (...) {
         delete state;
         return nullptr;
@@ -59,11 +74,13 @@ void tsd_dispatcher_policy_reset(tsd_dispatcher_policy_state *opaque, const tsd_
             state->controller = std::make_unique<tsd::policy::MPCController>(state->config);
         } catch (...) {
             state->fallback_active = true;
+            publish_state(*state, SIMD_SSE41, SIMD_SSE41, false);
             return;
         }
     }
     state->controller->reset(state->config);
     state->fallback_active = false;
+    publish_state(*state, SIMD_SSE41, SIMD_SSE41, false);
 }
 
 void tsd_dispatcher_policy_record(tsd_dispatcher_policy_state *opaque,
@@ -78,6 +95,7 @@ void tsd_dispatcher_policy_record(tsd_dispatcher_policy_state *opaque,
             state->controller = std::make_unique<tsd::policy::MPCController>(state->config);
         } catch (...) {
             state->fallback_active = true;
+            publish_state(*state, width, width, false);
             return;
         }
     }
@@ -100,6 +118,7 @@ int tsd_dispatcher_policy_recommend(tsd_dispatcher_policy_state *opaque,
         if (fallback_active) {
             *fallback_active = 1;
         }
+        publish_state(*state, current_width, current_width, false);
         return 0;
     }
     if (!state->controller) {
@@ -110,6 +129,7 @@ int tsd_dispatcher_policy_recommend(tsd_dispatcher_policy_state *opaque,
             if (fallback_active) {
                 *fallback_active = 1;
             }
+            publish_state(*state, current_width, current_width, false);
             return 0;
         }
     }
@@ -124,6 +144,7 @@ int tsd_dispatcher_policy_recommend(tsd_dispatcher_policy_state *opaque,
     if (out_width) {
         *out_width = target;
     }
+    publish_state(*state, current_width, target, changed);
     return 1;
 }
 
@@ -133,6 +154,7 @@ void tsd_dispatcher_policy_force_fallback(tsd_dispatcher_policy_state *opaque) {
     }
     auto *state = reinterpret_cast<DispatcherPolicyState*>(opaque);
     state->fallback_active = true;
+    publish_state(*state, SIMD_SSE41, SIMD_SSE41, false);
 }
 
 }  // extern "C"

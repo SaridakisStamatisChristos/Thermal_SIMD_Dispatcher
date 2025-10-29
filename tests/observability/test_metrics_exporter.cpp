@@ -1,0 +1,281 @@
+#include <observability/metrics_exporter.h>
+#include <observability/telemetry_state.h>
+
+#include <thermal/simd/simd_width.h>
+
+#include <openssl/err.h>
+#include <openssl/ssl.h>
+
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+#include <chrono>
+#include <cstring>
+#include <future>
+#include <iostream>
+#include <sstream>
+#include <string>
+#include <thread>
+
+namespace {
+
+void fail(const std::string &message) {
+    std::cerr << "test failure: " << message << std::endl;
+    std::exit(1);
+}
+
+struct StatsdCapture {
+    int socket{-1};
+    uint16_t port{0};
+    std::future<std::string> future;
+    std::thread thread;
+};
+
+StatsdCapture start_statsd_capture() {
+    StatsdCapture capture;
+    capture.socket = ::socket(AF_INET, SOCK_DGRAM, 0);
+    if (capture.socket < 0) {
+        fail("unable to create statsd socket");
+    }
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = htons(0);
+    if (::bind(capture.socket, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+        fail("bind statsd socket failed");
+    }
+    sockaddr_in actual{};
+    socklen_t len = sizeof(actual);
+    if (::getsockname(capture.socket, reinterpret_cast<sockaddr*>(&actual), &len) != 0) {
+        fail("getsockname statsd socket failed");
+    }
+    capture.port = ntohs(actual.sin_port);
+
+    struct timeval tv {5, 0};
+    (void)::setsockopt(capture.socket, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    std::promise<std::string> promise;
+    capture.future = promise.get_future();
+    int fd = capture.socket;
+    capture.thread = std::thread([fd, p = std::move(promise)]() mutable {
+        char buffer[512];
+        ssize_t n = ::recv(fd, buffer, sizeof(buffer) - 1, 0);
+        if (n > 0) {
+            buffer[n] = '\0';
+            p.set_value(std::string(buffer, static_cast<size_t>(n)));
+        } else {
+            p.set_value(std::string());
+        }
+    });
+    return capture;
+}
+
+void stop_statsd_capture(StatsdCapture &capture) {
+    if (capture.socket >= 0) {
+        ::close(capture.socket);
+        capture.socket = -1;
+    }
+    if (capture.thread.joinable()) {
+        capture.thread.join();
+    }
+}
+
+struct HttpResponse {
+    int status{0};
+    std::string body;
+};
+
+HttpResponse https_request(uint16_t port,
+                           const std::string &path,
+                           const std::string &auth_header,
+                           const std::string &ca_path) {
+    SSL_CTX *ctx = SSL_CTX_new(TLS_client_method());
+    if (!ctx) {
+        fail("unable to create SSL context");
+    }
+    if (SSL_CTX_load_verify_locations(ctx, ca_path.c_str(), nullptr) <= 0) {
+        fail("unable to load CA");
+    }
+    SSL *ssl = SSL_new(ctx);
+    if (!ssl) {
+        fail("unable to allocate SSL");
+    }
+    int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        fail("unable to create tcp socket");
+    }
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    if (::inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr) != 1) {
+        fail("inet_pton failed");
+    }
+    if (::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+        fail("connect failed");
+    }
+    SSL_set_fd(ssl, fd);
+    SSL_set_tlsext_host_name(ssl, "127.0.0.1");
+    if (SSL_connect(ssl) <= 0) {
+        fail("SSL_connect failed");
+    }
+    std::ostringstream request;
+    request << "GET " << path << " HTTP/1.1\r\n";
+    request << "Host: 127.0.0.1\r\n";
+    request << "Connection: close\r\n";
+    if (!auth_header.empty()) {
+        request << "Authorization: " << auth_header << "\r\n";
+    }
+    request << "\r\n";
+    std::string req = request.str();
+    if (SSL_write(ssl, req.data(), static_cast<int>(req.size())) <= 0) {
+        fail("SSL_write failed");
+    }
+    std::string response;
+    char buffer[1024];
+    int n = 0;
+    while ((n = SSL_read(ssl, buffer, sizeof(buffer))) > 0) {
+        response.append(buffer, n);
+    }
+    SSL_shutdown(ssl);
+    SSL_free(ssl);
+    ::close(fd);
+    SSL_CTX_free(ctx);
+
+    HttpResponse parsed;
+    auto header_end = response.find("\r\n\r\n");
+    if (header_end == std::string::npos) {
+        fail("malformed HTTP response");
+    }
+    std::string headers = response.substr(0, header_end);
+    parsed.body = response.substr(header_end + 4);
+    std::istringstream header_stream(headers);
+    std::string status_line;
+    std::getline(header_stream, status_line);
+    if (!status_line.empty() && status_line.back() == '\r') {
+        status_line.pop_back();
+    }
+    std::istringstream status_stream(status_line);
+    std::string http_version;
+    status_stream >> http_version >> parsed.status;
+    return parsed;
+}
+
+std::string basic_auth_header(const std::string &user, const std::string &pass) {
+    std::string token = user + ":" + pass;
+    static const char table[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string encoded;
+    int val = 0;
+    int valb = -6;
+    for (unsigned char c : token) {
+        val = (val << 8) + c;
+        valb += 8;
+        while (valb >= 0) {
+            encoded.push_back(table[(val >> valb) & 0x3F]);
+            valb -= 6;
+        }
+    }
+    if (valb > -6) {
+        encoded.push_back(table[((val << 8) >> (valb + 8)) & 0x3F]);
+    }
+    while (encoded.size() % 4) {
+        encoded.push_back('=');
+    }
+    return std::string("Basic ") + encoded;
+}
+
+}  // namespace
+
+int main() {
+    StatsdCapture capture = start_statsd_capture();
+
+    const char *cert_dir = "../tests/observability/certs/";
+    std::string server_crt = std::string(cert_dir) + "server.crt";
+    std::string server_key = std::string(cert_dir) + "server.key";
+    std::string ca_crt = std::string(cert_dir) + "ca.crt";
+
+    tsd_metrics_tls_config_t tls{};
+    tls.certificate_path = server_crt.c_str();
+    tls.private_key_path = server_key.c_str();
+    tls.ca_certificate_path = ca_crt.c_str();
+
+    tsd_metrics_basic_auth_t auth{};
+    auth.username = "observer";
+    auth.password = "secret";
+
+    tsd_metrics_exporter_config_t config{};
+    config.bind_address = "127.0.0.1";
+    config.port = 0;
+    config.tls = &tls;
+    config.basic_auth = &auth;
+    config.statsd_host = "127.0.0.1";
+    config.statsd_port = capture.port;
+
+    if (tsd_metrics_exporter_start_with_config(&config) != 0) {
+        fail("metrics exporter failed to start");
+    }
+
+    uint16_t port = tsd_metrics_exporter_listen_port();
+    if (port == 0) {
+        fail("listen port not assigned");
+    }
+
+    tsd_controller_telemetry_t controller{};
+    controller.fallback_active = 0;
+    controller.current_width = SIMD_AVX2;
+    controller.recommended_width = SIMD_AVX2;
+    controller.issued_change = 0;
+    tsd_observability_update_controller(&controller);
+
+    tsd_fusion_telemetry_t fusion{};
+    fusion.running = 1;
+    fusion.degraded = 0;
+    fusion.temp_available = 1;
+    fusion.package_temp_c = 63.0;
+    fusion.freq_available = 1;
+    fusion.freq_ratio = 0.85;
+    fusion.cpi_available = 1;
+    fusion.thermal_cpi = 1.10;
+    fusion.power_available = 1;
+    fusion.power_budget_w = 75.0;
+    tsd_observability_update_fusion(&fusion);
+
+    HttpResponse unauth = https_request(port, "/metrics", "", ca_crt);
+    if (unauth.status != 401) {
+        fail("expected 401 for missing credentials");
+    }
+
+    HttpResponse metrics = https_request(port, "/metrics", basic_auth_header("observer", "secret"), ca_crt);
+    if (metrics.status != 200) {
+        fail("expected 200 for metrics");
+    }
+    if (metrics.body.find("tsd_patch_transitions_total") == std::string::npos) {
+        fail("metrics body missing counter");
+    }
+
+    HttpResponse health = https_request(port, "/healthz", basic_auth_header("observer", "secret"), ca_crt);
+    if (health.status != 200) {
+        fail("expected healthy response");
+    }
+    HttpResponse ready = https_request(port, "/readyz", basic_auth_header("observer", "secret"), ca_crt);
+    if (ready.status != 200) {
+        fail("expected ready response");
+    }
+
+    tsd_metrics_exporter_record_patch(SIMD_AVX2, SIMD_AVX512, 0, 5);
+
+    auto status = capture.future.wait_for(std::chrono::seconds(5));
+    if (status != std::future_status::ready) {
+        fail("statsd emission missing");
+    }
+    std::string statsd_payload = capture.future.get();
+    if (statsd_payload.find("tsd.patch_transition.avx2.avx512.success") == std::string::npos) {
+        fail("statsd payload missing transition");
+    }
+
+    tsd_metrics_exporter_stop();
+    stop_statsd_capture(capture);
+    return 0;
+}
+
