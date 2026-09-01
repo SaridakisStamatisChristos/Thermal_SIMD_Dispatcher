@@ -1,81 +1,117 @@
-# Predictive Thermal Controller
+# Predictive Thermal Policy
 
-The predictive controller combines reactive thermal throttling with a short-horizon forecast to minimize SIMD width flapping. It runs inside `controller/predictive_controller.c` and is invoked from the dispatcher event loop every scheduler interval.
+The predictive path is implemented by `src/policy/mpc_controller.cpp` together with `src/policy/arx_model.cpp`. Despite the historical `MPCController` class name, the current implementation is a **model-assisted discrete candidate optimizer**, not a general receding-horizon MPC solver. It forecasts thermal state from recent telemetry, scores the available SIMD modes, and falls back to the reactive hysteresis path when predictive inputs are unavailable or stale.
 
 ## Goals
-- Maintain CPU/package temperature below the configured ceiling without sacrificing SIMD throughput unnecessarily.
-- Avoid oscillations caused by short thermal spikes by enforcing hysteresis and a minimum dwell time.
-- Fail closed in the presence of missing data (telemetry dropouts, MSR inaccessibility) by downgrading SIMD width and escalating through the metrics pipeline.
 
-## Control Inputs
-| Signal | Source | Notes |
+- Keep CPI/thermal behavior near configured service-level targets without unnecessary SIMD-mode flapping.
+- Penalize width changes so small forecast differences do not trigger transitions.
+- Reject stale telemetry and invalid model state.
+- Preserve the independent reactive hysteresis controller as the conservative fallback.
+
+## Inputs
+
+Each `TelemetrySample` stored by the predictive controller includes:
+
+| Signal | Source | Use |
 | --- | --- | --- |
-| `thermal_cpi` | Derived from `perf_event_open` counters (`cycles` / `instructions`) | Sampled every interval and decayed with EWMA (`alpha=0.25`). |
-| `package_temp_c` | MSR IA32_THERM_STATUS or `/sys/class/thermal/thermal_zone*` fallback | Normalized to Kelvin for forecast math; converted back for logging. |
-| `freq_hint` | Telemetry fusion layer (see [Telemetry Fusion](telemetry-fusion.md)) | Indicates OEM turbo residency and informs forecast headroom. |
-| `power_budget_w` | Optional RAPL reading | Drives predictive downgrade when dynamic power exceeds limit. |
+| `ratio_milli` | CPI-derived performance ratio | Candidate cost and short-term trend. |
+| `trimmed_ratio_milli` | Trimmed ratio history | More robust forecast ratio when available. |
+| `severity_milli` | Reactive evaluator | ARX exogenous input. |
+| `temperature_millic` | Fused package-temperature telemetry | ARX autoregressive input and temperature cost. |
+| current SIMD width | Dispatcher state | Transition-distance/penalty calculation. |
+| monotonic timestamp | `steady_clock` | Staleness rejection. |
 
-Each signal is tagged with a monotonic timestamp. Stale signals (>2 intervals) are discarded and treated as unavailable.
+The current ARX temperature predictor does **not** model SIMD width as a fitted plant-control coefficient. Candidate-width effects are handled by the controller scoring function. This limitation is intentional and is why the implementation should not be described as full MPC.
 
-## Forecast Model
-The controller uses a single-step ARX/ARMAX model implemented in `src/policy/arx_model.cpp` and driven by coefficients stored in `config/controller_coeffs.json` (see [Controller Coefficients](controller_coeffs.md)). The model consumes a sliding window of recent telemetry samples and projects the next package temperature in millicelsius:
+## ARX / ARMAX temperature model
 
+Coefficients are loaded from `config/controller_coeffs.json`. The estimator is implemented in `src/policy/arx_model.cpp` and computes a one-step package-temperature estimate from recent samples:
+
+```text
+T_hat[t+1] = bias
+           + sum(phi_i * T[t-i])
+           + sum(theta_i * Ratio[t-i])
+           + sum(gamma_i * Severity[t-i])
+           + sum(delta_i * TrimmedRatio[t-i])
+           + psi * residual[t]
 ```
-T[t+1] = bias
-         + Σ φᵢ · T[t-i]
-         + Σ θᵢ · Ratio[t-i]
-         + Σ γᵢ · Severity[t-i]
-         + ψ · ε[t]
-```
 
-- `φᵢ`, `θᵢ`, and `γᵢ` are configurable auto-regressive and exogenous coefficients.
-- `ψ` is an optional moving-average gain applied to the most recent residual `ε[t] = T[t] - T̂[t]`.
-- Missing temperature samples disable the prediction path and fall back to a simple moving average.
-- Coefficient files support hot-reload: the controller listens for `SIGHUP` and re-reads `config/controller_coeffs.json` on the next control tick. Successful reloads and failures are logged and exported via metrics.
+The moving-average residual term is optional. If no valid temperature sample is available, the ARX prediction is rejected and the controller uses its fallback averaging path instead.
 
-Telemetry freshness is enforced prior to forecasting. If the latest sample exceeds the configured `staleness_window_ms`, the controller skips predictive evaluation, logs a warning, and records `predictive_stale_samples_total`.
+The coefficient file can also define `staleness_window_ms`. `SIGHUP` requests a coefficient reload; reload work is performed on the next controller call rather than inside the signal handler.
 
-The forecast produces a projected temperature under the current SIMD width. The controller evaluates transitions (`SSE4.1`, `AVX2`, `AVX-512`) and selects the highest width whose projected temperature remains below `temp_ceiling_c - safety_margin_c` and whose CPI ratio is under `up_ratio`.
+## Candidate scoring
 
-## Decision Pipeline
-1. **Acquire Inputs:** Pull the latest telemetry fusion snapshot (all `TelemetrySnapshot` values share a generation number).
-2. **Validate Freshness:** Reject snapshots older than `stale_threshold_ms`. Revert to downgrade path if stale.
-3. **Run Forecast:** Compute `forecast_temp` and `forecast_cpi` using the ARX model.
-4. **Evaluate Guards:**
-   - If `forecast_temp >= temp_ceiling_c`, downgrade one SIMD level.
-   - If `forecast_temp >= temp_ceiling_c + emergency_margin_c`, drop to scalar and set `state=emergency`.
-   - Require `up_count` consecutive intervals below `up_ratio` before upgrading.
-5. **Apply Dwell & Cooldown:** Enforce `min_dwell_ms` per width and cooldown timers between upgrades/downgrades.
-6. **Actuate:** Program trampoline patch buffer, flip dispatch pointer, and log `event=controller_decision` with context fields.
+For each control tick, the controller considers the current width and each supported candidate up to the detected maximum:
 
-## Configuration Knobs
-| Flag | Description | Default |
-| --- | --- | --- |
-| `--temp-ceiling` | Maximum allowed package temperature (°C). | 92 |
-| `--safety-margin` | Guard band subtracted from the ceiling for predictive upgrades (°C). | 4 |
-| `--emergency-margin` | Additional buffer that triggers scalar fallback (°C). | 10 |
-| `--forecast-horizon` | Number of intervals to project. Currently fixed at 1 but tunable for experiments. | 1 |
-| `--coeff-path` | Override path to controller coefficients JSON. | `config/controller_coeffs.json` |
-| `--predictive-alpha` | EWMA alpha applied to CPI history. | 0.25 |
+- `SIMD_SSE41`
+- `SIMD_AVX2`
+- `SIMD_AVX512`
 
-## Telemetry & Metrics
-- `predictive_forecasts_total`: ARX/ARMAX forecasts executed with valid telemetry.
-- `predictive_decisions_total`: control decisions driven by the predictive controller.
-- `predictive_abs_error_millic_total`: accumulated absolute prediction error in millicelsius.
-- `predictive_stale_samples_total`: telemetry snapshots rejected due to staleness.
-- `predictive_coeff_reload_total`: successful coefficient reloads (including on startup).
-- `predictive_coeff_reload_errors_total`: failures to read or parse the coefficient file.
+The score combines:
 
-Metrics are exposed through the metrics subsystem documented in [Metrics Endpoints](metrics-endpoints.md).
+1. distance between projected ratio and `slo_ratio_milli`;
+2. distance between projected temperature and `slo_temp_millic`;
+3. an upgrade/downgrade transition penalty proportional to the number of width steps;
+4. a stability margin and minimum-improvement requirement before changing width.
 
-## Failure Modes & Mitigations
-| Failure | Detection | Mitigation |
-| --- | --- | --- |
-| Coefficient file missing/corrupt | Checksum verification on load | Log `level=error`, increment `predictive_coeff_reload_errors_total`, continue with baked-in safe coefficients. |
-| Telemetry stall | Staleness guard > `stale_threshold_ms` | Force downgrade, escalate via `telemetry_stall` alert, set degraded mode bit. |
-| Forecast divergence | `forecast_temp` deviates > `forecast_residual_threshold` for N intervals | Auto-revert to reactive controller and set `controller_state=reactive` until manual intervention. |
+This is a finite candidate-selection problem. The implementation does not optimize a sequence `u[t..t+H]` and does not roll a width-dependent plant model through a control horizon.
 
-## Testing Strategy
-- `tests/policy/test_policy_controller.c` validates coefficient application, dwell logic, and emergency fallbacks.
-- Integration tests under `tests/smoke.sh` run with synthetic telemetry via `--health-check` to verify downgrades.
-- CI pipeline (see README) executes these tests on every merge to `main` and is summarized in the [Validation Matrix](testing-matrix.md).
+## Interaction with the dispatcher
+
+1. `tsd_dispatcher_policy_record()` pushes each latest thermal evaluation into the controller history.
+2. `tsd_dispatcher_policy_recommend()` asks for a candidate width.
+3. If the predictive controller declines or is in fallback state, the runtime continues through the existing reactive hysteresis logic.
+4. If a different width is recommended and runtime transition policy allows it, `tsd_trampoline_patch()` selects the corresponding **immutable RX trampoline**.
+5. Cooldown and minimum-dwell constraints remain enforced by the dispatcher loop.
+
+`tsd_trampoline_patch()` is a compatibility name: production transitions no longer rewrite executable bytes.
+
+## Configuration
+
+The policy-level defaults are defined in `src/policy/policy_config.c`:
+
+| Setting | Default | Meaning |
+| --- | ---: | --- |
+| `slo_ratio_milli` | 1500 | Target CPI/performance ratio. |
+| `slo_temp_millic` | 85000 | Target package temperature in millicelsius. |
+| `transition_penalty_up_milli` | 750 | Cost of each upward SIMD step. |
+| `transition_penalty_down_milli` | 1000 | Cost of each downward SIMD step. |
+| `forecast_horizon` | 5 | Number of recent samples used by the policy/forecast helpers. |
+
+Runtime CLI/configuration wiring is documented in [`configuration.md`](configuration.md) and [`controller_coeffs.md`](controller_coeffs.md).
+
+## Metrics
+
+The controller exports counters including:
+
+- `predictive_forecasts_total`
+- `predictive_decisions_total`
+- `predictive_abs_error_millic_total`
+- `predictive_stale_samples_total`
+- `predictive_coeff_reload_total`
+- `predictive_coeff_reload_errors_total`
+
+These are observability signals, not proof that every transition was generated by the predictive path; the dispatcher can still act through the reactive fallback controller.
+
+## Failure behavior
+
+| Condition | Behavior |
+| --- | --- |
+| Coefficient file missing or malformed | Log reload failure, keep predictive path conservative/fallback-capable. |
+| Latest telemetry older than staleness window | Reject predictive recommendation and increment stale-sample metric. |
+| Missing valid temperature history | ARX forecast is unavailable; use fallback estimate or reactive policy. |
+| Patch/selection failure | Dispatcher forces predictive fallback and retains/re-enters the conservative path. |
+| Prolonged hardware-perf loss | Separate degraded-mode timeout logic can force SSE4.1. |
+
+## Validation
+
+- `tests/policy/test_policy_controller.c` exercises policy behavior and fallback paths.
+- `tests/policy/test_arx_model.cpp` validates coefficient parsing, forecasting and residual handling.
+- `.github/workflows/sandbox.yml` runs policy/telemetry regressions and a forced software-perf runtime path.
+- Hardware thermal behavior still requires the HIL/thermal-soak pipeline described in [`testing-matrix.md`](testing-matrix.md).
+
+## Future step toward true MPC
+
+A genuine MPC implementation would make SIMD mode (and ideally workload intensity/power) an explicit fitted control input to the plant model, identify per-platform dynamics, roll candidate trajectories across a horizon, and optimize a constrained objective such as throughput, temperature headroom and energy. The current code deliberately stops short of claiming that capability.

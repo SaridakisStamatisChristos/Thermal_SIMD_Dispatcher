@@ -18,9 +18,14 @@
 #include <thermal/simd/simd_width.h>
 
 /**
- * Trampoline slots are aligned to 64 bytes to satisfy CET shadow stack
- * requirements and provide a BTI landing pad regardless of where an indirect
- * branch arrives.
+ * Each indirect-call target is 64-byte aligned and begins with ENDBR64 so the
+ * dispatcher is compatible with x86 CET Indirect Branch Tracking (IBT).
+ * Alignment is a layout/cache property; CET shadow stacks do not require it.
+ *
+ * Production code slots are created once on a writable, non-executable page,
+ * then the page is sealed read+execute before any slot can be published.
+ * Runtime width changes select between immutable RX slots with an atomic
+ * pointer update; executable code is never rewritten while the process runs.
  */
 #if defined(__cplusplus)
 struct alignas(64) tsd_patch_slot_t {
@@ -64,6 +69,11 @@ extern TSD_ATOMIC_TYPE(bool) g_tsd_page_a_effective_writable;
 extern TSD_ATOMIC_TYPE(bool) g_tsd_page_b_effective_writable;
 
 int tsd_trampoline_init(void);
+
+/*
+ * Compatibility name retained for existing callers. This no longer rewrites
+ * executable memory; it atomically selects an already-sealed implementation.
+ */
 int tsd_trampoline_patch(simd_width_t new_width);
 int init_double_buffer_trampoline(void);
 int tsd_trampoline_self_validate(char *reason, size_t reason_len);

@@ -1,67 +1,95 @@
 # Validation Matrix
 
-This document maps the dispatcher subsystems to automated coverage and operator checklists so production rollouts can rely on deterministic guardrails instead of tribal knowledge.
+This document maps dispatcher subsystems to automated coverage and hardware-only validation. Public CI is intentionally separated from hardware-in-the-loop checks because hosted runners cannot guarantee AVX-512 availability, MSR access, stable perf permissions or repeatable thermal behavior.
 
-## Unit Tests
+## Unit tests
 
-| Subsystem | Test Binary | Path | Notes |
+| Subsystem | Test binary | Path | Coverage |
 | --- | --- | --- | --- |
-| Dispatcher core (trampoline wiring, downgrade paths) | `test_thermal_simd` | [`tests/test_thermal_simd.c`](../tests/test_thermal_simd.c) | Exercises scalar/SIMD transitions, W^X enforcement, and failure escalation. |
-| Predictive controller | `test_policy_controller` | [`tests/policy/test_policy_controller.c`](../tests/policy/test_policy_controller.c) | Validates dwell timers, emergency fallbacks, and coefficient reload behavior. |
-| Telemetry fusion | `test_telemetry` | [`tests/telemetry/test_telemetry.cpp`](../tests/telemetry/test_telemetry.cpp) | Mocks perf/MSR inputs to ensure normalization, staleness guards, and degraded flags. |
-| Config parsing | `test_config_parser` | [`tests/test_config_parser.c`](../tests/test_config_parser.c) | Confirms CLI/env precedence and rejects malformed telemetry/controller overrides. |
-| Statistics helpers | `test_statistics` | [`tests/test_statistics.c`](../tests/test_statistics.c) | Guards percentile and EWMA helpers used by controller heuristics. |
+| Dispatcher core | `test_thermal_simd` | [`tests/test_thermal_simd.c`](../tests/test_thermal_simd.c) | Width transitions, fallback paths, policy timing and fault escalation. |
+| Immutable executable-memory dispatch | `test_trampoline_security` | [`tests/patcher/test_trampoline_security.cpp`](../tests/patcher/test_trampoline_security.cpp) | RX-only mappings, CET/IBT landing pads, native 128/256/512-bit payload encodings, fail-closed selection and attestation mismatch detection. |
+| Predictive policy | `test_policy_controller` | [`tests/policy/test_policy_controller.c`](../tests/policy/test_policy_controller.c) | Dwell timers, emergency fallback, stale telemetry and coefficient reload behavior. |
+| ARX estimator | `test_arx_model` | [`tests/policy/test_arx_model.cpp`](../tests/policy/test_arx_model.cpp) | Coefficient parsing, temperature forecasting and residual handling. |
+| Telemetry fusion | `test_telemetry`, `test_telemetry_fusion`, `test_telemetry_fusion_stress` | [`tests/telemetry/`](../tests/telemetry) | Sensor normalization, staleness, fusion-thread behavior and concurrent access. |
+| Config parsing | `test_config_parser`, `test_runtime_config_cli` | [`tests/`](../tests) | CLI/env precedence and malformed override rejection. |
+| Statistics helpers | `test_statistics` | [`tests/test_statistics.c`](../tests/test_statistics.c) | EWMA/trimmed statistics used by policy heuristics. |
+| Observability | `test_logging_metrics`, `test_observability_metrics` | [`tests/observability/`](../tests/observability) | Counters, exporters, TLS/auth configuration and snapshots. |
 
-All unit binaries build via `cmake --build build --target test_thermal_simd test_policy_controller test_telemetry ...` and execute under `ctest` when `BUILD_TESTING=ON`.
+All registered unit tests run through `ctest` when `BUILD_TESTING=ON`.
 
-## Integration & Smoke
+## Executable-memory security invariant
 
-| Scenario | Script | Tags |
+Production trampolines are no longer rewritten at runtime. Initialization creates the complete code table as `RW` and non-executable, copies the canonical SSE4.1/AVX2/AVX-512 payloads, then changes the mapping to `RX` before publishing any slot. Runtime transitions atomically select an immutable slot.
+
+`test_trampoline_security` verifies:
+
+1. every active indirect-call target begins with `ENDBR64`;
+2. the active mapping is reported by `/proc/self/maps` as readable/executable and not writable;
+3. fault-injected transitions do not change the selected width;
+4. no compatibility "inactive" slot is reported writable;
+5. AVX2 contains a YMM broadcast and AVX-512 contains a ZMM broadcast, preventing regression to XMM-only encodings;
+6. attestation rejects a deliberately modified test-only immutable payload.
+
+The test-only override path allocates a fresh RW page, writes the injected payload, seals it RX and never rewrites it. Production builds do not expose this override path.
+
+## Public GitHub Actions
+
+| Workflow | Trigger | Purpose |
 | --- | --- | --- |
-| Build + basic health check | [`tests/compile.sh`](../tests/compile.sh), [`tests/smoke.sh`](../tests/smoke.sh) | Runs on public CI and pre-merge branches. |
-| Capability/self-test gate | [`ci/hw-smoke.sh`](../ci/hw-smoke.sh) | Requires AVX-512 + perf access; validates `--health-check`. |
+| [`.github/workflows/ci.yml`](../.github/workflows/ci.yml) | push to `main`, pull request | Standard configure/build/CTest regression suite. |
+| [`.github/workflows/security.yml`](../.github/workflows/security.yml) | push to `main`, pull request, weekly | Focused immutable-trampoline, attestation and health-check security regressions. |
+| [`.github/workflows/sandbox.yml`](../.github/workflows/sandbox.yml) | push to `main`, pull request, weekly | Policy/telemetry tests plus a forced software-perf degraded-mode runtime exercise. |
 
-The smoke suite compiles the dispatcher, runs `--health-check`, and captures metrics/log assertions expected in staging.
+These workflows require no private signing material and are expected to be runnable on ordinary GitHub-hosted Linux runners.
 
-## Stress & Fault Injection
+## Integration and smoke
+
+| Scenario | Script | Notes |
+| --- | --- | --- |
+| Build + basic runtime smoke | [`tests/compile.sh`](../tests/compile.sh), [`tests/smoke.sh`](../tests/smoke.sh) | Useful for local/pre-merge validation. |
+| Hardware capability/health gate | [`ci/hw-smoke.sh`](../ci/hw-smoke.sh) | Requires real perf/MSR permissions and the intended CPU feature set. |
+
+## Stress and fault injection
 
 | Harness | Binary | Description |
 | --- | --- | --- |
-| Patch churn | `stress_patch_request` | Validates double-buffer trampolines under sustained AVX width flips. |
-| Signal storm | `stress_signal_storm` | Ensures signal handling remains re-entrant while patching occurs. |
-| Telemetry faults | `stress_telemetry_faults` | Feeds malformed snapshots to verify safe downgrade and alerting. |
+| Transition churn | `stress_patch_request` | Repeated immutable width selections with injected failures. The compatibility name remains "patch" although production code pages are not rewritten. |
+| Signal storm | `stress_signal_storm` | Exercises signal handling while width selections occur. |
+| Telemetry faults | `stress_telemetry_faults` | Feeds malformed/dropout snapshots and checks safe fallback behavior. |
 
-Targets live in [`tests/stress/`](../tests/stress) and run automatically in the `stress` stage of `ci/pipeline.yml` on `hil`/`avx512` runners.
+These targets live in [`tests/stress/`](../tests/stress) and are intended primarily for controlled HIL runners where the advertised ISA is guaranteed.
 
-## Hardware-in-the-Loop
+## Hardware-in-the-loop
 
 | Stage | Definition | Purpose |
 | --- | --- | --- |
-| `hardware-smoke` | [`ci/pipeline.yml`](../ci/pipeline.yml) → `hardware-smoke` | Rebuilds and executes `ci/hw-smoke.sh` on bare metal. |
-| `stress-suite` | [`ci/pipeline.yml`](../ci/pipeline.yml) → `stress-suite` | Runs all stress harnesses with production-grade parameters. |
-| `thermal-soak` | [`ci/pipeline.yml`](../ci/pipeline.yml) → `thermal-soak` | Long-running thermal regression check; see [`ci/thermal-soak.sh`](../ci/thermal-soak.sh). |
+| `hardware-smoke` | [`ci/pipeline.yml`](../ci/pipeline.yml) | Rebuild and run `ci/hw-smoke.sh` on bare metal. |
+| `stress-suite` | [`ci/pipeline.yml`](../ci/pipeline.yml) | Run transition/signal/telemetry stress harnesses on known hardware. |
+| `thermal-soak` | [`ci/pipeline.yml`](../ci/pipeline.yml) | Long-running thermal regression and policy-stability check. |
 
-Provisioning and operations guidance live in [`docs/ci-hil.md`](ci-hil.md); the fleet must expose the `hil` and `avx512` tags for the stages above to schedule.
+Provisioning guidance is in [`docs/ci-hil.md`](ci-hil.md). HIL runners should advertise `hil` and `avx512` only when those capabilities are actually present.
 
-## Security & Sandbox Coverage
+## Release review requirements
 
-| Workflow | Definition | Coverage Focus | Automation Notes | Release Review Requirement |
-| --- | --- | --- | --- | --- |
-| Supply-chain attestation | [`ci/security.yml`](../ci/security.yml) | Verifies attestation bundle signatures, SBOM drift, and binary provenance against `docs/security/threat-model.md`. | Runs on nightly + release-candidate branches with private signing materials. Fails open when credentials are unavailable. | Release manager must confirm artifacts uploaded and checklist in [`docs/security/threat-model.md`](security/threat-model.md) is satisfied before promoting. |
-| Sandbox fuzzing | [`ci/sandbox.yml`](../ci/sandbox.yml) | Exercises `ci/sandbox/run.sh` dropout/spike scenarios to surface telemetry, patching, and metrics regressions. | Nightly on hosts labeled `sandbox`; artifacts archived under `artifacts/YYYYmmdd-HHMMSS/`. | QA lead reviews sandbox artifacts per [`docs/sandbox-workflow.md`](sandbox-workflow.md) exit criteria during release sign-off. |
+A release candidate should not be promoted solely because public CI is green. Reviewers should also confirm:
 
-The workflows above surface defects early, but their results are not yet wired into automated release gates. Treat failures and missing runs as blocking items during release reviews until that integration ships.
+- the latest public `CI`, `Security Regression` and `Sandbox Regression` workflows passed;
+- at least one representative hardware-smoke run passed on the deployment CPU family;
+- AVX-512 deployments have a successful AVX-512 HIL run rather than relying on CPUID mocks;
+- thermal-soak results show no oscillatory width-selection behavior under sustained load;
+- the active trampoline self-validator reports RX-only mappings on the deployment kernel;
+- metrics/health endpoints are bound and authenticated according to the deployment threat model.
 
-## Manual Runbooks
+## Manual runbooks
 
-The following runbooks plug the remaining operational gaps and guide the manual checks noted above:
+- [`docs/runbooks/sensor-failure.md`](runbooks/sensor-failure.md) — telemetry dropout/degraded-mode remediation.
+- [`docs/runbooks/policy-divergence.md`](runbooks/policy-divergence.md) — forecast drift and controller triage.
+- [`docs/runbooks/patcher-attestation-alert.md`](runbooks/patcher-attestation-alert.md) — active-payload attestation mismatch handling.
+- [`docs/security/threat-model.md`](security/threat-model.md) — deployment threat model and remaining operator controls.
 
-- [`docs/runbooks/sensor-failure.md`](runbooks/sensor-failure.md) covers telemetry dropouts and degraded mode remediation.
-- [`docs/runbooks/policy-divergence.md`](runbooks/policy-divergence.md) walks through controller forecast drift triage.
-- [`docs/runbooks/patcher-attestation-alert.md`](runbooks/patcher-attestation-alert.md) describes the manual attestation validation performed when `ci/security.yml` cannot complete.
-- [`docs/security/threat-model.md`](security/threat-model.md) enumerates attestation requirements validated during release reviews.
+## Remaining validation expansion
 
-## Roadmap Items
-
-- Promote `ci/security.yml` verdicts to a mandatory release gate once signing infrastructure is accessible to CI.
-- Expand `ci/sandbox.yml` to cover long-haul fuzzing and feed results into automated regression triage.
+- Add compiler/sanitizer matrix coverage (GCC + Clang, ASan/UBSan; TSan where executable-memory test behavior is supported).
+- Record HIL CPU model/microcode/kernel metadata with thermal-soak artifacts.
+- Add calibrated throughput-per-watt measurements for representative real kernels, not only the built-in demonstration payload.
+- Add a long-haul degraded-mode recovery test when hardware-counter hot re-probing is implemented.

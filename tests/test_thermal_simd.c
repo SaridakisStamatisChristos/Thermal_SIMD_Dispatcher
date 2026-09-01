@@ -137,8 +137,8 @@ static int run_patch_failure_diagnostic(void) {
         return 1;
     }
     const char *err = tsd_test_last_patch_error();
-    if (!err || strstr(err, "mprotect(trampoline write)") == NULL) {
-        fprintf(stderr, "expected patch error message, got '%s'\n", err ? err : "<null>");
+    if (!err || strstr(err, "immutable trampoline selection rejected (write fault injection)") == NULL) {
+        fprintf(stderr, "expected immutable write-fault diagnostic, got '%s'\n", err ? err : "<null>");
         return 1;
     }
     if (tsd_test_current_width() != SIMD_SSE41) {
@@ -151,8 +151,8 @@ static int run_patch_failure_diagnostic(void) {
         return 1;
     }
     err = tsd_test_last_patch_error();
-    if (!err || strstr(err, "mprotect(trampoline exec)") == NULL) {
-        fprintf(stderr, "expected exec patch error message, got '%s'\n", err ? err : "<null>");
+    if (!err || strstr(err, "immutable trampoline selection rejected (RX fault injection)") == NULL) {
+        fprintf(stderr, "expected immutable RX-fault diagnostic, got '%s'\n", err ? err : "<null>");
         return 1;
     }
     int inactive_writable = tsd_test_inactive_page_writable();

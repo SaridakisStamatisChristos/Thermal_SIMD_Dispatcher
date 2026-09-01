@@ -1,0 +1,34 @@
+name: Sandbox Regression
+
+on:
+  pull_request:
+  push:
+    branches: [ main ]
+  schedule:
+    - cron: '41 3 * * 3'
+
+jobs:
+  degraded-runtime:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake ninja-build libssl-dev
+
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Run telemetry and policy regressions
+        run: ctest --test-dir build --output-on-failure -R 'telemetry|policy|runtime_config'
+
+      - name: Exercise software telemetry fallback
+        env:
+          TSD_FAKE_PERF: '1'
+        run: ./build/thermal_simd --no-avx512 --duration-sec=1 --work-iters=100000 --metrics-port=0
