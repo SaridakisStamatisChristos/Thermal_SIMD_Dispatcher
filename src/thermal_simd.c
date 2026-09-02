@@ -6,6 +6,7 @@
 #include <stdatomic.h>
 #include <pthread.h>
 #include <sched.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -29,6 +30,12 @@
 #endif
 
 static _Atomic int g_tsd_running = 1;
+static _Atomic int g_tsd_reload_requested = 0;
+
+static void tsd_handle_sighup(int sig) {
+    (void)sig;
+    atomic_store_explicit(&g_tsd_reload_requested, 1, memory_order_relaxed);
+}
 
 static int32_t simd_shim(int32_t a, int32_t b);
 
@@ -50,6 +57,34 @@ static void record_dwell_metric(simd_width_t width, int dwell_ticks) {
     if (dwell_ms > 0) {
         tsd_metrics_exporter_observe_dwell(width, dwell_ms);
     }
+}
+
+static int temperature_upgrade_allowed(const tsd_thermal_eval_t *eval) {
+    if (!eval || !eval->temp_available) {
+        return 0;
+    }
+    if (g_tsd_config.predictive_temp_ceiling_c < 20 ||
+        g_tsd_config.predictive_temp_ceiling_c > 125 ||
+        g_tsd_config.predictive_safety_margin_c < 0) {
+        return 1;
+    }
+    int64_t limit = (int64_t)(g_tsd_config.predictive_temp_ceiling_c -
+                              g_tsd_config.predictive_safety_margin_c) * 1000;
+    return (int64_t)eval->package_temp_millic <= limit;
+}
+
+static int emergency_temperature_exceeded(const tsd_thermal_eval_t *eval) {
+    if (!eval || !eval->temp_available) {
+        return 0;
+    }
+    if (g_tsd_config.predictive_temp_ceiling_c < 20 ||
+        g_tsd_config.predictive_temp_ceiling_c > 125 ||
+        g_tsd_config.predictive_emergency_margin_c < 0) {
+        return 0;
+    }
+    int64_t limit = (int64_t)(g_tsd_config.predictive_temp_ceiling_c +
+                              g_tsd_config.predictive_emergency_margin_c) * 1000;
+    return (int64_t)eval->package_temp_millic >= limit;
 }
 
 __attribute__((naked))
@@ -159,6 +194,18 @@ void* thermal_monitor_thread(void *arg) {
         };
         while (nanosleep(&interval, &interval) == -1 && errno == EINTR) {}
         dwell_ticks++;
+
+        if (policy_state) {
+            tsd_dispatcher_policy_heartbeat(policy_state, width);
+            if (atomic_exchange_explicit(&g_tsd_reload_requested, 0, memory_order_relaxed)) {
+                if (tsd_dispatcher_policy_reload(policy_state) != 0) {
+                    tsd_log_warn(LOG_COMPONENT, "SIGHUP coefficient reload failed; retaining existing/fallback policy state");
+                } else {
+                    tsd_log_info(LOG_COMPONENT, "SIGHUP coefficient reload completed");
+                }
+            }
+        }
+
         if (cooldown > 0) {
             cooldown--;
             continue;
@@ -188,6 +235,12 @@ void* thermal_monitor_thread(void *arg) {
         tsd_thermal_eval_t eval = {0};
         int predictive_fallback = 0;
         int evaluation_rc = evaluate_thermal(ctx, &eval);
+        if (emergency_temperature_exceeded(&eval)) {
+            evaluation_rc = 1;
+            if (eval.severity_milli == 0) {
+                eval.severity_milli = 1;
+            }
+        }
         if (policy_state) {
             tsd_dispatcher_policy_record(policy_state, &eval, width);
         }
@@ -201,23 +254,29 @@ void* thermal_monitor_thread(void *arg) {
             }
             if (used_predictive > 0 && target != width) {
                 simd_width_t previous = width;
-                record_dwell_metric(previous, dwell_ticks);
-                if (!tsd_runtime_flags_allow_transitions() && target != SIMD_SSE41) {
+                if (target > previous &&
+                    (!tsd_runtime_flags_allow_transitions() || !tsd_perf_upgrades_allowed(ctx) ||
+                     !temperature_upgrade_allowed(&eval))) {
+                    target = previous;
+                } else if (!tsd_runtime_flags_allow_transitions() && target != SIMD_SSE41) {
                     target = SIMD_SSE41;
                 }
-                int patch_rc = tsd_trampoline_patch(target);
-                if (patch_rc == 0) {
-                    width = target;
-                    throttle_count = 0;
-                    stable_count = 0;
-                    dwell_ticks = 0;
-                    cooldown = (target < previous) ? g_tsd_config.cooldown_down_ticks
-                                                   : g_tsd_config.cooldown_up_ticks;
-                    continue;
-                }
-                tsd_dispatcher_policy_force_fallback(policy_state);
-                if (tsd_log_should_log(TSD_LOG_LEVEL_WARN)) {
-                    tsd_log_warn(LOG_COMPONENT, "Predictive patch failed; reverting to hysteresis policy");
+                if (target != previous) {
+                    record_dwell_metric(previous, dwell_ticks);
+                    int patch_rc = tsd_trampoline_patch(target);
+                    if (patch_rc == 0) {
+                        width = target;
+                        throttle_count = 0;
+                        stable_count = 0;
+                        dwell_ticks = 0;
+                        cooldown = (target < previous) ? g_tsd_config.cooldown_down_ticks
+                                                       : g_tsd_config.cooldown_up_ticks;
+                        continue;
+                    }
+                    tsd_dispatcher_policy_force_fallback(policy_state);
+                    if (tsd_log_should_log(TSD_LOG_LEVEL_WARN)) {
+                        tsd_log_warn(LOG_COMPONENT, "Predictive patch failed; reverting to hysteresis policy");
+                    }
                 }
             }
         }
@@ -287,6 +346,11 @@ void* thermal_monitor_thread(void *arg) {
             stable_count++;
             throttle_count = 0;
             if (stable_count >= g_tsd_config.up_count && width < max_width_cached) {
+                if (!tsd_runtime_flags_allow_transitions() || !tsd_perf_upgrades_allowed(ctx) ||
+                    !temperature_upgrade_allowed(&eval)) {
+                    stable_count = 0;
+                    continue;
+                }
                 tsd_log_info(LOG_COMPONENT,
                              "Recovered: ratio=%u.%03u (trimmed %u.%03u) MPKI=%lu.%03lu",
                              eval.ratio_milli / 1000, eval.ratio_milli % 1000,
@@ -294,9 +358,6 @@ void* thermal_monitor_thread(void *arg) {
                              eval.llc_mpki_milli / 1000, eval.llc_mpki_milli % 1000);
                 simd_width_t target = width + 1;
                 record_dwell_metric(width, dwell_ticks);
-                if (!tsd_runtime_flags_allow_transitions() && target != SIMD_SSE41) {
-                    target = SIMD_SSE41;
-                }
                 int patch_rc = tsd_trampoline_patch(target);
                 if (patch_rc == 0) {
                     width = target;
@@ -499,6 +560,16 @@ int tsd_dispatcher_main(int argc, char **argv) {
         return (sandbox_rc == 0) ? rc : 1;
     }
 
+    struct sigaction reload_action;
+    memset(&reload_action, 0, sizeof(reload_action));
+    reload_action.sa_handler = tsd_handle_sighup;
+    sigemptyset(&reload_action.sa_mask);
+    if (sigaction(SIGHUP, &reload_action, NULL) != 0) {
+        char errbuf[128];
+        tsd_log_warn(LOG_COMPONENT, "Unable to install executable SIGHUP reload handler: %s",
+                     tsd_log_strerror(errno, errbuf, sizeof(errbuf)));
+    }
+
     run_demo();
     if (metrics_started) {
         tsd_metrics_exporter_stop();
@@ -523,6 +594,7 @@ void tsd_test_reset_runtime(void) {
     tsd_cpu_clear_detect_override();
     tsd_reset_patch_state();
     atomic_store_explicit(&g_tsd_running, 1, memory_order_relaxed);
+    atomic_store_explicit(&g_tsd_reload_requested, 0, memory_order_relaxed);
     atomic_store_explicit(&g_tsd_workload_iterations, 0, memory_order_relaxed);
     tsd_runtime_config_refresh_ticks(&g_tsd_config);
     tsd_runtime_flags_record_sandbox_success();
