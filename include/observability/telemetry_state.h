@@ -28,8 +28,16 @@ typedef struct tsd_fusion_telemetry_s {
     double power_budget_w;
 } tsd_fusion_telemetry_t;
 
+typedef struct tsd_perf_telemetry_s {
+    int mode; /* 0=none, 1=hardware, 2=software/degraded */
+    int counters_healthy;
+    int pinned_cpu;
+    int monitor_cpu;
+} tsd_perf_telemetry_t;
+
 void tsd_observability_update_controller(const tsd_controller_telemetry_t *telemetry);
 void tsd_observability_update_fusion(const tsd_fusion_telemetry_t *telemetry);
+void tsd_observability_update_perf(const tsd_perf_telemetry_t *telemetry);
 
 #ifdef __cplusplus
 }
@@ -38,7 +46,6 @@ void tsd_observability_update_fusion(const tsd_fusion_telemetry_t *telemetry);
 #ifdef __cplusplus
 #include <chrono>
 #include <mutex>
-#include <optional>
 
 namespace observability {
 
@@ -64,15 +71,25 @@ struct FusionTelemetrySnapshot {
     std::chrono::system_clock::time_point updated_at{std::chrono::system_clock::time_point{}};
 };
 
+struct PerfTelemetrySnapshot {
+    int mode{0};
+    bool counters_healthy{false};
+    int pinned_cpu{-1};
+    int monitor_cpu{-1};
+    std::chrono::system_clock::time_point updated_at{std::chrono::system_clock::time_point{}};
+};
+
 class TelemetryState {
 public:
     static TelemetryState &instance();
 
     void update_controller(const tsd_controller_telemetry_t *telemetry);
     void update_fusion(const tsd_fusion_telemetry_t *telemetry);
+    void update_perf(const tsd_perf_telemetry_t *telemetry);
 
     ControllerTelemetrySnapshot controller_snapshot() const;
     FusionTelemetrySnapshot fusion_snapshot() const;
+    PerfTelemetrySnapshot perf_snapshot() const;
 
 private:
     TelemetryState() = default;
@@ -80,8 +97,8 @@ private:
     mutable std::mutex mutex_;
     ControllerTelemetrySnapshot controller_{};
     FusionTelemetrySnapshot fusion_{};
+    PerfTelemetrySnapshot perf_{};
 };
 
 }  // namespace observability
 #endif
-
