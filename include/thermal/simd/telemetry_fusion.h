@@ -7,7 +7,16 @@
 extern "C" {
 #endif
 
+/* Backward-compatible entry point: starts fusion on CPU 0. */
 int tsd_telemetry_fusion_start(void);
+
+/*
+ * Starts (or acquires a reference to) the process-wide fusion service using
+ * the supplied workload CPU for direct APERF/MPERF/cpufreq telemetry.
+ */
+int tsd_telemetry_fusion_start_for_cpu(int cpu);
+
+/* Releases one process-wide fusion reference; the last user stops the thread. */
 void tsd_telemetry_fusion_stop(void);
 
 /*
@@ -23,6 +32,13 @@ int tsd_telemetry_fusion_publish_sample(const tsd_telemetry_sample_t *sample);
  * their authoritative direct telemetry source.
  */
 int tsd_telemetry_fusion_sample(tsd_telemetry_sample_t *out);
+
+/*
+ * Safety gate used by the immutable dispatcher. Before fusion starts this is
+ * permissive for legacy startup compatibility. Once fusion is running, wider
+ * SIMD selections require a currently usable package-temperature signal.
+ */
+int tsd_telemetry_temperature_upgrade_allowed(void);
 
 #ifdef __cplusplus
 }

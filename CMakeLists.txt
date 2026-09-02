@@ -135,6 +135,12 @@ if(BUILD_TESTING)
     target_include_directories(test_thermal_simd PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME thermal_simd COMMAND test_thermal_simd)
 
+    add_executable(test_perf_resilience tests/perf/test_perf_resilience.c)
+    target_link_libraries(test_perf_resilience PRIVATE thermal_simd_core_tests pthread)
+    target_compile_definitions(test_perf_resilience PRIVATE TSD_ENABLE_TESTS)
+    target_compile_options(test_perf_resilience PRIVATE -Wall -Wextra -pthread)
+    add_test(NAME perf_resilience COMMAND test_perf_resilience)
+
     add_executable(test_policy_controller tests/policy/test_policy_controller.c)
     target_link_libraries(test_policy_controller PRIVATE thermal_simd_core_tests)
     target_compile_options(test_policy_controller PRIVATE -Wall -Wextra)

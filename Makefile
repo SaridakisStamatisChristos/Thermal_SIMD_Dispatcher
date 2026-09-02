@@ -9,7 +9,7 @@ ifeq ($(strip $(OPENSSL_LIBS)),)
 OPENSSL_LIBS := -lssl -lcrypto
 endif
 
-CPPFLAGS ?= -Isrc -Iinclude $(OPENSSL_CFLAGS)
+CPPFLAGS ?= -Isrc -Iinclude $(OPENSSL_CFLAGS) -DTSD_DEFAULT_COEFF_PATH='"$(CURDIR)/config/controller_coeffs.json"'
 CFLAGS ?= -O2 -pthread -fPIC -mno-avx -Wall -Wextra -Wshadow -Wconversion -Wcast-qual -Wformat=2 -Werror=return-type
 CXXFLAGS ?= -O2 -pthread -fPIC -mno-avx -std=c++17 -Wall -Wextra -Wshadow -Wconversion -Wcast-qual -Wformat=2
 LDFLAGS ?= -pthread

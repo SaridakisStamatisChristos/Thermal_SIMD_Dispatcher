@@ -1,3 +1,8 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: thermal-simd
+---
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
@@ -65,6 +70,22 @@ spec:
             - name: metrics
               containerPort: 9464
               protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: metrics
+              scheme: HTTP
+            initialDelaySeconds: 2
+            periodSeconds: 5
+            failureThreshold: 2
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+              scheme: HTTP
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 3
           volumeMounts:
             - name: cpu-msr
               mountPath: /dev/cpu
