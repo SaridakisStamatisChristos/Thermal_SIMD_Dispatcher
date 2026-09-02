@@ -1,6 +1,5 @@
 #include <observability/telemetry_state.h>
 
-#include <algorithm>
 #include <mutex>
 
 namespace observability {
@@ -40,6 +39,18 @@ void TelemetryState::update_fusion(const tsd_fusion_telemetry_t *telemetry) {
     fusion_.updated_at = std::chrono::system_clock::now();
 }
 
+void TelemetryState::update_perf(const tsd_perf_telemetry_t *telemetry) {
+    if (!telemetry) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    perf_.mode = telemetry->mode;
+    perf_.counters_healthy = telemetry->counters_healthy != 0;
+    perf_.pinned_cpu = telemetry->pinned_cpu;
+    perf_.monitor_cpu = telemetry->monitor_cpu;
+    perf_.updated_at = std::chrono::system_clock::now();
+}
+
 ControllerTelemetrySnapshot TelemetryState::controller_snapshot() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return controller_;
@@ -48,6 +59,11 @@ ControllerTelemetrySnapshot TelemetryState::controller_snapshot() const {
 FusionTelemetrySnapshot TelemetryState::fusion_snapshot() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return fusion_;
+}
+
+PerfTelemetrySnapshot TelemetryState::perf_snapshot() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return perf_;
 }
 
 }  // namespace observability
@@ -62,5 +78,8 @@ void tsd_observability_update_fusion(const tsd_fusion_telemetry_t *telemetry) {
     observability::TelemetryState::instance().update_fusion(telemetry);
 }
 
-}  // extern "C"
+void tsd_observability_update_perf(const tsd_perf_telemetry_t *telemetry) {
+    observability::TelemetryState::instance().update_perf(telemetry);
+}
 
+}  // extern "C"
