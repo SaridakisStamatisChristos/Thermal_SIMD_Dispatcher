@@ -58,7 +58,17 @@ ControllerTelemetrySnapshot TelemetryState::controller_snapshot() const {
 
 FusionTelemetrySnapshot TelemetryState::fusion_snapshot() const {
     std::lock_guard<std::mutex> lock(mutex_);
-    return fusion_;
+    FusionTelemetrySnapshot snapshot = fusion_;
+    /*
+     * /readyz currently consumes the fusion snapshot as its aggregate runtime
+     * health signal. Fold perf health into that view so software/degraded mode
+     * cannot be reported as ready merely because temperature/frequency remain
+     * available. The raw fusion_ state itself remains unchanged.
+     */
+    if (perf_.mode != 1 || !perf_.counters_healthy) {
+        snapshot.degraded = true;
+    }
+    return snapshot;
 }
 
 PerfTelemetrySnapshot TelemetryState::perf_snapshot() const {
