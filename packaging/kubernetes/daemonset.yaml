@@ -37,7 +37,6 @@ spec:
                 - ALL
               add:
                 - PERFMON
-                - SYS_ADMIN
             seccompProfile:
               type: RuntimeDefault
       tolerations:
@@ -63,7 +62,6 @@ spec:
                 - ALL
               add:
                 - PERFMON
-                - SYS_ADMIN
             seccompProfile:
               type: RuntimeDefault
           ports:
@@ -90,18 +88,17 @@ spec:
             periodSeconds: 10
             failureThreshold: 3
           volumeMounts:
-            - name: cpu-msr
-              mountPath: /dev/cpu
-              readOnly: true
             - name: perf-events
               mountPath: /sys/bus/event_source
               readOnly: true
       volumes:
-        - name: cpu-msr
-          hostPath:
-            path: /dev/cpu
-            type: Directory
         - name: perf-events
           hostPath:
             path: /sys/bus/event_source
             type: Directory
+
+# This default manifest intentionally does not mount /dev/cpu or grant
+# CAP_SYS_RAWIO. The runtime can use cpufreq/sysfs telemetry without MSRs.
+# Deployments that explicitly require APERF/MPERF MSR reads should add only the
+# required /dev/cpu device access and host-specific permission/CAP_SYS_RAWIO
+# policy rather than broadening every deployment with CAP_SYS_ADMIN.
