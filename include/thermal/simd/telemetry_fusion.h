@@ -33,6 +33,13 @@ int tsd_telemetry_fusion_publish_sample(const tsd_telemetry_sample_t *sample);
  */
 int tsd_telemetry_fusion_sample(tsd_telemetry_sample_t *out);
 
+/*
+ * Safety gate used by the immutable dispatcher. Before fusion starts this is
+ * permissive for legacy startup compatibility. Once fusion is running, wider
+ * SIMD selections require a currently usable package-temperature signal.
+ */
+int tsd_telemetry_temperature_upgrade_allowed(void);
+
 #ifdef __cplusplus
 }
 #endif
