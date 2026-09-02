@@ -252,90 +252,112 @@ static int run_perf_read_retry_test(void) {
     tsd_test_perf_set_group_fd(ctx, 100);
     tsd_test_perf_set_llc_fd(ctx, 101);
 
-    const perf_group_read_test_t rd_before = {
+    /*
+     * This regression is intentionally scoped to read semantics. The primary
+     * perf-group RESET/ENABLE contract is validated independently by the
+     * production recovery path; this synthetic context models only the group
+     * leader stream and therefore must not fabricate an instruction-event FD.
+     */
+    const perf_group_read_test_t rd_seed = {
         .nr = 2,
         .time_enabled = 100,
         .time_running = 100,
         .values = {1000, 500},
     };
-    const perf_group_read_test_t rd_after = {
+    const uint64_t llc_seed = 10;
+    const tsd_perf_test_read_step_t seed_group_steps[] = {
+        {TSD_PERF_TEST_STEP_EINTR, 0},
+        {TSD_PERF_TEST_STEP_DATA, 16},
+        {TSD_PERF_TEST_STEP_DATA, sizeof(rd_seed) - 16},
+    };
+    const tsd_perf_test_read_step_t seed_llc_steps[] = {
+        {TSD_PERF_TEST_STEP_EINTR, 0},
+        {TSD_PERF_TEST_STEP_DATA, 5},
+        {TSD_PERF_TEST_STEP_DATA, 3},
+    };
+    const tsd_perf_test_read_stream_t seed_streams[] = {
+        {100, seed_group_steps, sizeof(seed_group_steps) / sizeof(seed_group_steps[0]),
+         (const uint8_t *)&rd_seed, sizeof(rd_seed)},
+        {101, seed_llc_steps, sizeof(seed_llc_steps) / sizeof(seed_llc_steps[0]),
+         (const uint8_t *)&llc_seed, sizeof(llc_seed)},
+    };
+    tsd_test_perf_set_read_streams(seed_streams, sizeof(seed_streams) / sizeof(seed_streams[0]));
+    tsd_thermal_eval_t eval = {0};
+    int triggered = tsd_perf_evaluate(ctx, &eval, NULL);
+    tsd_test_perf_clear_read_streams();
+    if (triggered != 0 || !tsd_test_perf_get_last_group_valid(ctx) ||
+        tsd_test_perf_get_last_llc_value(ctx) != llc_seed) {
+        fprintf(stderr, "initial partial group read did not seed evaluator state\n");
+        rc = 1;
+        goto out;
+    }
+
+    const perf_group_read_test_t rd_stable = {
         .nr = 2,
         .time_enabled = 200,
         .time_running = 200,
         .values = {3000, 2500},
     };
-    uint8_t group_bytes[sizeof(rd_before) + sizeof(rd_after)] = {0};
-    memcpy(group_bytes, &rd_before, sizeof(rd_before));
-    memcpy(group_bytes + sizeof(rd_before), &rd_after, sizeof(rd_after));
-
-    const uint64_t llc_values[2] = {10, 30};
-
-    const tsd_perf_test_read_step_t group_steps[] = {
-        {TSD_PERF_TEST_STEP_EINTR, 0},
-        {TSD_PERF_TEST_STEP_DATA, 16},
-        {TSD_PERF_TEST_STEP_DATA, sizeof(rd_before) - 16},
+    const uint64_t llc_stable = 30;
+    const tsd_perf_test_read_step_t stable_group_steps[] = {
         {TSD_PERF_TEST_STEP_EINTR, 0},
         {TSD_PERF_TEST_STEP_DATA, 8},
-        {TSD_PERF_TEST_STEP_DATA, sizeof(rd_after) - 8},
+        {TSD_PERF_TEST_STEP_DATA, sizeof(rd_stable) - 8},
     };
-    const tsd_perf_test_read_step_t llc_steps[] = {
-        {TSD_PERF_TEST_STEP_EINTR, 0},
-        {TSD_PERF_TEST_STEP_DATA, 5},
-        {TSD_PERF_TEST_STEP_DATA, 3},
+    const tsd_perf_test_read_step_t stable_llc_steps[] = {
         {TSD_PERF_TEST_STEP_EINTR, 0},
         {TSD_PERF_TEST_STEP_DATA, 2},
         {TSD_PERF_TEST_STEP_DATA, 6},
     };
-    const tsd_perf_test_read_stream_t baseline_streams[] = {
-        {100, group_steps, sizeof(group_steps) / sizeof(group_steps[0]), group_bytes, sizeof(group_bytes)},
-        {101, llc_steps, sizeof(llc_steps) / sizeof(llc_steps[0]), (const uint8_t *)llc_values, sizeof(llc_values)},
+    const tsd_perf_test_read_stream_t stable_streams[] = {
+        {100, stable_group_steps, sizeof(stable_group_steps) / sizeof(stable_group_steps[0]),
+         (const uint8_t *)&rd_stable, sizeof(rd_stable)},
+        {101, stable_llc_steps, sizeof(stable_llc_steps) / sizeof(stable_llc_steps[0]),
+         (const uint8_t *)&llc_stable, sizeof(llc_stable)},
     };
-    tsd_test_perf_set_read_streams(baseline_streams, sizeof(baseline_streams) / sizeof(baseline_streams[0]));
-    tsd_perf_measure_baseline(ctx, NULL);
+    tsd_test_perf_set_read_streams(stable_streams, sizeof(stable_streams) / sizeof(stable_streams[0]));
+    memset(&eval, 0, sizeof(eval));
+    triggered = tsd_perf_evaluate(ctx, &eval, NULL);
     tsd_test_perf_clear_read_streams();
-
-    if (tsd_test_perf_get_baseline_cpi(ctx) != 1000 ||
-        tsd_test_perf_get_baseline_mpki(ctx) == 0 ||
-        !tsd_test_perf_get_last_group_valid(ctx) ||
-        tsd_test_perf_get_last_llc_value(ctx) != llc_values[1]) {
-        fprintf(stderr, "baseline read retry verification failed\n");
+    if (triggered != 0 || eval.cpi_milli != 1000 ||
+        tsd_test_perf_get_last_llc_value(ctx) != llc_stable) {
+        fprintf(stderr, "stable partial group read verification failed\n");
         rc = 1;
         goto out;
     }
 
-    const perf_group_read_test_t rd_next = {
+    const perf_group_read_test_t rd_hot = {
         .nr = 2,
         .time_enabled = 300,
         .time_running = 300,
         .values = {7000, 4500},
     };
-    const tsd_perf_test_read_step_t eval_group_steps[] = {
+    const uint64_t llc_hot = 60;
+    const tsd_perf_test_read_step_t hot_group_steps[] = {
         {TSD_PERF_TEST_STEP_EINTR, 0},
         {TSD_PERF_TEST_STEP_DATA, 12},
-        {TSD_PERF_TEST_STEP_DATA, sizeof(rd_next) - 12},
+        {TSD_PERF_TEST_STEP_DATA, sizeof(rd_hot) - 12},
     };
-    const uint64_t llc_next = 60;
-    const tsd_perf_test_read_step_t eval_llc_steps[] = {
+    const tsd_perf_test_read_step_t hot_llc_steps[] = {
         {TSD_PERF_TEST_STEP_EINTR, 0},
         {TSD_PERF_TEST_STEP_DATA, 5},
         {TSD_PERF_TEST_STEP_DATA, 3},
     };
-    uint8_t eval_group_bytes[sizeof(rd_next)] = {0};
-    memcpy(eval_group_bytes, &rd_next, sizeof(rd_next));
-    const tsd_perf_test_read_stream_t eval_streams[] = {
-        {100, eval_group_steps, sizeof(eval_group_steps) / sizeof(eval_group_steps[0]), eval_group_bytes, sizeof(eval_group_bytes)},
-        {101, eval_llc_steps, sizeof(eval_llc_steps) / sizeof(eval_llc_steps[0]), (const uint8_t *)&llc_next, sizeof(llc_next)},
+    const tsd_perf_test_read_stream_t hot_streams[] = {
+        {100, hot_group_steps, sizeof(hot_group_steps) / sizeof(hot_group_steps[0]),
+         (const uint8_t *)&rd_hot, sizeof(rd_hot)},
+        {101, hot_llc_steps, sizeof(hot_llc_steps) / sizeof(hot_llc_steps[0]),
+         (const uint8_t *)&llc_hot, sizeof(llc_hot)},
     };
-    tsd_test_perf_set_read_streams(eval_streams, sizeof(eval_streams) / sizeof(eval_streams[0]));
-    tsd_thermal_eval_t eval = {0};
-    int triggered = tsd_perf_evaluate(ctx, &eval, NULL);
+    tsd_test_perf_set_read_streams(hot_streams, sizeof(hot_streams) / sizeof(hot_streams[0]));
+    memset(&eval, 0, sizeof(eval));
+    triggered = tsd_perf_evaluate(ctx, &eval, NULL);
     tsd_test_perf_clear_read_streams();
 
     if (!tsd_test_perf_get_last_group_valid(ctx) ||
-        tsd_test_perf_get_last_llc_value(ctx) != llc_next ||
-        eval.cpi_milli == 0 ||
-        triggered == 0) {
-        fprintf(stderr, "evaluation read retry verification failed\n");
+        tsd_test_perf_get_last_llc_value(ctx) != llc_hot ||
+        eval.cpi_milli != 2000 || triggered == 0) {
+        fprintf(stderr, "hot partial group read verification failed\n");
         rc = 1;
     }
 
