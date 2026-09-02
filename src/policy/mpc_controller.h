@@ -34,6 +34,7 @@ public:
     bool recommend(simd_width_t current_width,
                    simd_width_t max_width,
                    simd_width_t &out_width);
+    bool reloadCoefficients();
     size_t sampleCount() const { return history_.size(); }
 
 #ifdef TSD_ENABLE_TESTS
@@ -44,7 +45,6 @@ public:
 
 private:
     bool loadCoefficients(bool log_success);
-    void maybeReloadCoefficients();
     double computeForecastRatio(size_t horizon) const;
     double computeForecastTemperature(size_t horizon, size_t &valid_count, bool &used_model) const;
     double scoreWidth(simd_width_t candidate,
