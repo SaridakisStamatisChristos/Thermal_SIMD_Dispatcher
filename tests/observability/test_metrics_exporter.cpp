@@ -235,12 +235,19 @@ int main() {
     fusion.temp_available = 1;
     fusion.package_temp_c = 63.0;
     fusion.freq_available = 1;
-    fusion.freq_ratio = 0.85;
+    fusion.freq_ratio = 850.0;
     fusion.cpi_available = 1;
     fusion.thermal_cpi = 1.10;
     fusion.power_available = 1;
     fusion.power_budget_w = 75.0;
     tsd_observability_update_fusion(&fusion);
+
+    tsd_perf_telemetry_t perf{};
+    perf.mode = 1;
+    perf.counters_healthy = 1;
+    perf.pinned_cpu = 0;
+    perf.monitor_cpu = 1;
+    tsd_observability_update_perf(&perf);
 
     HttpResponse unauth = https_request(port, "/metrics", "", ca_crt);
     if (unauth.status != 401) {
@@ -264,6 +271,14 @@ int main() {
         fail("expected ready response");
     }
 
+    perf.mode = 2;
+    perf.counters_healthy = 0;
+    tsd_observability_update_perf(&perf);
+    HttpResponse degraded_ready = https_request(port, "/readyz", basic_auth_header("observer", "secret"), ca_crt);
+    if (degraded_ready.status == 200) {
+        fail("software perf mode must not report ready");
+    }
+
     tsd_metrics_exporter_record_patch(SIMD_AVX2, SIMD_AVX512, 0, 5);
 
     auto status = capture.future.wait_for(std::chrono::seconds(5));
@@ -279,4 +294,3 @@ int main() {
     stop_statsd_capture(capture);
     return 0;
 }
-
