@@ -7,6 +7,7 @@
 #include <mutex>
 #include <optional>
 
+#include <observability/telemetry_state.h>
 #include <telemetry/bus.h>
 #include <telemetry/collector.h>
 #include <telemetry/fusion.h>
@@ -179,6 +180,19 @@ void fill_filtered_from_raw(tsd_telemetry_sample_t *out) {
     }
 }
 
+void update_temperature_observability_unlocked(const tsd_telemetry_sample_t &sample) {
+    tsd_temperature_channels_t channels{};
+    channels.raw_available = sample.temp_available ? 1 : 0;
+    channels.raw_package_temp_c = sample.temp_available
+                                      ? static_cast<double>(sample.package_temp_millic) / 1000.0
+                                      : 0.0;
+    channels.filtered_available = sample.filtered_temp_available ? 1 : 0;
+    channels.filtered_package_temp_c = sample.filtered_temp_available
+                                           ? static_cast<double>(sample.filtered_package_temp_millic) / 1000.0
+                                           : 0.0;
+    tsd_observability_update_temperature_channels(&channels);
+}
+
 void update_temperature_gate_unlocked(bool raw_temperature_available) {
     g_temperature_upgrade_allowed.store(raw_temperature_available, std::memory_order_release);
     if (!raw_temperature_available &&
@@ -231,6 +245,12 @@ int start_unlocked(int cpu) {
     if (g_direct_helper_ready && tsd_telemetry_helper_sample(&g_direct_helper, &initial) == 0) {
         if (initial.temp_available || initial.freq_ratio_available) (void)publish_sample_unlocked(initial);
         has_raw_temp = initial.temp_available != 0;
+        if (initial.temp_available && g_smoothed_temp_c.has_value()) {
+            initial.filtered_temp_available = 1;
+            initial.filtered_package_temp_millic =
+                static_cast<int32_t>(std::llround(*g_smoothed_temp_c * 1000.0));
+        }
+        update_temperature_observability_unlocked(initial);
     }
     update_temperature_gate_unlocked(has_raw_temp);
     return 0;
@@ -267,6 +287,8 @@ extern "C" void tsd_telemetry_fusion_stop(void) {
     reset_signal_state_unlocked();
     g_fusion_running.store(false, std::memory_order_release);
     g_temperature_upgrade_allowed.store(true, std::memory_order_release);
+    tsd_temperature_channels_t channels{};
+    tsd_observability_update_temperature_channels(&channels);
 }
 
 extern "C" int tsd_telemetry_fusion_publish_sample(const tsd_telemetry_sample_t *sample) {
@@ -277,6 +299,12 @@ extern "C" int tsd_telemetry_fusion_publish_sample(const tsd_telemetry_sample_t 
     const auto now = std::chrono::steady_clock::now();
     tsd_telemetry_sample_t safety{};
     copy_raw_cache_unlocked(&safety, now);
+    if (g_smoothed_temp_c.has_value()) {
+        safety.filtered_temp_available = 1;
+        safety.filtered_package_temp_millic =
+            static_cast<int32_t>(std::llround(*g_smoothed_temp_c * 1000.0));
+    }
+    update_temperature_observability_unlocked(safety);
     update_temperature_gate_unlocked(safety.temp_available != 0);
     return published ? 0 : -1;
 }
@@ -300,6 +328,7 @@ extern "C" int tsd_telemetry_fusion_sample(tsd_telemetry_sample_t *out) {
     copy_raw_cache_unlocked(out, now);
     fill_filtered_from_raw(out);
 
+    update_temperature_observability_unlocked(*out);
     update_temperature_gate_unlocked(out->temp_available != 0);
     bool raw_usable = out->temp_available || out->freq_ratio_available;
     return (raw_usable || filtered_usable) ? 0 : -1;

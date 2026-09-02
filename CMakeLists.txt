@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.15)
-project(thermal_simd_dispatcher VERSION 0.3.0 LANGUAGES C CXX)
+project(thermal_simd_dispatcher VERSION 0.3.1 LANGUAGES C CXX)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -46,12 +46,20 @@ configure_file(
     @ONLY
 )
 
+# The lifecycle and trampoline implementation files are compiled under private
+# names. Small public wrappers then enforce handle lifetime and live safety
+# authorization without duplicating the monitor or executable-memory engines.
+set_source_files_properties(src/thermal_simd.c PROPERTIES COMPILE_DEFINITIONS TSD_RUNTIME_INTERNAL_IMPL)
+set_source_files_properties(src/patcher/trampoline.cpp PROPERTIES COMPILE_DEFINITIONS TSD_TRAMPOLINE_INTERNAL_IMPL)
+
 # Sources shared with the white-box test archive. The production core adds the
-# runtime/orchestration source below; tests compile that source separately with
-# TSD_ENABLE_TESTS so test-only hooks never leak into the installed library.
+# runtime/orchestration implementation and public handle wrapper below; tests
+# compile the implementation separately with TSD_ENABLE_TESTS so test-only
+# hooks never leak into the installed library.
 set(THERMAL_SIMD_CORE_SOURCES
     src/config/runtime_flags.c
     src/dispatch/adaptive_dispatch.c
+    src/runtime_guard.c
     src/logging.c
     src/config_parser.c
     src/third_party/jsmn.c
@@ -73,6 +81,7 @@ set(THERMAL_SIMD_CORE_SOURCES
     src/thermal_config.c
     src/thermal_cpu.c
     src/patcher/trampoline.cpp
+    src/patcher/trampoline_guard.c
     src/thermal_perf.c
     src/thermal_signals.c
     src/policy/policy_config.c
@@ -81,7 +90,7 @@ set(THERMAL_SIMD_CORE_SOURCES
     src/policy/mpc_controller.cpp
 )
 
-add_library(thermal_simd_core STATIC ${THERMAL_SIMD_CORE_SOURCES} src/thermal_simd.c)
+add_library(thermal_simd_core STATIC ${THERMAL_SIMD_CORE_SOURCES} src/runtime_api.c src/thermal_simd.c)
 set_target_properties(thermal_simd_core PROPERTIES EXPORT_NAME simd)
 target_include_directories(thermal_simd_core
     PUBLIC

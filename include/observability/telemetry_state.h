@@ -28,6 +28,13 @@ typedef struct tsd_fusion_telemetry_s {
     double power_budget_w;
 } tsd_fusion_telemetry_t;
 
+typedef struct tsd_temperature_channels_s {
+    int raw_available;
+    double raw_package_temp_c;
+    int filtered_available;
+    double filtered_package_temp_c;
+} tsd_temperature_channels_t;
+
 typedef struct tsd_perf_telemetry_s {
     int mode; /* 0=none, 1=hardware, 2=software/degraded */
     int counters_healthy;
@@ -37,7 +44,13 @@ typedef struct tsd_perf_telemetry_s {
 
 void tsd_observability_update_controller(const tsd_controller_telemetry_t *telemetry);
 void tsd_observability_update_fusion(const tsd_fusion_telemetry_t *telemetry);
+void tsd_observability_update_temperature_channels(const tsd_temperature_channels_t *telemetry);
 void tsd_observability_update_perf(const tsd_perf_telemetry_t *telemetry);
+
+/* Small C queries used by the public runtime/trampoline safety guard. */
+int tsd_observability_runtime_guard_active(void);
+int tsd_observability_perf_mode(void);
+int tsd_observability_perf_hardware_fresh(void);
 
 #ifdef __cplusplus
 }
@@ -62,7 +75,11 @@ struct FusionTelemetrySnapshot {
     bool running{false};
     bool degraded{false};
     bool temp_available{false};
-    double package_temp_c{0.0};
+    double package_temp_c{0.0}; /* legacy alias for filtered_package_temp_c */
+    bool raw_temp_available{false};
+    double raw_package_temp_c{0.0};
+    bool filtered_temp_available{false};
+    double filtered_package_temp_c{0.0};
     bool freq_available{false};
     double freq_ratio{0.0};
     bool cpi_available{false};
@@ -88,11 +105,16 @@ public:
 
     void update_controller(const tsd_controller_telemetry_t *telemetry);
     void update_fusion(const tsd_fusion_telemetry_t *telemetry);
+    void update_temperature_channels(const tsd_temperature_channels_t *telemetry);
     void update_perf(const tsd_perf_telemetry_t *telemetry);
 
     ControllerTelemetrySnapshot controller_snapshot() const;
     FusionTelemetrySnapshot fusion_snapshot() const;
     PerfTelemetrySnapshot perf_snapshot() const;
+
+    bool runtime_guard_active() const;
+    int perf_mode() const;
+    bool perf_hardware_fresh(std::chrono::seconds max_age) const;
 
 private:
     TelemetryState() = default;

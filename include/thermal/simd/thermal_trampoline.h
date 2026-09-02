@@ -17,6 +17,10 @@
 
 #include <thermal/simd/simd_width.h>
 
+#ifdef TSD_TRAMPOLINE_INTERNAL_IMPL
+#define tsd_trampoline_patch tsd_trampoline_patch_impl
+#endif
+
 /**
  * Each indirect-call target is 64-byte aligned and begins with ENDBR64 so the
  * dispatcher is compatible with x86 CET Indirect Branch Tracking (IBT).
@@ -73,9 +77,11 @@ int tsd_trampoline_init(void);
 /*
  * Compatibility name retained for existing callers. This no longer rewrites
  * executable memory; it atomically selects an already-sealed implementation.
- * Production builds also reject widths that exceed host ISA support or the
- * configured runtime AVX-512 policy. White-box test builds retain controlled
- * override hooks for deterministic executable-memory regression tests.
+ * Production builds reject widths that exceed host ISA/static AVX-512 policy
+ * and, while the adaptive runtime is active, also reject wider widths that are
+ * not currently authorized by fresh perf and raw-temperature safety state.
+ * White-box test builds retain controlled override hooks for deterministic
+ * executable-memory regression tests.
  */
 int tsd_trampoline_patch(simd_width_t new_width);
 int init_double_buffer_trampoline(void);
