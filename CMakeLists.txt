@@ -13,6 +13,32 @@ include(CMakePackageConfigHelpers)
 find_package(OpenSSL REQUIRED)
 find_package(Threads REQUIRED)
 
+# The public library is a static archive containing both C and C++ objects.
+# A consumer is allowed to be a pure-C CMake project, so its final link may be
+# driven by the C compiler and would not otherwise receive the C++ ABI/runtime.
+# Export the runtime selected by this build explicitly instead of relying on
+# the consumer to know our implementation language. Linux is the only
+# supported platform and libm is likewise part of the archive's public static
+# link closure (for llround and related math helpers).
+set(TSD_CXX_RUNTIME_LIBRARIES "")
+foreach(_tsd_lib IN LISTS CMAKE_CXX_IMPLICIT_LINK_LIBRARIES)
+    if(_tsd_lib MATCHES "^(stdc\\+\\+|c\\+\\+|c\\+\\+abi|supc\\+\\+)$")
+        list(APPEND TSD_CXX_RUNTIME_LIBRARIES "${_tsd_lib}")
+    endif()
+endforeach()
+list(REMOVE_DUPLICATES TSD_CXX_RUNTIME_LIBRARIES)
+if(NOT TSD_CXX_RUNTIME_LIBRARIES)
+    if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+        set(TSD_CXX_RUNTIME_LIBRARIES stdc++)
+    elseif(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        # Ubuntu/Clang uses libstdc++ unless configured otherwise; the implicit
+        # library scan above wins automatically for libc++ toolchains.
+        set(TSD_CXX_RUNTIME_LIBRARIES stdc++)
+    else()
+        message(FATAL_ERROR "Unable to determine C++ runtime for static thermal_simd_core consumers")
+    endif()
+endif()
+
 file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/include/thermal/simd)
 configure_file(
     ${CMAKE_CURRENT_SOURCE_DIR}/include/thermal/simd/version.h.in
@@ -67,7 +93,14 @@ target_compile_definitions(thermal_simd_core
         TSD_DEFAULT_COEFF_PATH="${CMAKE_CURRENT_SOURCE_DIR}/config/controller_coeffs.json"
         TSD_INSTALLED_COEFF_PATH="${CMAKE_INSTALL_FULL_SYSCONFDIR}/thermal-simd/controller_coeffs.json"
 )
-target_link_libraries(thermal_simd_core PRIVATE Threads::Threads OpenSSL::SSL OpenSSL::Crypto)
+target_link_libraries(thermal_simd_core
+    PUBLIC
+        Threads::Threads
+        OpenSSL::SSL
+        OpenSSL::Crypto
+        m
+        ${TSD_CXX_RUNTIME_LIBRARIES}
+)
 
 add_executable(thermal_simd src/main.cpp src/thermal_simd.c)
 target_compile_options(thermal_simd PRIVATE -O2 -pthread -fPIC -mno-avx ${THERMAL_SIMD_DISPATCHER_CPU_FLAGS})
