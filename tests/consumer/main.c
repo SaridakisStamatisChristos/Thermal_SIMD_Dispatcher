@@ -2,6 +2,7 @@
 #include <stdint.h>
 
 #include <thermal/simd/adaptive_dispatch.h>
+#include <thermal/simd/runtime.h>
 
 static void sse41_kernel(void *context, size_t work_items) {
     uint64_t *counter = (uint64_t *)context;
@@ -26,6 +27,11 @@ int main(void) {
     tsd_kernel_dispatch_destroy(dispatch);
     if (rc != 0 || counter != 17 || used != SIMD_SSE41) {
         return 2;
+    }
+
+    /* Force the installed archive to resolve the exported lifecycle object too. */
+    if (tsd_runtime_perf_mode(NULL) != TSD_PERF_MODE_NONE) {
+        return 3;
     }
     return 0;
 }
