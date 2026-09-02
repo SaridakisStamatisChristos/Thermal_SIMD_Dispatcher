@@ -26,6 +26,13 @@ int tsd_dispatcher_policy_recommend(tsd_dispatcher_policy_state *state,
                                     int *fallback_active);
 void tsd_dispatcher_policy_force_fallback(tsd_dispatcher_policy_state *state);
 
+/* Refreshes controller liveness without implying a width decision. */
+void tsd_dispatcher_policy_heartbeat(tsd_dispatcher_policy_state *state,
+                                     simd_width_t current_width);
+
+/* Explicit coefficient reload API; embedders retain ownership of process signals. */
+int tsd_dispatcher_policy_reload(tsd_dispatcher_policy_state *state);
+
 #ifdef __cplusplus
 }
 #endif
