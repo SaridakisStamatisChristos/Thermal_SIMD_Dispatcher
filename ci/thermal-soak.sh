@@ -10,12 +10,15 @@ SAMPLE_INTERVAL_SECONDS=${SAMPLE_INTERVAL_SECONDS:-1}
 METRICS_PORT=${METRICS_PORT:-19464}
 WORK_ITERS=${WORK_ITERS:-1000000}
 
-if ! [[ "${SOAK_MINUTES}" =~ ^[0-9]+$ ]] || [ "${SOAK_MINUTES}" -lt 1 ]; then
-    echo "SOAK_MINUTES must be a positive integer" >&2
+if ! [[ "${SOAK_MINUTES}" =~ ^[0-9]+$ ]] || [ "${SOAK_MINUTES}" -lt 1 ] || [ "${SOAK_MINUTES}" -gt 300 ]; then
+    echo "SOAK_MINUTES must be an integer in [1, 300]" >&2
     exit 2
 fi
 
 SOAK_SECONDS=$((SOAK_MINUTES * 60))
+# Give endpoint startup and final sampling a small margin while keeping the
+# runtime's --duration-sec contract itself wall-clock accurate.
+RUNTIME_SECONDS=$((SOAK_SECONDS + 30))
 rm -rf "${ARTIFACT_DIR}"
 mkdir -p "${ARTIFACT_DIR}"
 
@@ -31,8 +34,9 @@ METRICS_FINAL="${ARTIFACT_DIR}/metrics-final.prom"
     echo "git_sha=$(git -C "${REPO_ROOT}" rev-parse HEAD)"
     echo "kernel=$(uname -srmo)"
     echo "soak_minutes=${SOAK_MINUTES}"
+    echo "runtime_seconds=${RUNTIME_SECONDS}"
     echo "sample_interval_seconds=${SAMPLE_INTERVAL_SECONDS}"
-    echo "work_iters=${WORK_ITERS}"
+    echo "work_batch_iterations=${WORK_ITERS}"
     echo "allowed_affinity=$(taskset -pc $$ 2>/dev/null || true)"
     echo "perf_event_paranoid=$(cat /proc/sys/kernel/perf_event_paranoid 2>/dev/null || echo unavailable)"
     echo "nmi_watchdog=$(cat /proc/sys/kernel/nmi_watchdog 2>/dev/null || echo unavailable)"
@@ -96,12 +100,8 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-# The current demo workload is intentionally launched with the maximum accepted
-# internal batch count; the sampler owns the wall-clock characterization window
-# and terminates the process after collecting exactly SOAK_SECONDS of evidence.
-# This keeps HIL timing independent of host throughput.
 "${BUILD_DIR}/thermal_simd" \
-    --duration-sec=86400 \
+    --duration-sec="${RUNTIME_SECONDS}" \
     --work-iters="${WORK_ITERS}" \
     --metrics-bind=127.0.0.1 \
     --metrics-port="${METRICS_PORT}" \
