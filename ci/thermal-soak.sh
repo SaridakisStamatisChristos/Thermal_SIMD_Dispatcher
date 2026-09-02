@@ -20,9 +20,6 @@ if ! lscpu | grep -Eq '(^|[[:space:]])avx512f([[:space:]]|$)'; then
 fi
 
 SOAK_SECONDS=$((SOAK_MINUTES * 60))
-# Give endpoint startup and final sampling a small margin while keeping the
-# runtime's --duration-sec contract itself wall-clock accurate.
-RUNTIME_SECONDS=$((SOAK_SECONDS + 30))
 rm -rf "${ARTIFACT_DIR}"
 mkdir -p "${ARTIFACT_DIR}"
 
@@ -38,7 +35,7 @@ METRICS_FINAL="${ARTIFACT_DIR}/metrics-final.prom"
     echo "git_sha=$(git -C "${REPO_ROOT}" rev-parse HEAD)"
     echo "kernel=$(uname -srmo)"
     echo "soak_minutes=${SOAK_MINUTES}"
-    echo "runtime_seconds=${RUNTIME_SECONDS}"
+    echo "runtime_mode=persistent"
     echo "sample_interval_seconds=${SAMPLE_INTERVAL_SECONDS}"
     echo "work_batch_iterations=${WORK_ITERS}"
     echo "avx512_requested=true"
@@ -107,7 +104,7 @@ trap cleanup EXIT INT TERM
 
 "${BUILD_DIR}/thermal_simd" \
     --allow-avx512 \
-    --duration-sec="${RUNTIME_SECONDS}" \
+    --run-forever \
     --work-iters="${WORK_ITERS}" \
     --metrics-bind=127.0.0.1 \
     --metrics-port="${METRICS_PORT}" \
@@ -145,13 +142,24 @@ python3 "${SCRIPT_DIR}/hil_sampler.py" \
 
 curl --max-time 2 --silent --fail "${METRICS_URL}" > "${METRICS_FINAL}" || true
 
-if kill -0 "${RUNTIME_PID}" 2>/dev/null; then
-    kill -TERM "${RUNTIME_PID}" 2>/dev/null || true
-    wait "${RUNTIME_PID}" 2>/dev/null || true
-else
+if ! kill -0 "${RUNTIME_PID}" 2>/dev/null; then
     echo "thermal-simd exited before the characterization window completed" >&2
+    tail -100 "${RUNTIME_LOG}" >&2 || true
+    exit 1
 fi
+
+kill -TERM "${RUNTIME_PID}"
+set +e
+wait "${RUNTIME_PID}"
+RUNTIME_STATUS=$?
+set -e
 RUNTIME_PID=""
+if [ "${RUNTIME_STATUS}" -ne 0 ]; then
+    echo "thermal-simd did not shut down cleanly after SIGTERM (status=${RUNTIME_STATUS})" >&2
+    tail -100 "${RUNTIME_LOG}" >&2 || true
+    exit 1
+fi
+echo "graceful_sigterm_shutdown=true" >> "${METADATA}"
 
 python3 - "${SUMMARY}" <<'PY'
 import json
@@ -197,6 +205,7 @@ print(f"- Ready: **{100*s['ready_fraction']:.2f}%**")
 print(f"- Hardware perf healthy: **{100*s['hardware_perf_fraction']:.2f}%**")
 print(f"- Temperature coverage: **{100*s['temperature_sample_fraction']:.2f}%**")
 print(f"- Width samples: `{s['width_samples']}`")
+print("- Graceful SIGTERM shutdown: **validated**")
 if s.get('max_temperature_c') is not None:
     print(f"- Max package temperature: **{s['max_temperature_c']:.2f} °C**")
 if s.get('mean_temperature_c') is not None:
