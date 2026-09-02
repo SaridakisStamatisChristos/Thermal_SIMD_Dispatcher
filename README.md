@@ -1,14 +1,14 @@
 # Thermal-Aware SIMD Dispatcher
 
-Linux x86-64 research/runtime system that selects between SSE4.1, AVX2 and AVX-512 implementations using performance-counter and thermal telemetry.
+Linux x86-64 systems runtime and embeddable library that selects between SSE4.1, AVX2 and AVX-512 implementations using performance-counter and thermal telemetry.
 
-The dispatcher uses an **immutable W^X code table**: each implementation is written once while the backing page is `RW` and non-executable, the page is sealed `RX`, and runtime transitions only atomically select an already-sealed slot. No executable page is rewritten during normal operation. The built-in demonstration payloads execute genuine 128-bit, 256-bit and 512-bit vector operations while preserving the legacy scalar shim ABI.
+The dispatcher uses an **immutable W^X code table**: each built-in implementation is written once while the backing page is `RW` and non-executable, the page is sealed `RX`, and runtime transitions only atomically select an already-sealed slot. No executable page is rewritten during normal operation. The built-in demonstration payloads execute genuine 128-bit, 256-bit and 512-bit vector operations while preserving the legacy scalar shim ABI.
 
-Thermal adaptation combines time-scaled CPI from `perf_event_open`, LLC-miss information, temperature/frequency telemetry, hysteresis, cooldown and minimum dwell. A model-assisted predictive policy can score candidate widths from recent telemetry and an ARX temperature forecast; if the predictive path is unavailable, the runtime falls back to the conservative hysteresis controller.
+Thermal adaptation combines time-scaled CPI from `perf_event_open`, LLC-miss information, raw safety telemetry, filtered forecasting telemetry, hysteresis, cooldown and minimum dwell. A model-assisted predictive policy can score candidate widths from recent telemetry and an ARX temperature forecast; if the predictive path is unavailable, the runtime falls back to the conservative hysteresis controller.
 
 Runtime failures are intentionally asymmetric and fail closed. Loss of the primary perf cycle/instruction group enters software/degraded mode and drives the dispatcher to SSE4.1 by default while hardware counters are periodically re-probed. Once telemetry fusion is active, loss of package-temperature telemetry also blocks wider SIMD authorization and immediately selects SSE4.1 if a wider slot is active. Downgrades remain available throughout degraded operation.
 
-This repository is intentionally explicit about validation boundaries: hosted CI validates software behavior, memory-permission invariants, degraded-mode logic, compiler/sanitizer portability, package construction and deterministic fault injection; AVX-512/MSR/perf/thermal behavior requires a compatible self-hosted HIL machine.
+This repository is intentionally explicit about validation boundaries: hosted CI validates software behavior, memory-permission invariants, degraded-mode logic, compiler/sanitizer portability, package construction, external consumer integration and deterministic fault injection; AVX-512/MSR/perf/thermal behavior requires a compatible self-hosted HIL machine.
 
 ## Platform and prerequisites
 
@@ -19,7 +19,9 @@ This repository is intentionally explicit about validation boundaries: hosted CI
 - OpenSSL development/runtime libraries for metrics TLS and trampoline attestation hashing.
 - Optional metrics TLS materials when exposing `/metrics` off-host.
 
-The runtime respects the process CPU-affinity mask rather than assuming CPU 0 is available, which keeps it compatible with cpusets and container CPU restrictions. Hardware-counter loss is recoverable: software mode uses bounded re-probe backoff and rebuilds a fresh hardware baseline before resuming hardware evaluation.
+The runtime respects the caller's CPU-affinity mask rather than assuming CPU 0 is available, which keeps it compatible with cpusets and container CPU restrictions. A perf context records the original workload TID, pins only that owner thread to a permitted workload CPU, binds initial and recovered perf groups to that same TID, and restores the original owner affinity during normal cleanup. A distinct allowed CPU is selected for the monitor thread when the cpuset permits it.
+
+Hardware-counter loss is recoverable: software mode uses bounded re-probe backoff and rebuilds a fresh hardware baseline before resuming hardware evaluation. Recovery is committed only after RESET/ENABLE succeeds and the group demonstrates real enabled time, running time, cycle progress and instruction progress.
 
 ## Build
 
@@ -47,7 +49,47 @@ cmake --build build-install -j
 sudo cmake --install build-install
 ```
 
-The CMake install includes the `thermal_simd` executable, public headers, the static core library, CMake export metadata and `controller_coeffs.json` under the configured system configuration directory.
+Version 0.2 installs the `thermal_simd` executable, public headers, the static core library, a versioned CMake package and `controller_coeffs.json` under the configured system configuration directory. External CMake projects can consume it with:
+
+```cmake
+find_package(thermal_simd_dispatcher 0.2 CONFIG REQUIRED)
+target_link_libraries(my_target PRIVATE thermal::simd)
+```
+
+The Quality Gates workflow builds and runs a separate project from `tests/consumer/` against the staged installation, so installed-package usability is validated independently of the source tree.
+
+## Application-facing adaptive dispatch
+
+The built-in trampoline payload remains useful for validating immutable executable-memory transitions, but applications no longer need to use that scalar demonstration ABI. `adaptive_dispatch.h` exposes ordinary registered application variants:
+
+```c
+#include <thermal/simd/adaptive_dispatch.h>
+
+static void process_sse41(void *ctx, size_t n) { /* real SSE4.1 kernel */ }
+static void process_avx2(void *ctx, size_t n)   { /* real AVX2 kernel */ }
+static void process_avx512(void *ctx, size_t n) { /* real AVX-512 kernel */ }
+
+void run(void *ctx, size_t n) {
+    tsd_kernel_variants_t variants = {
+        .sse41 = process_sse41,
+        .avx2 = process_avx2,
+        .avx512 = process_avx512,
+        .context = ctx,
+    };
+    tsd_kernel_dispatch_t *dispatch = NULL;
+    if (tsd_kernel_dispatch_create(&variants, &dispatch) != 0) {
+        return;
+    }
+
+    simd_width_t used = SIMD_SSE41;
+    (void)tsd_kernel_dispatch_execute(dispatch, n, &used);
+    tsd_kernel_dispatch_destroy(dispatch);
+}
+```
+
+The variant table is copied when the dispatch object is created and is immutable for that object's lifetime, so concurrent execution does not race registration. Each execution samples the runtime's current width atomically, clamps it to host ISA support, and chooses the widest registered implementation at or below that width. SSE4.1 is mandatory as the conservative fallback. Successfully dispatched work is accounted into the software-perf work counter so degraded-mode adaptation can observe application work rather than only the demo shim.
+
+The adaptive-dispatch API consumes the runtime's current width; it does not implicitly start the standalone monitoring lifecycle. Embedders remain responsible for the runtime/control lifecycle appropriate to their application.
 
 ## Run
 
@@ -55,6 +97,8 @@ The CMake install includes the `thermal_simd` executable, public headers, the st
 ./build/thermal_simd --help
 ./build/thermal_simd --no-avx512 --interval=100 --down-ratio=1.3 --duration-sec=5
 ```
+
+`--duration-sec` is wall-clock duration. The workload executes batches of `--work-iters` until that monotonic-time deadline is reached, then logs actual elapsed milliseconds, completed iterations and measured iterations/second. The final batch may overshoot the requested deadline slightly by at most one batch.
 
 If hardware perf access is intentionally unavailable, the software telemetry path can be exercised with:
 
@@ -81,7 +125,7 @@ The built-in demonstration modes are:
 - AVX2: 256-bit YMM broadcast + integer multiply, followed by `vzeroupper`.
 - AVX-512: 512-bit ZMM broadcast + integer multiply, followed by `vzeroupper`.
 
-The scalar input/output shim is retained for backward compatibility; the wide variants broadcast the scalar operands across all lanes so the returned low lane has identical semantics. These payloads are deliberately small width-exercising demonstrations, not claims of application-level AVX2/AVX-512 throughput scaling.
+The scalar input/output shim is retained for backward compatibility; the wide variants broadcast the scalar operands across all lanes so the returned low lane has identical semantics. These payloads are deliberately small width-exercising demonstrations, not claims of application-level AVX2/AVX-512 throughput scaling. Real application kernels should use the adaptive-dispatch API above.
 
 ## Runtime flags
 
@@ -94,8 +138,8 @@ The scalar input/output shim is retained for backward compatibility; the wide va
 - `--cooldown-up=MS` cooldown after upgrade (default 2000).
 - `--min-dwell=MS` minimum time at a width (default 200).
 - `--no-avx512` disable AVX-512 selection.
-- `--duration-sec=S` demonstration runtime (default 10).
-- `--work-iters=N` inner work iterations per tick (default 10,000,000).
+- `--duration-sec=S` wall-clock demonstration runtime (default 10).
+- `--work-iters=N` inner workload batch size (default 10,000,000).
 - `--degraded-timeout-sec=S` fail closed after prolonged software telemetry (default 120).
 - `--log-level=LEVEL` one of `error`, `warn`, `info`, `debug`.
 - `--health-check` validate perf counters, telemetry and immutable trampoline integrity then exit.
@@ -108,21 +152,28 @@ The scalar input/output shim is retained for backward compatibility; the wide va
 - `--predictive-alpha=A` CPI EWMA alpha (default 0.25).
 - `--coeff-path=PATH` ARX coefficient bundle override.
 
-The build-tree default coefficient bundle is `config/controller_coeffs.json`. Installed/package deployments may use the installed system configuration path, and `TSD_PREDICTIVE_COEFF_PATH` takes precedence when set.
+The build-tree default coefficient bundle is `config/controller_coeffs.json`. Installed/package deployments may use the installed system configuration path, and `TSD_PREDICTIVE_COEFF_PATH` takes precedence when set. The shipped coefficients are a conservative default/demo model rather than a claim of universal CPU calibration; see [`docs/model-provenance.md`](docs/model-provenance.md).
 
-The current policy is a **model-assisted discrete candidate optimizer**, not a general continuous MPC solver. It forecasts thermal state, scores the available SIMD widths against configured SLOs and transition penalties, and falls back to hysteresis when predictive inputs are stale or invalid. Missing temperature is treated as unavailable data rather than as a fictitious `0 C` measurement. Predictive downgrades remain permitted without temperature; predictive upgrades require a valid temperature sample, and the central runtime transition gate independently enforces the same no-blind-upgrade rule for the hysteresis path.
+The current policy is a **model-assisted discrete candidate optimizer**, not a general continuous MPC solver. It forecasts thermal state, scores the available SIMD widths against configured SLOs and transition penalties, and falls back to hysteresis when predictive inputs are stale or invalid. Missing temperature is treated as unavailable data rather than as a fictitious `0 C` measurement. Predictive downgrades remain permitted without temperature; predictive upgrades require a valid raw temperature sample, and the central runtime transition gate independently enforces the same no-blind-upgrade rule for the hysteresis path.
 
 ### Telemetry fusion
 
 The production thermal path is documented in [`docs/telemetry-fusion.md`](docs/telemetry-fusion.md).
 
-The direct Linux helper provides temperature and APERF/MPERF or cpufreq ratio data with exponential recovery/backoff. The C++ fusion layer provides freshness/quality arbitration and a collector API. The production bridge is process-wide and reference-counted, starts on the selected workload CPU, seeds the fusion bus from the real direct helper, and returns failure for empty fused snapshots so the fusion layer cannot silently replace hardware telemetry with zeros.
+The direct Linux helper provides package-aware temperature and APERF/MPERF or cpufreq ratio data with exponential recovery/backoff. Temperature discovery scores CPU-package-relevant thermal zones and `hwmon` sources such as `coretemp`, `k10temp` and `zenpower` instead of blindly taking the first CPU-like thermal zone.
 
-Frequency ratio is normalized in milli-units (`1000 == 1.0x`) across the production bridge and collector API.
+The C++ fusion layer provides freshness/quality arbitration and a collector API. The production bridge is process-wide and reference-counted, starts on the selected workload CPU, seeds the fusion bus from the real direct helper, and returns failure for empty fused snapshots so the fusion layer cannot silently replace hardware telemetry with zeros. A second process-local consumer requesting another CPU does not silently receive the first CPU's frequency telemetry; it falls back to its own CPU-local direct helper.
+
+Telemetry has two explicit channels:
+
+- **raw safety telemetry** drives emergency decisions, reactive thermal severity and wider-SIMD authorization;
+- **EWMA-filtered telemetry** feeds forecasting/control and observability.
+
+A sudden thermal spike therefore cannot be hidden by EWMA lag. `--telemetry-ewma=0` means bypass filtering, not “freeze at the first value.” Frequency ratio is normalized in milli-units (`1000 == 1.0x`) across the production bridge and collector API.
 
 ### Perf-event recovery
 
-The cycle/instruction perf group is treated as a live dependency rather than a startup-only assumption. A failed group read or invalid group layout:
+The cycle/instruction perf group is treated as a live dependency rather than a startup-only assumption. A failed group read, invalid group layout or sustained lack of counter runtime:
 
 1. closes the invalid perf descriptors;
 2. enters software/degraded mode;
@@ -130,7 +181,7 @@ The cycle/instruction perf group is treated as a live dependency rather than a s
 4. publishes unhealthy perf state to readiness;
 5. schedules a hardware re-probe.
 
-Re-probe backoff starts at five seconds and is capped at sixty seconds. A successful reopen enables the counters and establishes a fresh baseline before normal hardware evaluation resumes. Initial hardware startup is not counted as a recovery metric; `perf_recoveries` represents an actual software-to-hardware transition.
+The primary group is bound to the recorded workload TID both at startup and during hot recovery. Re-probe backoff starts at five seconds and is capped at sixty seconds. A successful reopen must RESET/ENABLE the complete group and demonstrate real enabled/running/cycle/instruction progress while establishing a fresh baseline before hardware mode is committed. Initial hardware startup is not counted as a recovery metric; `perf_recoveries` represents an actual software-to-hardware transition. The optional LLC event has an independent recovery schedule.
 
 ### Metrics and observability
 
@@ -143,7 +194,9 @@ Re-probe backoff starts at five seconds and is capped at sixty seconds. A succes
 - `--statsd-host=HOST` enable StatsD output.
 - `--statsd-port=PORT` StatsD UDP port (default 8125).
 
-Tracked signals include perf fallback/degraded events, telemetry sensor drop/recovery, width transitions/failures, health-check failures, predictive forecast errors and metrics flush timing. `/readyz` fails when perf is in software/degraded mode even if temperature/frequency fusion remains alive; `/healthz` remains the liveness-oriented endpoint.
+The HTTP exporter uses bounded worker concurrency, an explicit queue limit, request-size bounds and per-client send/receive deadlines so a slow or incomplete client cannot monopolize liveness/readiness service. Basic-auth comparison is performed without an early-exit secret comparison.
+
+`/healthz` is deliberately a **liveness** endpoint: if the exporter can serve it, the process is live even when recoverable dependencies are degraded. `/readyz` is strict operational readiness and requires fresh controller/fusion state plus healthy hardware perf counters. The JSON response includes explicit controller, fusion and perf state rather than folding perf degradation into the fusion model.
 
 ## Health check
 
@@ -162,14 +215,26 @@ GitHub Actions include:
 - `.github/workflows/ci.yml` — normal release configure/build/full CTest pipeline.
 - `.github/workflows/security.yml` — immutable executable-memory, attestation and health-check regressions.
 - `.github/workflows/sandbox.yml` — telemetry/policy tests plus a software-perf degraded-mode runtime exercise.
-- `.github/workflows/quality.yml` — GCC/Clang debug matrix, Clang ASan+UBSan, Makefile parity, staged CMake install and container build.
+- `.github/workflows/quality.yml` — GCC/Clang debug matrix, Clang ASan+UBSan, focused Clang ThreadSanitizer concurrency coverage, Makefile parity, staged install, external `find_package` consumer and container build.
 - `.github/workflows/hil.yml` — manually triggered hardware validation for self-hosted runners labelled `hil` and `avx512`.
 
-The standard CTest suite also contains bounded smoke registrations for patch-selection stress, signal stress and telemetry fault recovery plus a dedicated perf-resilience regression covering runtime group loss, cpuset-aware CPU selection and fusion reference counting. Longer HIL runs use:
+The standard CTest suite contains bounded smoke registrations for patch-selection stress, signal stress and telemetry fault recovery plus dedicated regressions for runtime perf loss, real counter-progress requirements, cpuset-aware selection/affinity restoration, raw-vs-filtered thermal safety, fusion reference counting, observability availability and application-facing adaptive dispatch.
+
+The HIL workflow is evidence-producing rather than a generic endurance loop. `ci/thermal-soak.sh` and `ci/hil_sampler.py` collect:
+
+- commit, kernel, CPU model, microcode, affinity, topology and governor metadata;
+- current/recommended SIMD width over time;
+- liveness/readiness and explicit perf-counter mode/health;
+- package temperature and frequency telemetry;
+- CPU sysfs frequency;
+- RAPL package power when the runner exposes powercap energy counters;
+- runtime logs and final Prometheus output.
+
+The workflow validates minimum health/perf/temperature coverage and uploads the CSV, JSONL, metadata, logs, summary and metrics as a retained Actions artifact. This repository does **not** claim that HIL evidence exists until that manual workflow has actually run on a compatible machine.
 
 ```bash
 ci/hw-smoke.sh
-ci/thermal-soak.sh
+SOAK_MINUTES=30 ci/thermal-soak.sh
 ```
 
 `ci/pipeline.yml` is retained as a GitLab-compatible HIL definition; GitHub users should use `.github/workflows/hil.yml`.
