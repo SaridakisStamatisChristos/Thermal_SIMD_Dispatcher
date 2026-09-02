@@ -1,7 +1,6 @@
 #include <config/runtime_flags.h>
 #include <healthcheck/sandbox.h>
 
-#include <sched.h>
 #include <thermal/simd/health_check.h>
 #include <thermal/simd/logging.h>
 #include <thermal/simd/metrics.h>
@@ -46,10 +45,13 @@ int main(int argc, char **argv) {
     }
 
     tsd_install_patch_signal_handlers();
-    cpu_set_t cpuset;
-    CPU_ZERO(&cpuset);
-    CPU_SET(0, &cpuset);
-    (void)sched_setaffinity(0, sizeof(cpuset), &cpuset);
 
+    /*
+     * CPU placement is owned by the perf/runtime layer, which starts from the
+     * process's existing affinity mask and selects only CPUs the caller is
+     * actually allowed to use. Do not pre-pin the process here: doing so would
+     * collapse an unrestricted affinity mask to CPU 0 before the cpuset-aware
+     * selector can choose distinct workload/monitor CPUs.
+     */
     return tsd_dispatcher_main(argc, argv);
 }
