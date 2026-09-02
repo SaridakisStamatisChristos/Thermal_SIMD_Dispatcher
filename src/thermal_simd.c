@@ -195,6 +195,9 @@ void* thermal_monitor_thread(void *arg) {
         while (nanosleep(&interval, &interval) == -1 && errno == EINTR) {}
         dwell_ticks++;
 
+        /* Fail-closed selections can originate inside telemetry evaluation. */
+        width = atomic_load_explicit(&g_tsd_current_width, memory_order_acquire);
+
         if (policy_state) {
             tsd_dispatcher_policy_heartbeat(policy_state, width);
             if (atomic_exchange_explicit(&g_tsd_reload_requested, 0, memory_order_relaxed)) {
@@ -235,6 +238,7 @@ void* thermal_monitor_thread(void *arg) {
         tsd_thermal_eval_t eval = {0};
         int predictive_fallback = 0;
         int evaluation_rc = evaluate_thermal(ctx, &eval);
+        width = atomic_load_explicit(&g_tsd_current_width, memory_order_acquire);
         if (emergency_temperature_exceeded(&eval)) {
             evaluation_rc = 1;
             if (eval.severity_milli == 0) {
