@@ -24,11 +24,17 @@ spec:
             - name: TSD_LOG_LEVEL
               value: info
           securityContext:
-            privileged: true
+            privileged: false
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
             capabilities:
+              drop:
+                - ALL
               add:
-                - CAP_PERFMON
-                - CAP_SYS_ADMIN
+                - PERFMON
+                - SYS_ADMIN
+            seccompProfile:
+              type: RuntimeDefault
       tolerations:
         - effect: NoSchedule
           key: node-role.kubernetes.io/control-plane
@@ -44,11 +50,17 @@ spec:
             - name: TSD_LOG_LEVEL
               value: info
           securityContext:
-            privileged: true
+            privileged: false
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
             capabilities:
+              drop:
+                - ALL
               add:
-                - CAP_PERFMON
-                - CAP_SYS_ADMIN
+                - PERFMON
+                - SYS_ADMIN
+            seccompProfile:
+              type: RuntimeDefault
           ports:
             - name: metrics
               containerPort: 9464
@@ -64,6 +76,8 @@ spec:
         - name: cpu-msr
           hostPath:
             path: /dev/cpu
+            type: Directory
         - name: perf-events
           hostPath:
             path: /sys/bus/event_source
+            type: Directory

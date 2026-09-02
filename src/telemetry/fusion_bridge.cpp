@@ -14,6 +14,9 @@ namespace {
 
 std::mutex g_fusion_mutex;
 std::unique_ptr<telemetry::TelemetryFusion> g_fusion;
+std::shared_ptr<telemetry::TelemetryBusManager> g_manager;
+tsd_telemetry_helper_t g_direct_helper{};
+bool g_direct_helper_ready = false;
 
 telemetry::TelemetryFusionConfig default_config() {
     telemetry::TelemetryFusionConfig config;
@@ -21,6 +24,68 @@ telemetry::TelemetryFusionConfig default_config() {
     config.freshness_window = std::chrono::milliseconds(150);
     config.ring_size = 128;
     return config;
+}
+
+bool publish_sample_unlocked(const tsd_telemetry_sample_t &sample) {
+    if (!g_manager) {
+        return false;
+    }
+    auto bus = g_manager->bus();
+    if (!bus) {
+        return false;
+    }
+
+    bool published = false;
+    const auto now = std::chrono::steady_clock::now();
+    if (sample.temp_available) {
+        telemetry::TelemetryReading reading;
+        reading.value = static_cast<double>(sample.package_temp_millic) / 1000.0;
+        reading.valid = true;
+        reading.quality = 100;
+        reading.timestamp = now;
+        bus->publish(telemetry::TelemetrySignal::kPackageTempC, reading);
+        published = true;
+    }
+    if (sample.freq_ratio_available) {
+        telemetry::TelemetryReading reading;
+        /* The fusion bus stores frequency ratio in milli-units end-to-end. */
+        reading.value = static_cast<double>(sample.freq_ratio_milli);
+        reading.valid = true;
+        reading.quality = 100;
+        reading.timestamp = now;
+        bus->publish(telemetry::TelemetrySignal::kFrequencyRatio, reading);
+        published = true;
+    }
+    return published;
+}
+
+bool copy_usable_snapshot(const telemetry::TelemetrySnapshot &snapshot,
+                          tsd_telemetry_sample_t *out) {
+    if (!snapshot.temp_available && !snapshot.freq_available) {
+        return false;
+    }
+
+    out->temp_available = snapshot.temp_available ? 1 : 0;
+    out->freq_ratio_available = snapshot.freq_available ? 1 : 0;
+    out->package_temp_millic = snapshot.temp_available
+                                   ? static_cast<int32_t>(std::llround(snapshot.package_temp_c * 1000.0))
+                                   : 0;
+    out->freq_ratio_milli = snapshot.freq_available
+                                ? static_cast<uint32_t>(std::llround(snapshot.freq_ratio))
+                                : 0u;
+    return true;
+}
+
+void fill_missing_from_direct(tsd_telemetry_sample_t *out,
+                              const tsd_telemetry_sample_t &direct) {
+    if (!out->temp_available && direct.temp_available) {
+        out->temp_available = 1;
+        out->package_temp_millic = direct.package_temp_millic;
+    }
+    if (!out->freq_ratio_available && direct.freq_ratio_available) {
+        out->freq_ratio_available = 1;
+        out->freq_ratio_milli = direct.freq_ratio_milli;
+    }
 }
 
 }  // namespace
@@ -31,42 +96,77 @@ extern "C" int tsd_telemetry_fusion_start(void) {
         return 0;
     }
 
-    auto manager = std::make_shared<telemetry::TelemetryBusManager>();
+    g_manager = std::make_shared<telemetry::TelemetryBusManager>();
     telemetry::TelemetryFusionConfig config = default_config();
-    g_fusion = std::make_unique<telemetry::TelemetryFusion>(config, manager);
+    g_fusion = std::make_unique<telemetry::TelemetryFusion>(config, g_manager);
+
+    /*
+     * The dispatcher workload is pinned to CPU 0. Seed the production fusion
+     * bus from the same direct Linux telemetry helper so an empty collector
+     * graph can never suppress otherwise available temperature/frequency data.
+     * Future platform-specific collectors can still be registered on the same
+     * manager and compete by timestamp/quality through TelemetryBus.
+     */
+    g_direct_helper_ready = tsd_telemetry_helper_init(&g_direct_helper, 0) == 0;
+
     g_fusion->start();
     return 0;
 }
 
 extern "C" void tsd_telemetry_fusion_stop(void) {
     std::lock_guard<std::mutex> lock(g_fusion_mutex);
-    if (!g_fusion) {
-        return;
+    if (g_fusion) {
+        g_fusion->stop();
+        g_fusion.reset();
     }
-    g_fusion->stop();
-    g_fusion.reset();
+    g_manager.reset();
+    if (g_direct_helper_ready) {
+        tsd_telemetry_helper_destroy(&g_direct_helper);
+        g_direct_helper_ready = false;
+    }
+}
+
+extern "C" int tsd_telemetry_fusion_publish_sample(const tsd_telemetry_sample_t *sample) {
+    if (!sample) {
+        return -1;
+    }
+    std::lock_guard<std::mutex> lock(g_fusion_mutex);
+    if (!g_fusion || !g_manager) {
+        return -1;
+    }
+    return publish_sample_unlocked(*sample) ? 0 : -1;
 }
 
 extern "C" int tsd_telemetry_fusion_sample(tsd_telemetry_sample_t *out) {
     if (!out) {
         return -1;
     }
+
+    *out = tsd_telemetry_sample_t{};
     std::lock_guard<std::mutex> lock(g_fusion_mutex);
     if (!g_fusion) {
         return -1;
     }
-    auto snapshot = g_fusion->latest_snapshot();
-    if (!snapshot) {
-        return -1;
-    }
-    out->temp_available = snapshot->temp_available ? 1 : 0;
-    out->freq_ratio_available = snapshot->freq_available ? 1 : 0;
-    out->package_temp_millic = snapshot->temp_available
-                                   ? static_cast<int32_t>(std::llround(snapshot->package_temp_c * 1000.0))
-                                   : 0;
-    out->freq_ratio_milli = snapshot->freq_available
-                                ? static_cast<uint32_t>(std::llround(snapshot->freq_ratio))
-                                : 0u;
-    return 0;
-}
 
+    /*
+     * Always advance the direct helper's retry/recovery state. If we only
+     * sampled it when the fused snapshot was completely empty, one healthy
+     * signal could mask the recovery of another indefinitely.
+     */
+    tsd_telemetry_sample_t direct{};
+    bool direct_usable = false;
+    if (g_direct_helper_ready && tsd_telemetry_helper_sample(&g_direct_helper, &direct) == 0) {
+        direct_usable = direct.temp_available || direct.freq_ratio_available;
+        if (direct_usable) {
+            (void)publish_sample_unlocked(direct);
+        }
+    }
+
+    auto snapshot = g_fusion->latest_snapshot();
+    bool fused_usable = snapshot && copy_usable_snapshot(*snapshot, out);
+    if (direct_usable) {
+        fill_missing_from_direct(out, direct);
+    }
+
+    return (fused_usable || direct_usable) ? 0 : -1;
+}

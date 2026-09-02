@@ -18,6 +18,14 @@ static tsd_thermal_eval_t make_sample(uint32_t ratio_milli, int32_t temp_millic)
     return sample;
 }
 
+static tsd_thermal_eval_t make_sample_without_temperature(uint32_t ratio_milli) {
+    tsd_thermal_eval_t sample = make_sample(ratio_milli, 0);
+    sample.temp_available = 0;
+    sample.package_temp_millic = 0;
+    sample.thermal_severity_milli = 0;
+    return sample;
+}
+
 static void test_predictive_convergence(void) {
     tsd_policy_config cfg;
     tsd_policy_config_set_defaults(&cfg);
@@ -73,6 +81,39 @@ static void test_predictive_stability(void) {
     tsd_dispatcher_policy_destroy(state);
 }
 
+static void test_missing_temperature_is_not_zero_celsius(void) {
+    tsd_policy_config cfg;
+    tsd_policy_config_set_defaults(&cfg);
+    cfg.slo_ratio_milli = 1500;
+    cfg.slo_temp_millic = 85000;
+    cfg.transition_penalty_down_milli = 49;
+    cfg.transition_penalty_up_milli = 1000;
+    cfg.forecast_horizon = 3;
+
+    tsd_dispatcher_policy_state *state = tsd_dispatcher_policy_create(&cfg);
+    assert(state != NULL);
+
+    for (int i = 0; i < 3; ++i) {
+        tsd_thermal_eval_t sample = make_sample_without_temperature(1600);
+        tsd_dispatcher_policy_record(state, &sample, SIMD_AVX2);
+    }
+
+    simd_width_t target = SIMD_AVX2;
+    int fallback = 0;
+    int rc = tsd_dispatcher_policy_recommend(state, SIMD_AVX2, SIMD_AVX2, &target, &fallback);
+
+    /*
+     * Ratio-only scoring improves by exactly one cost unit when stepping down.
+     * Treating missing temperature as 0 C adds a synthetic 0.01 penalty and
+     * suppresses the transition; correct missing-data handling preserves it.
+     */
+    assert(fallback == 0);
+    assert(rc == 1);
+    assert(target == SIMD_SSE41);
+
+    tsd_dispatcher_policy_destroy(state);
+}
+
 static void test_predictive_fallback(void) {
     tsd_policy_config cfg;
     tsd_policy_config_set_defaults(&cfg);
@@ -96,6 +137,7 @@ static void test_predictive_fallback(void) {
 int main(void) {
     test_predictive_convergence();
     test_predictive_stability();
+    test_missing_temperature_is_not_zero_celsius();
     test_predictive_fallback();
     printf("policy controller tests passed\n");
     return 0;

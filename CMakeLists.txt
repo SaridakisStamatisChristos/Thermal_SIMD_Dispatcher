@@ -7,6 +7,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(THERMAL_SIMD_DISPATCHER_CPU_FLAGS "-msse4.1" CACHE STRING "CPU-specific compiler flags for thermal_simd")
 
 include(CTest)
+include(GNUInstallDirs)
 
 find_package(OpenSSL REQUIRED)
 
@@ -53,13 +54,14 @@ target_include_directories(thermal_simd_core
     PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
         $<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/include>
-        $<INSTALL_INTERFACE:include>
+        $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
     PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 target_compile_definitions(thermal_simd_core
     PRIVATE
         TSD_DEFAULT_COEFF_PATH="${CMAKE_CURRENT_SOURCE_DIR}/config/controller_coeffs.json"
+        TSD_INSTALLED_COEFF_PATH="${CMAKE_INSTALL_FULL_SYSCONFDIR}/thermal-simd/controller_coeffs.json"
 )
 
 target_link_libraries(thermal_simd_core PRIVATE pthread OpenSSL::SSL OpenSSL::Crypto)
@@ -73,7 +75,7 @@ target_include_directories(tsd_policy_tuner
     PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
         $<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/include>
-        $<INSTALL_INTERFACE:include>
+        $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )
 target_link_libraries(tsd_policy_tuner
     PUBLIC
@@ -83,6 +85,11 @@ add_executable(policy_tuner src/tools/policy_tuner/main.cpp)
 target_link_libraries(policy_tuner PRIVATE tsd_policy_tuner)
 
 if(BUILD_TESTING)
+    # CMake's Release flags define NDEBUG, which would otherwise compile away
+    # the many assert()-based regression checks. Tests must validate the same
+    # invariants in every configuration, including the normal Release CI job.
+    add_compile_options(-UNDEBUG)
+
     add_library(thermal_simd_core_tests STATIC ${THERMAL_SIMD_CORE_SOURCES})
     target_include_directories(thermal_simd_core_tests
         PUBLIC
@@ -95,6 +102,7 @@ if(BUILD_TESTING)
     target_compile_definitions(thermal_simd_core_tests
         PRIVATE
             TSD_DEFAULT_COEFF_PATH="${CMAKE_CURRENT_SOURCE_DIR}/config/controller_coeffs.json"
+            TSD_INSTALLED_COEFF_PATH="${CMAKE_INSTALL_FULL_SYSCONFDIR}/thermal-simd/controller_coeffs.json"
     )
     target_link_libraries(thermal_simd_core_tests PUBLIC OpenSSL::SSL OpenSSL::Crypto)
 
@@ -196,32 +204,41 @@ if(BUILD_TESTING)
     target_link_libraries(stress_patch_request PRIVATE tsd_stress_common)
     target_compile_definitions(stress_patch_request PRIVATE TSD_ENABLE_TESTS)
     target_compile_options(stress_patch_request PRIVATE -Wall -Wextra -pthread)
+    add_test(NAME stress_patch_request_smoke
+             COMMAND stress_patch_request --threads=2 --iterations=250)
 
     add_executable(stress_signal_storm tests/stress/signal_storm.c)
     target_link_libraries(stress_signal_storm PRIVATE tsd_stress_common pthread)
     target_compile_definitions(stress_signal_storm PRIVATE TSD_ENABLE_TESTS)
     target_compile_options(stress_signal_storm PRIVATE -Wall -Wextra -pthread)
+    add_test(NAME stress_signal_storm_smoke
+             COMMAND stress_signal_storm --duration-seconds=2 --signal-rate=50)
 
     add_executable(stress_telemetry_faults tests/stress/telemetry_faults.c)
     target_link_libraries(stress_telemetry_faults PRIVATE tsd_stress_common pthread)
     target_compile_definitions(stress_telemetry_faults PRIVATE TSD_ENABLE_TESTS)
     target_compile_options(stress_telemetry_faults PRIVATE -Wall -Wextra -pthread)
+    add_test(NAME stress_telemetry_faults_smoke
+             COMMAND stress_telemetry_faults --cycles=2)
 endif()
 
-install(TARGETS thermal_simd_core
+install(TARGETS thermal_simd_core thermal_simd
         EXPORT thermal_simd_dispatcherTargets
-        ARCHIVE DESTINATION lib
-        LIBRARY DESTINATION lib
-        RUNTIME DESTINATION bin)
+        ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+        LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 
 install(DIRECTORY include/
-        DESTINATION include
+        DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
         FILES_MATCHING PATTERN "*.h"
         PATTERN "*.in" EXCLUDE)
 
 install(FILES ${CMAKE_CURRENT_BINARY_DIR}/include/thermal/simd/version.h
-        DESTINATION include/thermal/simd)
+        DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/thermal/simd)
+
+install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/config/controller_coeffs.json
+        DESTINATION ${CMAKE_INSTALL_SYSCONFDIR}/thermal-simd)
 
 install(EXPORT thermal_simd_dispatcherTargets
         NAMESPACE thermal::
-        DESTINATION lib/cmake/thermal_simd_dispatcher)
+        DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/thermal_simd_dispatcher)

@@ -51,9 +51,9 @@ public:
     void poll(std::chrono::steady_clock::time_point now);
 
 private:
+    mutable std::mutex mutex_;
     std::shared_ptr<TelemetryBus> bus_;
     std::vector<std::shared_ptr<TelemetryCollector>> collectors_;
 };
 
 }  // namespace telemetry
-

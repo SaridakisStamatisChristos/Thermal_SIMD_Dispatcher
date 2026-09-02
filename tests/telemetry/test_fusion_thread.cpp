@@ -2,8 +2,10 @@
 #include <cassert>
 #include <chrono>
 #include <memory>
+#include <thread>
 
 #include <telemetry/fusion.h>
+#include <thermal/simd/telemetry_fusion.h>
 
 int main() {
     using namespace telemetry;
@@ -25,7 +27,7 @@ int main() {
         return sample;
     };
 
-    std::atomic<double> freq_value{2400.0};
+    std::atomic<double> freq_value{875.0};
     PerfSampleProvider perf_provider = [&]() {
         PerfSample sample{};
         sample.thermal_cpi = 1200.0;
@@ -56,7 +58,7 @@ int main() {
     assert(snapshot->power_available);
     assert(!snapshot->degraded);
     assert(snapshot->package_temp_c > 70.0);
-    assert(snapshot->freq_ratio >= 2000.0);
+    assert(snapshot->freq_ratio >= 800.0 && snapshot->freq_ratio <= 1200.0);
     assert(snapshot->thermal_cpi >= 1000.0);
     assert(snapshot->power_budget_w > 0.0);
 
@@ -69,6 +71,27 @@ int main() {
 
     fusion.stop();
 
+    /*
+     * Exercise the actual C production bridge. An explicitly published direct
+     * sample must survive the bridge/fusion boundary with its units intact.
+     */
+    assert(tsd_telemetry_fusion_start() == 0);
+    tsd_telemetry_sample_t direct{};
+    direct.temp_available = 1;
+    direct.package_temp_millic = 81250;
+    direct.freq_ratio_available = 1;
+    direct.freq_ratio_milli = 875;
+    assert(tsd_telemetry_fusion_publish_sample(&direct) == 0);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    tsd_telemetry_sample_t bridged{};
+    assert(tsd_telemetry_fusion_sample(&bridged) == 0);
+    assert(bridged.temp_available == 1);
+    assert(bridged.package_temp_millic == 81250);
+    assert(bridged.freq_ratio_available == 1);
+    assert(bridged.freq_ratio_milli == 875);
+    tsd_telemetry_fusion_stop();
+
     return 0;
 }
-

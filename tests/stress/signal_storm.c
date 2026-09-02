@@ -39,19 +39,20 @@ static int parse_positive(const char *value, int fallback) {
     }
     char *end = NULL;
     long parsed = strtol(value, &end, 10);
-    if (end == value || parsed <= 0 || parsed > INT_MAX) {
+    if (end == value || *end != '\0' || parsed <= 0 || parsed > INT_MAX) {
         return fallback;
     }
     return (int)parsed;
 }
 
 static int resolve_duration(int argc, char **argv) {
+    static const char equals_prefix[] = "--duration-seconds=";
     int seconds = 30;
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--duration-seconds") == 0 && i + 1 < argc) {
             seconds = parse_positive(argv[++i], seconds);
-        } else if (strncmp(argv[i], "--duration-seconds=", 20) == 0) {
-            seconds = parse_positive(argv[i] + 20, seconds);
+        } else if (strncmp(argv[i], equals_prefix, sizeof(equals_prefix) - 1U) == 0) {
+            seconds = parse_positive(argv[i] + sizeof(equals_prefix) - 1U, seconds);
         }
     }
     const char *duration_env = getenv("TSD_STRESS_DURATION");
@@ -62,12 +63,13 @@ static int resolve_duration(int argc, char **argv) {
 }
 
 static int resolve_rate(int argc, char **argv) {
+    static const char equals_prefix[] = "--signal-rate=";
     int rate = 250;
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--signal-rate") == 0 && i + 1 < argc) {
             rate = parse_positive(argv[++i], rate);
-        } else if (strncmp(argv[i], "--signal-rate=", 15) == 0) {
-            rate = parse_positive(argv[i] + 15, rate);
+        } else if (strncmp(argv[i], equals_prefix, sizeof(equals_prefix) - 1U) == 0) {
+            rate = parse_positive(argv[i] + sizeof(equals_prefix) - 1U, rate);
         }
     }
     const char *rate_env = getenv("TSD_SIGNAL_RATE");

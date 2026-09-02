@@ -12,6 +12,7 @@
 #include <unistd.h>
 
 #include <chrono>
+#include <cstdint>
 #include <cstring>
 #include <future>
 #include <iostream>
@@ -166,20 +167,20 @@ std::string basic_auth_header(const std::string &user, const std::string &pass) 
     std::string token = user + ":" + pass;
     static const char table[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     std::string encoded;
-    int val = 0;
+    uint32_t val = 0;
     int valb = -6;
     for (unsigned char c : token) {
-        val = (val << 8) + c;
+        val = (val << 8U) | static_cast<uint32_t>(c);
         valb += 8;
         while (valb >= 0) {
-            encoded.push_back(table[(val >> valb) & 0x3F]);
+            encoded.push_back(table[(val >> static_cast<unsigned int>(valb)) & 0x3FU]);
             valb -= 6;
         }
     }
     if (valb > -6) {
-        encoded.push_back(table[((val << 8) >> (valb + 8)) & 0x3F]);
+        encoded.push_back(table[((val << 8U) >> static_cast<unsigned int>(valb + 8)) & 0x3FU]);
     }
-    while (encoded.size() % 4) {
+    while (encoded.size() % 4U) {
         encoded.push_back('=');
     }
     return std::string("Basic ") + encoded;

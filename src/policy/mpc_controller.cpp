@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstdint>
+#include <fstream>
 #include <iterator>
 #include <limits>
 #include <string>
@@ -47,12 +48,25 @@ inline int widthIndex(simd_width_t width) {
     return static_cast<int>(width);
 }
 
+bool fileReadable(const char *path) {
+    if (!path || !*path) {
+        return false;
+    }
+    std::ifstream stream(path);
+    return stream.good();
+}
+
 std::string resolveCoefficientPath() {
     (void)registrar();
     const char *env = std::getenv("TSD_PREDICTIVE_COEFF_PATH");
     if (env && *env) {
         return std::string(env);
     }
+#ifdef TSD_INSTALLED_COEFF_PATH
+    if (fileReadable(TSD_INSTALLED_COEFF_PATH)) {
+        return std::string(TSD_INSTALLED_COEFF_PATH);
+    }
+#endif
 #ifdef TSD_DEFAULT_COEFF_PATH
     return std::string(TSD_DEFAULT_COEFF_PATH);
 #else
@@ -180,7 +194,7 @@ double MPCController::scoreWidth(simd_width_t candidate,
     double ratio_cost = std::fabs(ratio_projection - static_cast<double>(config_.slo_ratio_milli));
 
     double temp_cost = 0.0;
-    if (config_.slo_temp_millic != 0 && horizon > 0) {
+    if (config_.slo_temp_millic != 0 && horizon > 0 && std::isfinite(forecast_temp)) {
         double temp_projection = forecast_temp;
         temp_projection -= static_cast<double>(step) * ratio_error * 0.1;
         temp_cost = std::fabs(temp_projection - static_cast<double>(config_.slo_temp_millic)) * kTemperatureWeight;
@@ -238,6 +252,9 @@ bool MPCController::recommend(simd_width_t current_width,
     double forecast_temp = computeForecastTemperature(horizon, temp_valid_count, used_model);
     if (used_model) {
         tsd_metrics_increment(TSD_METRIC_PREDICTIVE_FORECASTS);
+    } else if (temp_valid_count == 0) {
+        /* Missing temperature is absence of evidence, not a 0 C measurement. */
+        forecast_temp = std::numeric_limits<double>::quiet_NaN();
     }
     last_prediction_millic_ = forecast_temp;
     last_prediction_valid_ = used_model;

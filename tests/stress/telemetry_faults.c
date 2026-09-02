@@ -115,12 +115,14 @@ int main(int argc, char **argv) {
     pthread_join(monitor_thread, NULL);
 
     unsigned int injected = atomic_load_explicit(&fault_injections, memory_order_relaxed);
+    tsd_perf_mode_t perf_mode = tsd_perf_get_mode(ctx);
     int last_group_valid = tsd_test_perf_get_last_group_valid(ctx);
     simd_width_t final_width = tsd_test_current_width();
 
     printf("telemetry_faults summary\n");
     printf("  cycles: %d\n", cycles);
     printf("  injections: %u\n", injected);
+    printf("  perf_mode: %d\n", (int)perf_mode);
     printf("  last_group_valid: %d\n", last_group_valid);
     printf("  final_width: %d\n", (int)final_width);
     fflush(stdout);
@@ -129,8 +131,15 @@ int main(int argc, char **argv) {
     tsd_stress_teardown_runtime();
 
     int rc = 0;
-    if (!last_group_valid) {
-        fprintf(stderr, "perf group reported invalid data after telemetry faults\n");
+    /* A hardware perf context must retain a valid group read. The stress
+     * harness deliberately forces software mode, where no perf group exists
+     * and last_group_valid is correctly zero. */
+    if (perf_mode == TSD_PERF_MODE_HARDWARE && !last_group_valid) {
+        fprintf(stderr, "hardware perf group reported invalid data after telemetry faults\n");
+        rc = 1;
+    }
+    if (perf_mode == TSD_PERF_MODE_NONE) {
+        fprintf(stderr, "perf context lost its operating mode under telemetry faults\n");
         rc = 1;
     }
     if (final_width != SIMD_SSE41) {

@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cctype>
+#include <cstdint>
 #include <cstring>
 #include <iomanip>
 #include <map>
@@ -412,7 +413,7 @@ private:
         static const std::string alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
         std::string output;
         output.reserve((input.size() * 3) / 4);
-        int val = 0;
+        uint32_t val = 0;
         int valb = -8;
         for (unsigned char c : input) {
             if (std::isspace(c)) {
@@ -425,10 +426,10 @@ private:
             if (pos == std::string::npos) {
                 return std::string();
             }
-            val = (val << 6) + static_cast<int>(pos);
+            val = (val << 6U) | static_cast<uint32_t>(pos);
             valb += 6;
             if (valb >= 0) {
-                output.push_back(static_cast<char>((val >> valb) & 0xFF));
+                output.push_back(static_cast<char>((val >> static_cast<unsigned int>(valb)) & 0xFFU));
                 valb -= 8;
             }
         }
@@ -759,4 +760,3 @@ void tsd_metrics_exporter_record_sensor_health(const char *sensor_name,
 }
 
 } // extern "C"
-

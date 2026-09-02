@@ -1,0 +1,49 @@
+name: Hardware-in-the-Loop
+
+on:
+  workflow_dispatch:
+    inputs:
+      soak_minutes:
+        description: Thermal/stress soak duration in minutes
+        required: false
+        default: "30"
+
+jobs:
+  hardware-smoke:
+    runs-on: [self-hosted, hil, avx512]
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Hardware smoke
+        run: ci/hw-smoke.sh
+
+  stress-suite:
+    needs: hardware-smoke
+    runs-on: [self-hosted, hil, avx512]
+    timeout-minutes: 60
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -S . -B build-ci -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
+      - name: Build stress targets
+        run: cmake --build build-ci --target stress_patch_request stress_signal_storm stress_telemetry_faults -j"$(nproc)"
+      - name: Patch-selection stress
+        run: build-ci/stress_patch_request --threads=8 --iterations=4000
+      - name: Signal stress
+        run: build-ci/stress_signal_storm --duration-seconds=45 --signal-rate=350
+      - name: Telemetry fault stress
+        run: build-ci/stress_telemetry_faults --cycles=5
+
+  thermal-soak:
+    needs: stress-suite
+    runs-on: [self-hosted, hil, avx512]
+    timeout-minutes: 360
+    env:
+      SOAK_MINUTES: ${{ inputs.soak_minutes }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Run HIL soak
+        run: ci/thermal-soak.sh

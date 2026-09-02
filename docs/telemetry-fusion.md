@@ -1,71 +1,121 @@
 # Telemetry Fusion Architecture
 
-The telemetry fusion layer normalizes and aggregates signals from hardware counters, ACPI sensors, and software probes so that the predictive controller can act on a consistent snapshot.
+The telemetry subsystem has two layers:
 
-## Overview
-- Lives in `telemetry/fusion.c` with headers under `include/telemetry/fusion.h`.
-- Runs on a dedicated thread pinned to an isolated core to prevent dispatcher jitter.
-- Publishes a `TelemetrySnapshot` structure to a lock-free ring buffer consumed by the dispatcher loop.
+1. a direct Linux helper for temperature and frequency-ratio signals; and
+2. a C++ fusion bus that can combine those direct signals with registered collector providers.
 
-## Data Sources
-| Source | Collector | Refresh Interval | Notes |
-| --- | --- | --- | --- |
-| `perf_event_open` (cycles, instructions) | `perf_collector.c` | Every scheduler tick (50ms default) | Provides CPI and residency data. |
-| MSR IA32_THERM_STATUS | `msr_collector.c` | 25ms | Exposes package/core temperatures; falls back to `/sys/class/thermal`. |
-| RAPL energy counters | `rapl_collector.c` | 50ms | Derives instantaneous power budget. |
-| CPU frequency (`/proc/cpuinfo_cur_freq`) | `freq_collector.c` | 50ms | Captures turbo residency hints. |
-| OEM sensors (I2C/PMBus) | `oem_collector.c` | 100ms | Optional but preferred for socket-level thermal accuracy. |
+The production bridge deliberately treats an empty fused snapshot as **unavailable**, not as a successful telemetry read. This prevents the fusion layer from suppressing valid direct hardware telemetry.
 
-Each collector publishes raw readings into a shared `TelemetryBus`. The fusion layer applies validation, deduplication, and time alignment before publishing.
+## Implementation map
 
-## Fusion Pipeline
-1. **Ingest:** Copy collector updates into a mutable `FusionScratch` struct while checking sequence numbers.
-2. **Validate:** Apply per-sensor plausibility checks (`min/max`, delta thresholds). Flag anomalies through `telemetry_anomaly_total`.
-3. **Temporal Align:** Convert timestamps to monotonic nanoseconds and ensure readings fall within the current interval window (`±10ms`). Stale readings are tagged with `status=STALE`.
-4. **Unit Normalize:** Convert temperatures to °C, power to Watts, frequency to MHz, CPI to dimensionless ratio.
-5. **Synthesize Metrics:**
-   - Compute `thermal_cpi` as CPI smoothed with an EWMA.
-   - Derive `freq_hint` from average frequency vs. nominal base clock.
-   - Calculate `power_budget_w` from RAPL delta energy.
-6. **Snapshot Publish:** Emit an immutable `TelemetrySnapshot` with `generation` incremented. The dispatcher consumes the snapshot by matching `generation`.
+- `src/telemetry_helper.c` — direct Linux telemetry acquisition and recovery/backoff.
+- `src/telemetry/bus.cpp` — timestamp/quality-aware signal store.
+- `src/telemetry/collector.cpp` — reusable provider-backed collector classes.
+- `src/telemetry/fusion.cpp` — polling thread, freshness checks, snapshot generation.
+- `src/telemetry/fusion_bridge.cpp` — C API used by the runtime and direct-helper fallback/publication boundary.
+- `include/telemetry/*.h` — C++ bus, collector and snapshot interfaces.
+- `include/thermal/simd/telemetry_fusion.h` — stable C bridge API.
 
-## Error Handling
-- Missing mandatory sensors (perf counters, package temperature) mark the snapshot `degraded=true` and trigger scalar fallback.
-- Optional sensors populate with `NaN` and log `event=telemetry_optional_missing` to support diagnostics.
-- Collector thread crashes escalate through the watchdog, raising `telemetry_watchdog_trip_total` and causing process exit.
+## Direct Linux sources
 
-## Configuration
-Configuration lives in `config/telemetry.toml` and surfaces through CLI/environment overrides:
+`tsd_telemetry_helper_t` currently provides the production hardware path:
 
-| Option | CLI Flag | Description | Default |
-| --- | --- | --- | --- |
-| `poll_interval_ms` | `--telemetry-interval` | Base interval for collectors. | 50 |
-| `max_skew_ms` | `--telemetry-max-skew` | Allowed skew between collectors before marking stale. | 15 |
-| `ewma_alpha` | `--telemetry-ewma` | EWMA alpha for CPI smoothing. | 0.25 |
-| `oem_bus` | `--telemetry-oem-bus` | Path to optional PMBus device. | `/dev/i2c-6` |
-| `rapl_domain` | `--telemetry-rapl-domain` | RAPL domain to monitor (e.g., `package-0`). | `package-0` |
+- package/CPU temperature from readable `/sys/class/thermal/thermal_zone*/temp` entries;
+- APERF/MPERF frequency ratio from `/dev/cpu/<cpu>/msr` when available;
+- cpufreq fallback from `/sys/devices/system/cpu/cpu*/cpufreq`;
+- exponential retry/backoff for temperature, cpufreq and MSR sources after failures.
 
-Environment variables mirror these flags using the `TSD_TELEMETRY_*` prefix (`TSD_TELEMETRY_INTERVAL`, etc.).
+The bridge initializes a helper for CPU 0, which is also the dispatcher workload CPU in the current runtime. When fusion has not yet produced a usable temperature/frequency snapshot, the bridge samples this helper directly, publishes the available values into the fusion bus, and returns the direct sample to the caller.
 
-## Observability
-The fusion layer emits structured logs with `event=telemetry_snapshot` and includes:
-- `generation`
-- `degraded`
-- `thermal_cpi`
-- `temp_package_c`
-- `freq_hint`
-- `power_budget_w`
+## Fusion bus
 
-Metrics include:
-- `telemetry_snapshots_total`
-- `telemetry_degraded_total`
-- `telemetry_anomaly_total`
-- `telemetry_watchdog_trip_total`
+`TelemetryBus` stores the newest/best reading per signal. A reading contains:
 
-See [Metrics Endpoints](metrics-endpoints.md) for export details.
+- value;
+- validity;
+- quality;
+- monotonic timestamp.
 
-## Testing
-- Unit tests under `tests/telemetry/test_telemetry.cpp` mock sensor inputs and verify normalization.
-- Hardware-in-the-loop CI job (see [`docs/ci-hil.md`](ci-hil.md)) validates sensor integration on nightly runs when AVX-512 runners tagged `hil` are available.
-- `tests/smoke.sh` exercises the telemetry pipeline using the sandbox workflow.
-- Coverage ownership for this subsystem is tracked in the [Validation Matrix](testing-matrix.md).
+Collector registration and bus-manager access are mutex-protected. `poll()` takes a stable copy of the current bus/collector set before invoking providers, so collectors may be registered without racing the polling loop.
+
+A newly published reading replaces the current one when it has at least the current quality or a newer timestamp.
+
+The production C boundary can publish already-normalized direct samples with:
+
+```c
+int tsd_telemetry_fusion_publish_sample(const tsd_telemetry_sample_t *sample);
+```
+
+Temperature is converted from milli-degrees Celsius to degrees Celsius inside the bus. Frequency ratio remains in milli-units end-to-end (for example `875` means `0.875x`).
+
+## Collector API
+
+The C++ collector layer provides reusable provider-backed classes:
+
+- `PerfCollector`
+- `MsrCollector`
+- `RaplCollector`
+- `FreqCollector`
+- `OemCollector`
+
+These classes do **not** magically discover hardware. A caller must register a collector with a concrete provider. The production runtime currently guarantees temperature/frequency input through the direct-helper bridge; additional perf, RAPL or OEM providers can be registered by integrations that have those data sources.
+
+`PerfSample::freq_hint` is defined in frequency-ratio milli-units (`1000 == 1.0x`), not MHz.
+
+## Snapshot generation
+
+`TelemetryFusion` owns a polling thread. The production bridge uses:
+
+- poll interval: 50 ms;
+- freshness window: 150 ms;
+- snapshot ring capacity: 128.
+
+The snapshot ring is synchronized with a mutex and condition variable. It is not lock-free.
+
+Each generation may contain:
+
+- package temperature;
+- frequency ratio;
+- thermal CPI;
+- power budget.
+
+The production fusion layer marks a snapshot degraded when either temperature or frequency ratio is missing. CPI remains authoritative in `thermal_perf.c`, and power is optional enrichment, so their absence alone does not mark an otherwise valid thermal snapshot degraded.
+
+`tsd_telemetry_fusion_sample()` returns success only when at least one temperature/frequency signal is usable. Empty snapshots return `-1`, allowing callers to use their direct source instead of silently consuming zero-valued telemetry.
+
+## Runtime interaction
+
+`thermal_perf.c` first asks the fusion bridge for temperature/frequency telemetry. With the production bridge behavior above:
+
+- a fresh fused temperature/frequency snapshot is returned when present;
+- otherwise the bridge samples the direct Linux helper and seeds the bus;
+- if the bridge cannot obtain a usable signal, the existing `thermal_perf.c` helper fallback remains available.
+
+CPI itself is still measured by the perf/software adaptation layer in `thermal_perf.c`; it is not fabricated by the fusion bridge.
+
+## Recovery semantics
+
+The direct helper has explicit retry state for:
+
+- thermal-zone discovery;
+- cpufreq paths;
+- MSR reopening.
+
+Backoff begins at 5 seconds and grows to 600 seconds. Recovery metrics are emitted only after a source becomes usable again.
+
+The fusion thread itself has no separate crash watchdog at present. If watchdog supervision is required, use the service manager/container orchestrator or add an explicit runtime watchdog rather than assuming one exists.
+
+## Tests
+
+Relevant automated coverage includes:
+
+- `tests/telemetry/test_telemetry.cpp` — sensor adapter behavior;
+- `tests/telemetry/test_fusion_thread.cpp` — collector/freshness behavior plus the production C bridge publication path;
+- `tests/telemetry/test_fusion_stress.cpp` — concurrent fusion stress;
+- `tests/stress/telemetry_faults.c` — degraded/recovery fault scenarios;
+- standard CTest smoke registrations for the stress binaries;
+- `.github/workflows/sandbox.yml` — software-perf degraded mode;
+- `.github/workflows/quality.yml` — GCC/Clang, sanitizer and packaging gates.
+
+Hardware-specific validation remains separate because hosted CI cannot guarantee AVX-512, perf permissions, MSR access or repeatable thermal conditions.

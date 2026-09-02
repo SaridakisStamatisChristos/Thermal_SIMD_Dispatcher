@@ -133,7 +133,13 @@ TelemetrySnapshot TelemetryFusion::fuse(std::chrono::steady_clock::time_point no
     assign_value(snapshot, TelemetrySignal::kThermalCpi, snapshot.thermal_cpi, snapshot.cpi_available, now);
     assign_value(snapshot, TelemetrySignal::kPowerBudgetWatts, snapshot.power_budget_w, snapshot.power_available, now);
 
-    if (!snapshot.temp_available || !snapshot.freq_available || !snapshot.cpi_available) {
+    /*
+     * Temperature and frequency are the production fusion bridge's required
+     * signals. CPI remains authoritative in thermal_perf.c and power is an
+     * optional enrichment, so their absence must not make otherwise valid
+     * hardware thermal telemetry look permanently degraded.
+     */
+    if (!snapshot.temp_available || !snapshot.freq_available) {
         snapshot.degraded = true;
     }
     tsd_fusion_telemetry_t telemetry{};
@@ -172,4 +178,3 @@ bool TelemetryFusion::assign_value(TelemetrySnapshot &snapshot,
 }
 
 }  // namespace telemetry
-

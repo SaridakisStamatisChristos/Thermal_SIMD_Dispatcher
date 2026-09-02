@@ -12,16 +12,19 @@ namespace telemetry {
 
 struct PerfSample {
     double thermal_cpi = 0.0;
+    /* Frequency ratio in milli-units: 1000 == 1.0x nominal/reference. */
     double freq_hint = 0.0;
     bool valid = false;
 };
 
 struct TemperatureSample {
+    /* Degrees Celsius. */
     double package_temp_c = 0.0;
     bool valid = false;
 };
 
 struct RaplSample {
+    /* Watts. */
     double power_budget_w = 0.0;
     bool valid = false;
 };
@@ -118,4 +121,3 @@ using TelemetryCollectorPtr = std::shared_ptr<TelemetryCollector>;
 using TelemetryCollectorList = std::vector<TelemetryCollectorPtr>;
 
 }  // namespace telemetry
-
