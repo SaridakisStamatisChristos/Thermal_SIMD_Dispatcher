@@ -26,15 +26,16 @@ telemetry::TelemetryFusionConfig default_config() {
     return config;
 }
 
-void publish_direct_sample(const tsd_telemetry_sample_t &sample) {
+bool publish_sample_unlocked(const tsd_telemetry_sample_t &sample) {
     if (!g_manager) {
-        return;
+        return false;
     }
     auto bus = g_manager->bus();
     if (!bus) {
-        return;
+        return false;
     }
 
+    bool published = false;
     const auto now = std::chrono::steady_clock::now();
     if (sample.temp_available) {
         telemetry::TelemetryReading reading;
@@ -43,6 +44,7 @@ void publish_direct_sample(const tsd_telemetry_sample_t &sample) {
         reading.quality = 100;
         reading.timestamp = now;
         bus->publish(telemetry::TelemetrySignal::kPackageTempC, reading);
+        published = true;
     }
     if (sample.freq_ratio_available) {
         telemetry::TelemetryReading reading;
@@ -52,7 +54,9 @@ void publish_direct_sample(const tsd_telemetry_sample_t &sample) {
         reading.quality = 100;
         reading.timestamp = now;
         bus->publish(telemetry::TelemetrySignal::kFrequencyRatio, reading);
+        published = true;
     }
+    return published;
 }
 
 bool copy_usable_snapshot(const telemetry::TelemetrySnapshot &snapshot,
@@ -110,6 +114,17 @@ extern "C" void tsd_telemetry_fusion_stop(void) {
     }
 }
 
+extern "C" int tsd_telemetry_fusion_publish_sample(const tsd_telemetry_sample_t *sample) {
+    if (!sample) {
+        return -1;
+    }
+    std::lock_guard<std::mutex> lock(g_fusion_mutex);
+    if (!g_fusion || !g_manager) {
+        return -1;
+    }
+    return publish_sample_unlocked(*sample) ? 0 : -1;
+}
+
 extern "C" int tsd_telemetry_fusion_sample(tsd_telemetry_sample_t *out) {
     if (!out) {
         return -1;
@@ -135,7 +150,7 @@ extern "C" int tsd_telemetry_fusion_sample(tsd_telemetry_sample_t *out) {
         tsd_telemetry_sample_t direct{};
         if (tsd_telemetry_helper_sample(&g_direct_helper, &direct) == 0 &&
             (direct.temp_available || direct.freq_ratio_available)) {
-            publish_direct_sample(direct);
+            (void)publish_sample_unlocked(direct);
             *out = direct;
             return 0;
         }
