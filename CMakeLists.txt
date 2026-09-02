@@ -85,6 +85,11 @@ add_executable(policy_tuner src/tools/policy_tuner/main.cpp)
 target_link_libraries(policy_tuner PRIVATE tsd_policy_tuner)
 
 if(BUILD_TESTING)
+    # CMake's Release flags define NDEBUG, which would otherwise compile away
+    # the many assert()-based regression checks. Tests must validate the same
+    # invariants in every configuration, including the normal Release CI job.
+    add_compile_options(-UNDEBUG)
+
     add_library(thermal_simd_core_tests STATIC ${THERMAL_SIMD_CORE_SOURCES})
     target_include_directories(thermal_simd_core_tests
         PUBLIC
