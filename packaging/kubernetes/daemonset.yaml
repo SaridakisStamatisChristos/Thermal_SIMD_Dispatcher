@@ -78,13 +78,12 @@ spec:
             initialDelaySeconds: 2
             periodSeconds: 5
             failureThreshold: 2
-          # Liveness intentionally checks only that the embedded HTTP server is
-          # responsive. /readyz carries perf/telemetry/controller dependency
-          # health, allowing recoverable perf loss to hot-reprobe in place
-          # instead of being killed by the kubelet.
+          # /healthz is process/exporter liveness only. Runtime dependencies
+          # such as perf and thermal telemetry are intentionally represented by
+          # /readyz so bounded hot-recovery can complete without kubelet churn.
           livenessProbe:
             httpGet:
-              path: /metrics
+              path: /healthz
               port: metrics
               scheme: HTTP
             initialDelaySeconds: 5
