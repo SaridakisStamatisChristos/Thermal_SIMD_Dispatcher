@@ -1,5 +1,6 @@
 #include <thermal/simd/telemetry_fusion.h>
 
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <memory>
@@ -9,6 +10,7 @@
 #include <telemetry/bus.h>
 #include <telemetry/collector.h>
 #include <telemetry/fusion.h>
+#include <thermal/simd/thermal_trampoline.h>
 
 namespace {
 
@@ -18,7 +20,8 @@ std::shared_ptr<telemetry::TelemetryBusManager> g_manager;
 tsd_telemetry_helper_t g_direct_helper{};
 bool g_direct_helper_ready = false;
 unsigned int g_fusion_users = 0;
-int g_direct_cpu = -1;
+std::atomic<bool> g_fusion_running{false};
+std::atomic<bool> g_temperature_upgrade_allowed{true};
 
 telemetry::TelemetryFusionConfig default_config() {
     telemetry::TelemetryFusionConfig config;
@@ -50,7 +53,6 @@ bool publish_sample_unlocked(const tsd_telemetry_sample_t &sample) {
     }
     if (sample.freq_ratio_available) {
         telemetry::TelemetryReading reading;
-        /* The fusion bus stores frequency ratio in milli-units end-to-end. */
         reading.value = static_cast<double>(sample.freq_ratio_milli);
         reading.valid = true;
         reading.quality = 100;
@@ -90,6 +92,15 @@ void fill_missing_from_direct(tsd_telemetry_sample_t *out,
     }
 }
 
+void update_temperature_gate_unlocked(bool temperature_available) {
+    g_temperature_upgrade_allowed.store(temperature_available, std::memory_order_release);
+    if (!temperature_available &&
+        std::atomic_load_explicit(&g_tsd_trampoline_initialized, std::memory_order_acquire) != 0 &&
+        std::atomic_load_explicit(&g_tsd_current_width, std::memory_order_acquire) != SIMD_SSE41) {
+        (void)tsd_trampoline_patch(SIMD_SSE41);
+    }
+}
+
 int start_unlocked(int cpu) {
     if (cpu < 0) {
         return -1;
@@ -104,10 +115,21 @@ int start_unlocked(int cpu) {
     telemetry::TelemetryFusionConfig config = default_config();
     g_fusion = std::make_unique<telemetry::TelemetryFusion>(config, g_manager);
 
-    g_direct_cpu = cpu;
     g_direct_helper_ready = tsd_telemetry_helper_init(&g_direct_helper, cpu) == 0;
     g_fusion->start();
     g_fusion_users = 1;
+    g_fusion_running.store(true, std::memory_order_release);
+
+    /* Establish the safety gate immediately rather than waiting one poll. */
+    tsd_telemetry_sample_t initial{};
+    bool has_temp = false;
+    if (g_direct_helper_ready && tsd_telemetry_helper_sample(&g_direct_helper, &initial) == 0) {
+        if (initial.temp_available || initial.freq_ratio_available) {
+            (void)publish_sample_unlocked(initial);
+        }
+        has_temp = initial.temp_available != 0;
+    }
+    update_temperature_gate_unlocked(has_temp);
     return 0;
 }
 
@@ -138,7 +160,8 @@ extern "C" void tsd_telemetry_fusion_stop(void) {
         tsd_telemetry_helper_destroy(&g_direct_helper);
         g_direct_helper_ready = false;
     }
-    g_direct_cpu = -1;
+    g_fusion_running.store(false, std::memory_order_release);
+    g_temperature_upgrade_allowed.store(true, std::memory_order_release);
 }
 
 extern "C" int tsd_telemetry_fusion_publish_sample(const tsd_telemetry_sample_t *sample) {
@@ -149,7 +172,11 @@ extern "C" int tsd_telemetry_fusion_publish_sample(const tsd_telemetry_sample_t 
     if (!g_fusion || !g_manager) {
         return -1;
     }
-    return publish_sample_unlocked(*sample) ? 0 : -1;
+    bool published = publish_sample_unlocked(*sample);
+    if (sample->temp_available) {
+        update_temperature_gate_unlocked(true);
+    }
+    return published ? 0 : -1;
 }
 
 extern "C" int tsd_telemetry_fusion_sample(tsd_telemetry_sample_t *out) {
@@ -163,11 +190,6 @@ extern "C" int tsd_telemetry_fusion_sample(tsd_telemetry_sample_t *out) {
         return -1;
     }
 
-    /*
-     * Always advance the direct helper's retry/recovery state. If we only
-     * sampled it when the fused snapshot was completely empty, one healthy
-     * signal could mask the recovery of another indefinitely.
-     */
     tsd_telemetry_sample_t direct{};
     bool direct_usable = false;
     if (g_direct_helper_ready && tsd_telemetry_helper_sample(&g_direct_helper, &direct) == 0) {
@@ -183,5 +205,13 @@ extern "C" int tsd_telemetry_fusion_sample(tsd_telemetry_sample_t *out) {
         fill_missing_from_direct(out, direct);
     }
 
+    update_temperature_gate_unlocked(out->temp_available != 0);
     return (fused_usable || direct_usable) ? 0 : -1;
+}
+
+extern "C" int tsd_telemetry_temperature_upgrade_allowed(void) {
+    if (!g_fusion_running.load(std::memory_order_acquire)) {
+        return 1;
+    }
+    return g_temperature_upgrade_allowed.load(std::memory_order_acquire) ? 1 : 0;
 }
