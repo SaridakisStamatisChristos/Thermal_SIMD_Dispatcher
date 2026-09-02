@@ -12,6 +12,8 @@ The canonical GitHub workflow is [`.github/workflows/hil.yml`](../.github/workfl
 2. **stress-suite** — exercises immutable width selection, signal pressure and telemetry fault recovery;
 3. **thermal-characterization** — runs [`ci/thermal-soak.sh`](../ci/thermal-soak.sh) and [`ci/hil_sampler.py`](../ci/hil_sampler.py) for a selected 1–300 minute observation window.
 
+The AVX-512 HIL contract is executable, not merely a runner label: `hw-smoke.sh` rejects a host without `avx512f`, both runtime HIL paths pass `--allow-avx512`, and thermal characterization requires an observed AVX-512 width sample.
+
 The final stage uploads `hil-artifacts/` even when characterization fails, so machine metadata and partial logs remain available for diagnosis.
 
 ## Required runner capabilities
@@ -28,7 +30,7 @@ The repository runtime itself will additionally verify its immutable trampoline 
 
 MSR access is optional for frequency telemetry because cpufreq can be used as a fallback. RAPL power is optional because some otherwise-valid systems do not expose package energy through Linux powercap.
 
-Do not grant broad capabilities solely to satisfy a test if a narrower device ownership, service policy or `CAP_PERFMON` configuration is available.
+The normal runtime/HIL permission target is `CAP_PERFMON` or an equivalent perf-event policy. Do not add `CAP_SYS_ADMIN` as a generic workaround. If MSR-backed APERF/MPERF is explicitly required, prefer narrow read permission on the required `/dev/cpu/*/msr` devices; where the host requires a capability, grant `CAP_SYS_RAWIO` explicitly and only to that deployment.
 
 ## Optional infrastructure-as-code assets
 
@@ -47,6 +49,7 @@ A successful `thermal-characterization` job records:
 - CPU package topology;
 - cpufreq governors;
 - visible thermal, powercap and MSR sources;
+- explicit AVX-512 request state;
 - runtime log;
 - one-second-by-default CSV telemetry timeline;
 - raw `/healthz` JSON snapshots in JSONL;
@@ -63,7 +66,8 @@ The automatic acceptance checks require:
 - at least 95% runtime liveness;
 - at least 90% validated hardware-perf coverage;
 - at least 90% package-temperature coverage;
-- at least one valid SIMD-width observation.
+- at least one valid SIMD-width observation;
+- at least one observed AVX-512 sample on the AVX-512-labelled lane.
 
 These are minimum evidence-quality checks, not universal thermal-performance SLOs. Deployment-specific temperature, power, throughput and oscillation limits should be evaluated separately.
 
@@ -106,7 +110,7 @@ For perf-related behavior, capture `perf_event_paranoid`, capabilities and the r
 1. Download the `thermal-simd-hil-<sha>` artifact even if the job failed.
 2. Inspect `machine-metadata.txt` first to establish the CPU/kernel/governor/permission context.
 3. Inspect `summary.json` for the failed coverage fraction.
-4. Use `timeline.csv` to determine whether the issue was endpoint availability, perf fallback, missing temperature, or sustained degraded state.
+4. Use `timeline.csv` to determine whether the issue was endpoint availability, perf fallback, missing temperature, missing AVX-512 execution, or sustained degraded state.
 5. Correlate `runtime.log` and `health.jsonl` around the failing timestamps.
 6. If RAPL is present, inspect power changes around width transitions; if it is absent, do not infer zero power.
 7. Reproduce with a shorter window:
