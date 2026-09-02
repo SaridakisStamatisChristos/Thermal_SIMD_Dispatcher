@@ -114,3 +114,37 @@ int tsd_kernel_dispatch_execute(tsd_kernel_dispatch_t *dispatch,
     }
     return 0;
 }
+
+int tsd_kernel_dispatch_execute_chunked(tsd_kernel_dispatch_t *dispatch,
+                                        size_t total_work_items,
+                                        size_t max_chunk_items,
+                                        simd_width_t *last_used_width) {
+    if (!dispatch || max_chunk_items == 0) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    if (total_work_items == 0) {
+        if (last_used_width) {
+            if (tsd_kernel_dispatch_resolve(dispatch, last_used_width) != 0) {
+                return -1;
+            }
+        }
+        return 0;
+    }
+
+    size_t remaining = total_work_items;
+    simd_width_t last = SIMD_SSE41;
+    while (remaining > 0) {
+        size_t chunk = remaining < max_chunk_items ? remaining : max_chunk_items;
+        if (tsd_kernel_dispatch_execute(dispatch, chunk, &last) != 0) {
+            return -1;
+        }
+        remaining -= chunk;
+    }
+
+    if (last_used_width) {
+        *last_used_width = last;
+    }
+    return 0;
+}
