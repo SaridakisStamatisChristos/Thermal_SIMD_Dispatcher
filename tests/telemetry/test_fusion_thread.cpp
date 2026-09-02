@@ -6,8 +6,11 @@
 
 #include <telemetry/fusion.h>
 #include <thermal/simd/telemetry_fusion.h>
+#include <thermal/simd/thermal_config.h>
 
-int main() {
+namespace {
+
+void test_cpp_fusion() {
     using namespace telemetry;
 
     TelemetryFusionConfig config;
@@ -47,7 +50,6 @@ int main() {
     fusion.register_collector(std::make_shared<PerfCollector>(config.poll_interval, perf_provider, 1));
     fusion.register_collector(std::make_shared<MsrCollector>(config.poll_interval, temp_provider, 1));
     fusion.register_collector(std::make_shared<RaplCollector>(config.poll_interval * 2, rapl_provider, 1));
-
     fusion.start();
 
     auto snapshot = fusion.wait_for_snapshot(1, std::chrono::milliseconds(200));
@@ -68,30 +70,69 @@ int main() {
     assert(degraded->generation > snapshot->generation);
     assert(!degraded->temp_available);
     assert(degraded->degraded);
-
     fusion.stop();
+}
 
-    /*
-     * Exercise the actual C production bridge. An explicitly published direct
-     * sample must survive the bridge/fusion boundary with its units intact.
-     */
-    assert(tsd_telemetry_fusion_start() == 0);
-    tsd_telemetry_sample_t direct{};
-    direct.temp_available = 1;
-    direct.package_temp_millic = 81250;
-    direct.freq_ratio_available = 1;
-    direct.freq_ratio_milli = 875;
-    assert(tsd_telemetry_fusion_publish_sample(&direct) == 0);
+void test_bridge_raw_safety_vs_filtered_control() {
+    tsd_runtime_config_set_defaults(&g_tsd_config);
+    g_tsd_config.telemetry_interval_ms = 10;
+    g_tsd_config.telemetry_max_skew_ms = 1000;
+    g_tsd_config.telemetry_ewma_alpha = 0.25;
 
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    tsd_telemetry_fusion_test_disable_direct_helper(1);
+    assert(tsd_telemetry_fusion_start_for_cpu(0) == 0);
 
-    tsd_telemetry_sample_t bridged{};
-    assert(tsd_telemetry_fusion_sample(&bridged) == 0);
-    assert(bridged.temp_available == 1);
-    assert(bridged.package_temp_millic == 81250);
-    assert(bridged.freq_ratio_available == 1);
-    assert(bridged.freq_ratio_milli == 875);
+    tsd_telemetry_sample_t sample{};
+    sample.temp_available = 1;
+    sample.package_temp_millic = 60000;
+    sample.freq_ratio_available = 1;
+    sample.freq_ratio_milli = 1000;
+    assert(tsd_telemetry_fusion_publish_sample(&sample) == 0);
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+
+    tsd_telemetry_sample_t first{};
+    assert(tsd_telemetry_fusion_sample(&first) == 0);
+    assert(first.temp_available == 1);
+    assert(first.package_temp_millic == 60000);
+    assert(first.filtered_temp_available == 1);
+    assert(first.filtered_package_temp_millic == 60000);
+
+    /* A thermal spike is immediate on the safety channel, smoothed only for control. */
+    sample.package_temp_millic = 100000;
+    assert(tsd_telemetry_fusion_publish_sample(&sample) == 0);
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+
+    tsd_telemetry_sample_t spike{};
+    assert(tsd_telemetry_fusion_sample(&spike) == 0);
+    assert(spike.temp_available == 1);
+    assert(spike.package_temp_millic == 100000);
+    assert(spike.filtered_temp_available == 1);
+    assert(spike.filtered_package_temp_millic > 60000);
+    assert(spike.filtered_package_temp_millic < 100000);
     tsd_telemetry_fusion_stop();
 
+    /* alpha=0 is an explicit bypass, never a frozen first sample. */
+    g_tsd_config.telemetry_ewma_alpha = 0.0;
+    assert(tsd_telemetry_fusion_start_for_cpu(0) == 0);
+    sample.package_temp_millic = 60000;
+    assert(tsd_telemetry_fusion_publish_sample(&sample) == 0);
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    sample.package_temp_millic = 100000;
+    assert(tsd_telemetry_fusion_publish_sample(&sample) == 0);
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+
+    tsd_telemetry_sample_t bypass{};
+    assert(tsd_telemetry_fusion_sample(&bypass) == 0);
+    assert(bypass.package_temp_millic == 100000);
+    assert(bypass.filtered_package_temp_millic == 100000);
+    tsd_telemetry_fusion_stop();
+    tsd_telemetry_fusion_test_disable_direct_helper(0);
+}
+
+}  // namespace
+
+int main() {
+    test_cpp_fusion();
+    test_bridge_raw_safety_vs_filtered_control();
     return 0;
 }
