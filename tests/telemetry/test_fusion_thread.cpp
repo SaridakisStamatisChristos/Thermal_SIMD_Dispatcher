@@ -27,7 +27,7 @@ int main() {
         return sample;
     };
 
-    std::atomic<double> freq_value{2400.0};
+    std::atomic<double> freq_value{875.0};
     PerfSampleProvider perf_provider = [&]() {
         PerfSample sample{};
         sample.thermal_cpi = 1200.0;
@@ -58,7 +58,7 @@ int main() {
     assert(snapshot->power_available);
     assert(!snapshot->degraded);
     assert(snapshot->package_temp_c > 70.0);
-    assert(snapshot->freq_ratio >= 2000.0);
+    assert(snapshot->freq_ratio >= 800.0 && snapshot->freq_ratio <= 1200.0);
     assert(snapshot->thermal_cpi >= 1000.0);
     assert(snapshot->power_budget_w > 0.0);
 
