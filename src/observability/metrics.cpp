@@ -32,6 +32,7 @@
 namespace {
 
 using Clock = std::chrono::system_clock;
+using FreshnessClock = std::chrono::steady_clock;
 constexpr size_t kMaxRequestBytes = 8192;
 constexpr size_t kClientQueueLimit = 32;
 constexpr size_t kWorkerCount = 4;
@@ -306,9 +307,6 @@ public:
         for (size_t i = 0; i < kWorkerCount; ++i) {
             workers_.emplace_back(&PrometheusExporter::worker_loop, this);
         }
-        // The accept thread owns a stable descriptor value for its lifetime.
-        // stop() only shuts it down to wake accept(); the descriptor is closed
-        // after the accept thread has joined, eliminating close/reuse races.
         server_thread_ = std::thread(&PrometheusExporter::serve, this, fd);
         return 0;
     }
@@ -323,8 +321,6 @@ public:
             observability::StatsdExporter::instance().shutdown();
             listener_fd = listen_fd_;
             if (listener_fd >= 0) {
-                // Wake a blocking accept() without invalidating/reusing the fd
-                // while the accept thread can still reference it.
                 (void)::shutdown(listener_fd, SHUT_RDWR);
             }
             accept_thread = std::move(server_thread_);
@@ -519,20 +515,20 @@ private:
         auto controller = observability::TelemetryState::instance().controller_snapshot();
         auto fusion = observability::TelemetryState::instance().fusion_snapshot();
         auto perf = observability::TelemetryState::instance().perf_snapshot();
-        auto now = std::chrono::system_clock::now();
-        bool controller_recent = controller.updated_at.time_since_epoch().count() != 0 &&
-                                 now >= controller.updated_at &&
-                                 (now - controller.updated_at) <= std::chrono::seconds(5);
-        bool fusion_recent = fusion.updated_at.time_since_epoch().count() != 0 &&
-                             now >= fusion.updated_at &&
-                             (now - fusion.updated_at) <= std::chrono::seconds(5);
-        bool perf_healthy = perf.mode == 1 && perf.counters_healthy;
-        return controller_recent && fusion_recent && !controller.fallback_active &&
-               fusion.running && !fusion.degraded && perf_healthy;
+        const auto now = FreshnessClock::now();
+        const auto freshness = std::chrono::seconds(5);
+        const auto recent = [&](FreshnessClock::time_point updated) {
+            return updated.time_since_epoch().count() != 0 && now >= updated && (now - updated) <= freshness;
+        };
+        const bool controller_recent = recent(controller.freshness_at);
+        const bool fusion_recent = recent(fusion.freshness_at);
+        const bool perf_recent = recent(perf.freshness_at);
+        const bool perf_healthy = perf.mode == 1 && perf.counters_healthy;
+        return controller_recent && fusion_recent && perf_recent &&
+               !controller.fallback_active && fusion.running && !fusion.degraded && perf_healthy;
     }
 
     bool health_ok() const {
-        /* If this handler is serving the request, the process/exporter is live. */
         return running_.load(std::memory_order_acquire);
     }
 
