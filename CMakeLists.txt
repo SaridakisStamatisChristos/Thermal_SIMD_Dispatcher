@@ -53,6 +53,7 @@ set(THERMAL_SIMD_CORE_SOURCES
 )
 
 add_library(thermal_simd_core STATIC ${THERMAL_SIMD_CORE_SOURCES})
+set_target_properties(thermal_simd_core PROPERTIES EXPORT_NAME simd)
 target_include_directories(thermal_simd_core
     PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
