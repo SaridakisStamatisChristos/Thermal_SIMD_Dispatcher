@@ -88,8 +88,8 @@ static void workload_loop(int iterations) {
 static void print_configuration(simd_width_t max_width) TSD_MAYBE_UNUSED;
 static void print_configuration(simd_width_t max_width) {
     const char *max_width_str = (max_width == SIMD_AVX512)
-        ? "AVX-512 (XMM-only)"
-        : (max_width == SIMD_AVX2 ? "AVX2 (XMM-only)" : "SSE4.1");
+        ? "AVX-512 (512-bit)"
+        : (max_width == SIMD_AVX2 ? "AVX2 (256-bit)" : "SSE4.1 (128-bit)");
     tsd_log_info(LOG_COMPONENT, "Maximum supported: %s%s",
                  max_width_str,
                  g_tsd_config.allow_avx512 ? "" : " [AVX-512 disabled by policy]");
