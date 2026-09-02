@@ -19,6 +19,7 @@ void TelemetryState::update_controller(const tsd_controller_telemetry_t *telemet
     controller_.recommended_width = telemetry->recommended_width;
     controller_.issued_change = telemetry->issued_change != 0;
     controller_.updated_at = std::chrono::system_clock::now();
+    controller_.freshness_at = std::chrono::steady_clock::now();
 }
 
 void TelemetryState::update_fusion(const tsd_fusion_telemetry_t *telemetry) {
@@ -37,6 +38,7 @@ void TelemetryState::update_fusion(const tsd_fusion_telemetry_t *telemetry) {
     fusion_.power_available = telemetry->power_available != 0;
     fusion_.power_budget_w = telemetry->power_budget_w;
     fusion_.updated_at = std::chrono::system_clock::now();
+    fusion_.freshness_at = std::chrono::steady_clock::now();
 }
 
 void TelemetryState::update_perf(const tsd_perf_telemetry_t *telemetry) {
@@ -49,6 +51,7 @@ void TelemetryState::update_perf(const tsd_perf_telemetry_t *telemetry) {
     perf_.pinned_cpu = telemetry->pinned_cpu;
     perf_.monitor_cpu = telemetry->monitor_cpu;
     perf_.updated_at = std::chrono::system_clock::now();
+    perf_.freshness_at = std::chrono::steady_clock::now();
 }
 
 ControllerTelemetrySnapshot TelemetryState::controller_snapshot() const {
