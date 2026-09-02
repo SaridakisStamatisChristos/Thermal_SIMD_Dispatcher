@@ -23,6 +23,7 @@ typedef struct {
     int memory_guard_divisor;
     int memory_guard_offset_milli;
     int demo_duration_sec;
+    int run_forever;
     int work_iters;
     int cooldown_down_ticks;
     int cooldown_up_ticks;
