@@ -333,7 +333,7 @@ tsd_patch_slot_t* build_test_override_slot(const std::array<uint8_t, TSD_TRAMPOL
 
 extern "C" {
 
-tsd_trampoline_ctx_t g_tsd_trampoline_ctx = {0};
+tsd_trampoline_ctx_t g_tsd_trampoline_ctx = {};
 pthread_mutex_t g_tsd_patch_lock = PTHREAD_MUTEX_INITIALIZER;
 std::atomic<simd_width_t> g_tsd_current_width{SIMD_SSE41};
 std::atomic<unsigned char> g_tsd_current_width_byte{static_cast<unsigned char>(SIMD_SSE41)};

@@ -20,12 +20,27 @@ extern "C" {
  */
 typedef void (*tsd_kernel_fn)(void *context, size_t work_items);
 
+/*
+ * Offset-aware, fallible callback used by the v2 interface. Returning zero
+ * reports that the complete [offset, offset + work_items) range was processed.
+ * A non-zero return is propagated to the caller and is not included in the
+ * software-work counter.
+ */
+typedef int (*tsd_kernel_fn_v2)(void *context, size_t offset, size_t work_items);
+
 typedef struct tsd_kernel_variants_s {
     tsd_kernel_fn sse41;
     tsd_kernel_fn avx2;
     tsd_kernel_fn avx512;
     void *context;
 } tsd_kernel_variants_t;
+
+typedef struct tsd_kernel_variants_v2_s {
+    tsd_kernel_fn_v2 sse41;
+    tsd_kernel_fn_v2 avx2;
+    tsd_kernel_fn_v2 avx512;
+    void *context;
+} tsd_kernel_variants_v2_t;
 
 typedef struct tsd_kernel_dispatch tsd_kernel_dispatch_t;
 
@@ -66,6 +81,28 @@ int tsd_kernel_dispatch_execute_chunked(tsd_kernel_dispatch_t *dispatch,
 /* Resolve without executing; useful for diagnostics and tests. */
 int tsd_kernel_dispatch_resolve(const tsd_kernel_dispatch_t *dispatch,
                                 simd_width_t *resolved_width);
+
+/*
+ * Safer offset-aware API. The legacy API above remains ABI/source compatible.
+ * One dispatch object must not be destroyed while any execution is in flight;
+ * the caller also owns and synchronizes the context for its complete lifetime.
+ */
+typedef struct tsd_kernel_dispatch_v2 tsd_kernel_dispatch_v2_t;
+
+int tsd_kernel_dispatch_v2_create(const tsd_kernel_variants_v2_t *variants,
+                                  tsd_kernel_dispatch_v2_t **out_dispatch);
+void tsd_kernel_dispatch_v2_destroy(tsd_kernel_dispatch_v2_t *dispatch);
+int tsd_kernel_dispatch_v2_resolve(const tsd_kernel_dispatch_v2_t *dispatch,
+                                   simd_width_t *resolved_width);
+int tsd_kernel_dispatch_v2_execute(tsd_kernel_dispatch_v2_t *dispatch,
+                                   size_t offset,
+                                   size_t work_items,
+                                   simd_width_t *used_width);
+int tsd_kernel_dispatch_v2_execute_chunked(tsd_kernel_dispatch_v2_t *dispatch,
+                                           size_t initial_offset,
+                                           size_t total_work_items,
+                                           size_t max_chunk_items,
+                                           simd_width_t *last_used_width);
 
 #ifdef __cplusplus
 }

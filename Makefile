@@ -1,7 +1,7 @@
 CXX ?= g++
 CC ?= gcc
 PKG_CONFIG ?= pkg-config
-ARCHFLAGS ?=
+ARCHFLAGS ?= -msse4.1
 
 OPENSSL_CFLAGS ?= $(shell $(PKG_CONFIG) --cflags openssl 2>/dev/null)
 OPENSSL_LIBS ?= $(shell $(PKG_CONFIG) --libs openssl 2>/dev/null)
@@ -15,7 +15,8 @@ CXXFLAGS ?= -O2 -pthread -fPIC -mno-avx -std=c++17 -Wall -Wextra -Wshadow -Wconv
 LDFLAGS ?= -pthread
 LDLIBS ?= $(OPENSSL_LIBS)
 
-BIN := thermal_simd
+BUILD_DIR ?= build-make
+BIN := $(BUILD_DIR)/thermal_simd
 
 CORE_C := \
 	src/config/runtime_flags.c \
@@ -58,8 +59,8 @@ APP_CPP := src/main.cpp
 
 SRC_C := $(CORE_C) $(APP_C)
 SRC_CPP := $(CORE_CPP) $(APP_CPP)
-OBJ_C := $(SRC_C:.c=.o)
-OBJ_CPP := $(SRC_CPP:.cpp=.o)
+OBJ_C := $(addprefix $(BUILD_DIR)/,$(SRC_C:.c=.o))
+OBJ_CPP := $(addprefix $(BUILD_DIR)/,$(SRC_CPP:.cpp=.o))
 OBJ := $(OBJ_C) $(OBJ_CPP)
 
 .PHONY: all clean run check-deps
@@ -72,17 +73,19 @@ check-deps:
 $(BIN): $(OBJ)
 	$(CXX) $(CXXFLAGS) $(ARCHFLAGS) $(LDFLAGS) -o $@ $(OBJ) $(LDLIBS)
 
-src/thermal_simd.o: CPPFLAGS += -DTSD_RUNTIME_INTERNAL_IMPL
-src/patcher/trampoline.o: CPPFLAGS += -DTSD_TRAMPOLINE_INTERNAL_IMPL
+$(BUILD_DIR)/src/thermal_simd.o: CPPFLAGS += -DTSD_RUNTIME_INTERNAL_IMPL
+$(BUILD_DIR)/src/patcher/trampoline.o: CPPFLAGS += -DTSD_TRAMPOLINE_INTERNAL_IMPL
 
-%.o: %.c
+$(BUILD_DIR)/%.o: %.c
+	@mkdir -p $(dir $@)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(ARCHFLAGS) -c $< -o $@
 
-%.o: %.cpp
+$(BUILD_DIR)/%.o: %.cpp
+	@mkdir -p $(dir $@)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(ARCHFLAGS) -c $< -o $@
 
 run: $(BIN)
 	./$(BIN)
 
 clean:
-	rm -f $(BIN) $(OBJ)
+	rm -rf $(BUILD_DIR)
