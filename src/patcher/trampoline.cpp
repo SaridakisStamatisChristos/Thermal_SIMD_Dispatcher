@@ -25,6 +25,7 @@ extern "C" {
 #include <cstdio>
 #include <cstring>
 #include <iomanip>
+#include <mutex>
 #include <sstream>
 #include <vector>
 
@@ -43,18 +44,6 @@ constexpr uint32_t kEnbr64 = 0xFA1E0FF3u;
 constexpr size_t kWidthCount = 3;
 constexpr size_t kSlotStride = alignof(tsd_patch_slot_t);
 
-/*
- * The dispatcher now builds every implementation exactly once on an RW,
- * non-executable page and seals the whole page RX before it can be selected.
- * Runtime transitions only atomically switch a pointer between immutable RX
- * slots. There is therefore no RWX transition window and no retired-page reuse
- * race for readers that have already loaded a slot pointer.
- *
- * The AVX2 and AVX-512 payloads intentionally execute native-width YMM/ZMM
- * operations instead of merely changing the encoding of an XMM operation.
- * Inputs are broadcast from the scalar ABI so the demo result remains exactly
- * compatible with the legacy int32_t shim.
- */
 static const std::array<uint8_t, TSD_TRAMPOLINE_SLOT_SIZE> kPatchSse41 = {
     0xF3, 0x0F, 0x1E, 0xFA,
     0x66, 0x0F, 0x70, 0xC0, 0x00,
@@ -93,7 +82,8 @@ static_assert(kSlotStride >= TSD_TRAMPOLINE_SLOT_SIZE, "slot alignment must cove
 std::array<tsd_patch_slot_t*, kWidthCount> g_slots{nullptr, nullptr, nullptr};
 std::array<uint8_t, TSD_ATTESTATION_HASH_SIZE> g_active_hash{};
 std::atomic<bool> g_active_hash_valid{false};
-char g_attestation_last_error[256] = {0};
+std::mutex g_attestation_mutex;
+thread_local char g_attestation_last_error[256] = {0};
 
 #ifdef TSD_ENABLE_TESTS
 const uint8_t *g_test_patch_override[kWidthCount] = {nullptr, nullptr, nullptr};
@@ -102,6 +92,18 @@ char g_test_last_patch_error[256] = {0};
 std::vector<void*> g_test_override_pages;
 int g_test_force_failure_stage = TSD_PATCH_FAIL_NONE;
 #endif
+
+class PthreadLockGuard {
+public:
+    explicit PthreadLockGuard(pthread_mutex_t *mutex) : mutex_(mutex) {
+        pthread_mutex_lock(mutex_);
+    }
+    ~PthreadLockGuard() { pthread_mutex_unlock(mutex_); }
+    PthreadLockGuard(const PthreadLockGuard &) = delete;
+    PthreadLockGuard &operator=(const PthreadLockGuard &) = delete;
+private:
+    pthread_mutex_t *mutex_;
+};
 
 const std::array<uint8_t, TSD_TRAMPOLINE_SLOT_SIZE>* canonical_patch(simd_width_t width) {
     switch (width) {
@@ -198,9 +200,28 @@ bool mapping_is_rx_not_writable(const void *address) {
     return ok;
 }
 
+void discard_code_page(void *page, size_t pagesize) {
+    if (page && page != MAP_FAILED && pagesize > 0) {
+        munmap(page, pagesize);
+    }
+    g_tsd_trampoline_ctx.page_a = nullptr;
+    g_tsd_trampoline_ctx.page_b = nullptr;
+    g_tsd_trampoline_ctx.page_size = 0;
+    g_tsd_trampoline_ctx.page_a_prot = PROT_NONE;
+    g_tsd_trampoline_ctx.page_b_prot = PROT_NONE;
+    g_tsd_trampoline_ctx.active = nullptr;
+    g_tsd_trampoline_ctx.inactive = nullptr;
+    for (auto &slot : g_slots) {
+        slot = nullptr;
+    }
+    std::atomic_store_explicit(&g_tsd_page_a_effective_writable, false, std::memory_order_release);
+    std::atomic_store_explicit(&g_tsd_page_b_effective_writable, false, std::memory_order_release);
+}
+
 void update_attestation_hash(const tsd_patch_slot_t *slot) {
+    std::lock_guard<std::mutex> lock(g_attestation_mutex);
+    g_active_hash_valid.store(false, std::memory_order_release);
     if (!slot) {
-        g_active_hash_valid.store(false, std::memory_order_release);
         std::snprintf(g_attestation_last_error, sizeof(g_attestation_last_error), "%s", "null slot");
         return;
     }
@@ -251,8 +272,7 @@ int build_canonical_code_page() {
         simd_width_t width = static_cast<simd_width_t>(i);
         const auto *patch = canonical_patch(width);
         if (!patch || !has_enbr64_prefix(patch->data(), patch->size())) {
-            munmap(page, pagesize);
-            g_tsd_trampoline_ctx.page_a = nullptr;
+            discard_code_page(page, pagesize);
             set_error("invalid canonical trampoline payload", EINVAL);
             return -1;
         }
@@ -263,11 +283,7 @@ int build_canonical_code_page() {
     serialize_instruction_stream();
     if (mprotect(page, pagesize, PROT_READ | PROT_EXEC) != 0) {
         int err = errno;
-        munmap(page, pagesize);
-        g_tsd_trampoline_ctx.page_a = nullptr;
-        for (auto &slot : g_slots) {
-            slot = nullptr;
-        }
+        discard_code_page(page, pagesize);
         set_error("mprotect(trampoline table RX)", err);
         return -1;
     }
@@ -276,6 +292,7 @@ int build_canonical_code_page() {
     std::atomic_store_explicit(&g_tsd_page_a_effective_writable, false, std::memory_order_release);
 
     if (!mapping_is_rx_not_writable(page)) {
+        discard_code_page(page, pagesize);
         set_error("trampoline table failed RX verification", EPERM);
         return -1;
     }
@@ -343,7 +360,10 @@ int tsd_trampoline_init(void) {
     std::atomic_store_explicit(&g_tsd_trampoline_initialized, 0, std::memory_order_release);
     std::atomic_store_explicit(&g_tsd_last_patch_attempt, static_cast<unsigned char>(SIMD_SSE41), std::memory_order_release);
     std::atomic_store_explicit(&g_tsd_last_patched_width, static_cast<unsigned char>(SIMD_SSE41), std::memory_order_release);
-    g_active_hash_valid.store(false, std::memory_order_release);
+    {
+        std::lock_guard<std::mutex> hash_lock(g_attestation_mutex);
+        g_active_hash_valid.store(false, std::memory_order_release);
+    }
 
     pthread_mutex_unlock(&g_tsd_patch_lock);
     return 0;
@@ -381,7 +401,6 @@ int tsd_trampoline_patch(simd_width_t new_width) {
             break;
         }
         if (g_test_force_failure_stage == TSD_PATCH_FAIL_PKU_WINDOW) {
-            /* PKU is intentionally not used by the immutable W^X design. */
             g_test_force_failure_stage = TSD_PATCH_FAIL_NONE;
         }
 #endif
@@ -430,6 +449,7 @@ int tsd_trampoline_patch(simd_width_t new_width) {
 }
 
 int tsd_trampoline_self_validate(char *reason, size_t reason_len) {
+    PthreadLockGuard patch_guard(&g_tsd_patch_lock);
     if (reason && reason_len > 0) {
         reason[0] = '\0';
     }
@@ -529,6 +549,8 @@ int tsd_attestation_get_active_hash(uint8_t *buffer, size_t len) {
         std::snprintf(g_attestation_last_error, sizeof(g_attestation_last_error), "%s", "buffer too small");
         return -1;
     }
+    PthreadLockGuard patch_guard(&g_tsd_patch_lock);
+    std::lock_guard<std::mutex> hash_lock(g_attestation_mutex);
     if (!g_active_hash_valid.load(std::memory_order_acquire)) {
         std::snprintf(g_attestation_last_error, sizeof(g_attestation_last_error), "%s", "hash unavailable");
         return -1;
@@ -542,6 +564,8 @@ int tsd_attestation_get_active_hash_hex(char *buffer, size_t len) {
         std::snprintf(g_attestation_last_error, sizeof(g_attestation_last_error), "%s", "hex buffer too small");
         return -1;
     }
+    PthreadLockGuard patch_guard(&g_tsd_patch_lock);
+    std::lock_guard<std::mutex> hash_lock(g_attestation_mutex);
     if (!g_active_hash_valid.load(std::memory_order_acquire)) {
         std::snprintf(g_attestation_last_error, sizeof(g_attestation_last_error), "%s", "hash unavailable");
         return -1;
@@ -558,6 +582,8 @@ int tsd_attestation_expect_active_hash(const uint8_t *expected, size_t len) {
         std::snprintf(g_attestation_last_error, sizeof(g_attestation_last_error), "%s", "expected hash invalid");
         return -1;
     }
+    PthreadLockGuard patch_guard(&g_tsd_patch_lock);
+    std::lock_guard<std::mutex> hash_lock(g_attestation_mutex);
     if (!g_active_hash_valid.load(std::memory_order_acquire)) {
         std::snprintf(g_attestation_last_error, sizeof(g_attestation_last_error), "%s", "hash unavailable");
         return -1;
