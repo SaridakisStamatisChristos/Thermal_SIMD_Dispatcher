@@ -15,10 +15,18 @@ typedef struct {
     uint64_t severity_milli;
     uint64_t thermal_severity_milli;
     int memory_bound;
+
+    /* Authoritative raw safety channel. */
     int temp_available;
     int freq_ratio_available;
     int32_t package_temp_millic;
     uint32_t freq_ratio_milli;
+
+    /* Optional filtered control/forecast channel. */
+    int filtered_temp_available;
+    int filtered_freq_ratio_available;
+    int32_t filtered_package_temp_millic;
+    uint32_t filtered_freq_ratio_milli;
 } tsd_thermal_eval_t;
 
 #ifdef __cplusplus

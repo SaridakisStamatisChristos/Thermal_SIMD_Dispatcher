@@ -19,6 +19,7 @@ BIN := thermal_simd
 
 CORE_C := \
 	src/config/runtime_flags.c \
+	src/dispatch/adaptive_dispatch.c \
 	src/logging.c \
 	src/config_parser.c \
 	src/third_party/jsmn.c \

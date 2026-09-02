@@ -76,8 +76,46 @@ jobs:
           UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
         run: ctest --test-dir build-sanitize --output-on-failure -E "stress_signal_storm_smoke"
 
+  thread-sanitizer:
+    name: Clang TSan / concurrency
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang cmake ninja-build libssl-dev
+
+      - name: Configure ThreadSanitizer
+        env:
+          CC: clang
+          CXX: clang++
+        run: |
+          cmake -S . -B build-tsan -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DBUILD_TESTING=ON \
+            -DCMAKE_C_FLAGS="-fsanitize=thread -fno-omit-frame-pointer -O1" \
+            -DCMAKE_CXX_FLAGS="-fsanitize=thread -fno-omit-frame-pointer -O1" \
+            -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=thread"
+
+      - name: Build focused concurrency targets
+        run: |
+          cmake --build build-tsan --target \
+            test_telemetry_fusion_stress \
+            test_observability_metrics \
+            test_adaptive_dispatch -j2
+
+      - name: Run focused TSan suite
+        env:
+          TSAN_OPTIONS: halt_on_error=1:history_size=7
+        run: |
+          ctest --test-dir build-tsan --output-on-failure \
+            -R "^(telemetry_fusion_stress|observability_metrics|adaptive_dispatch)$"
+
   packaging:
-    name: Make + install + container
+    name: Make + install + consumer + container
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -105,6 +143,16 @@ jobs:
           test -x stage/bin/thermal_simd
           test -f stage/etc/thermal-simd/controller_coeffs.json
           test -f stage/include/thermal/simd/thermal_trampoline.h
+          test -f stage/include/thermal/simd/adaptive_dispatch.h
+          test -f stage/lib/cmake/thermal_simd_dispatcher/thermal_simd_dispatcherConfig.cmake
+
+      - name: Build external installed-package consumer
+        run: |
+          cmake -S tests/consumer -B build-consumer -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_PREFIX_PATH="$PWD/stage"
+          cmake --build build-consumer -j2
+          ./build-consumer/thermal_simd_consumer
 
       - name: Build container image
         run: docker build -f packaging/Dockerfile -t thermal-simd:ci .

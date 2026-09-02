@@ -44,9 +44,9 @@ int tsd_perf_get_monitor_cpu(const perf_ctx_t *ctx);
 int tsd_perf_check_software_timeout(perf_ctx_t *ctx, int timeout_sec);
 
 /*
- * Wider SIMD authorization must be checked continuously, not only when the
- * runtime first falls back. Hardware mode is always eligible; software mode
- * is eligible only under the explicit TSD_ALLOW_SOFTWARE_UPGRADES override.
+ * Wider SIMD authorization must be checked continuously. Hardware mode is
+ * eligible only after a fresh, running perf baseline has been validated;
+ * software mode is eligible only under TSD_ALLOW_SOFTWARE_UPGRADES.
  */
 int tsd_perf_upgrades_allowed(const perf_ctx_t *ctx);
 
@@ -83,6 +83,14 @@ uint64_t tsd_perf_test_get_baseline_cpi(const perf_ctx_t *ctx);
 uint64_t tsd_perf_test_get_baseline_mpki(const perf_ctx_t *ctx);
 int tsd_perf_test_get_last_group_valid(const perf_ctx_t *ctx);
 uint64_t tsd_perf_test_get_last_llc_value(const perf_ctx_t *ctx);
+int tsd_perf_test_group_progress_valid(uint64_t before_enabled,
+                                       uint64_t before_running,
+                                       uint64_t before_cycles,
+                                       uint64_t before_insns,
+                                       uint64_t after_enabled,
+                                       uint64_t after_running,
+                                       uint64_t after_cycles,
+                                       uint64_t after_insns);
 #endif
 
 #ifdef __cplusplus

@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       soak_minutes:
-        description: Thermal/stress soak duration in minutes
+        description: Thermal characterization duration in minutes
         required: false
         default: "30"
 
@@ -36,14 +36,35 @@ jobs:
       - name: Telemetry fault stress
         run: build-ci/stress_telemetry_faults --cycles=5
 
-  thermal-soak:
+  thermal-characterization:
     needs: stress-suite
     runs-on: [self-hosted, hil, avx512]
     timeout-minutes: 360
     env:
       SOAK_MINUTES: ${{ inputs.soak_minutes }}
+      HIL_ARTIFACT_DIR: ${{ github.workspace }}/hil-artifacts
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-      - name: Run HIL soak
+
+      - name: Run thermal characterization
         run: ci/thermal-soak.sh
+
+      - name: Publish characterization summary
+        if: always()
+        run: |
+          if [ -f hil-artifacts/summary.md ]; then
+            cat hil-artifacts/summary.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "# Thermal SIMD HIL characterization" >> "$GITHUB_STEP_SUMMARY"
+            echo "Characterization did not produce a summary; inspect the uploaded logs." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload HIL evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: thermal-simd-hil-${{ github.sha }}
+          path: hil-artifacts/
+          if-no-files-found: warn
+          retention-days: 30

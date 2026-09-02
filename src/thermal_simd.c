@@ -112,6 +112,73 @@ static void workload_loop(int iterations) {
     }
 }
 
+typedef struct {
+    uint64_t iterations;
+    uint64_t elapsed_ns;
+} tsd_demo_result_t;
+
+static uint64_t monotonic_elapsed_ns(const struct timespec *start, const struct timespec *end) {
+    if (!start || !end) {
+        return 0;
+    }
+    time_t sec = end->tv_sec - start->tv_sec;
+    long nsec = end->tv_nsec - start->tv_nsec;
+    if (nsec < 0) {
+        sec -= 1;
+        nsec += 1000000000L;
+    }
+    if (sec < 0) {
+        return 0;
+    }
+    return (uint64_t)sec * UINT64_C(1000000000) + (uint64_t)nsec;
+}
+
+static tsd_demo_result_t run_workload_for_duration(int duration_sec, int batch_iterations) {
+    tsd_demo_result_t result = {0};
+    if (duration_sec <= 0 || batch_iterations <= 0) {
+        return result;
+    }
+
+    struct timespec start = {0};
+    struct timespec now = {0};
+    if (clock_gettime(CLOCK_MONOTONIC, &start) != 0) {
+        tsd_log_error("runtime", "CLOCK_MONOTONIC unavailable; cannot honor --duration-sec");
+        return result;
+    }
+
+    uint64_t before = atomic_load_explicit(&g_tsd_workload_iterations, memory_order_relaxed);
+    const uint64_t target_ns = (uint64_t)duration_sec * UINT64_C(1000000000);
+    do {
+        workload_loop(batch_iterations);
+        if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
+            break;
+        }
+        result.elapsed_ns = monotonic_elapsed_ns(&start, &now);
+    } while (result.elapsed_ns < target_ns);
+
+    if (result.elapsed_ns == 0 && clock_gettime(CLOCK_MONOTONIC, &now) == 0) {
+        result.elapsed_ns = monotonic_elapsed_ns(&start, &now);
+    }
+    uint64_t after = atomic_load_explicit(&g_tsd_workload_iterations, memory_order_relaxed);
+    result.iterations = after - before;
+    return result;
+}
+
+static void log_demo_result(const tsd_demo_result_t *result) {
+    if (!result) {
+        return;
+    }
+    uint64_t throughput = 0;
+    if (result->elapsed_ns > 0) {
+        throughput = (uint64_t)(((__uint128_t)result->iterations * UINT64_C(1000000000)) /
+                                result->elapsed_ns);
+    }
+    tsd_log_info("runtime",
+                 "Workload demo complete: elapsed_ms=%" PRIu64 " iterations=%" PRIu64
+                 " throughput_iter_per_sec=%" PRIu64,
+                 result->elapsed_ns / UINT64_C(1000000), result->iterations, throughput);
+}
+
 #define LOG_COMPONENT "runtime"
 
 #ifdef TSD_ENABLE_TESTS
@@ -146,7 +213,7 @@ static void print_configuration(simd_width_t max_width) {
                  g_tsd_config.cooldown_down_ticks,
                  g_tsd_config.cooldown_up_ticks,
                  g_tsd_config.min_dwell_ticks);
-    tsd_log_info(LOG_COMPONENT, "  Demo: %d sec, work iters: %d",
+    tsd_log_info(LOG_COMPONENT, "  Demo: %d wall-clock sec, work batch: %d iterations",
                  g_tsd_config.demo_duration_sec, g_tsd_config.work_iters);
 }
 
@@ -396,11 +463,14 @@ void* thermal_monitor_thread(void *arg) {
 
 static void run_demo(void) TSD_MAYBE_UNUSED;
 static void run_demo(void) {
+    atomic_store_explicit(&g_tsd_running, 1, memory_order_release);
     perf_ctx_t *perf = tsd_perf_init(workload_once);
     if (!perf) {
         tsd_log_warn(LOG_COMPONENT, "Performance monitoring unavailable; running without thermal adaptation.");
         tsd_log_info(LOG_COMPONENT, "Suggestions: run as root, adjust kernel.perf_event_paranoid, or add container capabilities.");
-        workload_loop(100000000);
+        tsd_demo_result_t result = run_workload_for_duration(g_tsd_config.demo_duration_sec,
+                                                             g_tsd_config.work_iters);
+        log_demo_result(&result);
         return;
     }
 
@@ -426,16 +496,12 @@ static void run_demo(void) {
         return;
     }
 
-    tsd_log_info(LOG_COMPONENT, "Running workload for %d seconds (work iterations per tick: %d)",
+    tsd_log_info(LOG_COMPONENT, "Running workload for %d wall-clock seconds (batch iterations: %d)",
                  g_tsd_config.demo_duration_sec, g_tsd_config.work_iters);
     tsd_log_info(LOG_COMPONENT, "Tip: stress-ng --cpu 8 --cpu-load 100 to simulate thermal load");
-    for (int sec = 0; sec < g_tsd_config.demo_duration_sec; sec++) {
-        workload_loop(g_tsd_config.work_iters);
-        if (tsd_log_should_log(TSD_LOG_LEVEL_DEBUG)) {
-            tsd_log_debug(LOG_COMPONENT, "Completed demo second %d/%d", sec + 1, g_tsd_config.demo_duration_sec);
-        }
-    }
-    tsd_log_info(LOG_COMPONENT, "Workload demo complete");
+    tsd_demo_result_t result = run_workload_for_duration(g_tsd_config.demo_duration_sec,
+                                                         g_tsd_config.work_iters);
+    log_demo_result(&result);
     atomic_store_explicit(&g_tsd_running, 0, memory_order_release);
     pthread_join(monitor, NULL);
     tsd_perf_cleanup(perf);

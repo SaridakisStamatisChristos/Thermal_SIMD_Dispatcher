@@ -92,14 +92,19 @@ void MPCController::reset(const tsd_policy_config &config) {
 }
 
 void MPCController::pushSample(const tsd_thermal_eval_t &sample, simd_width_t width) {
-    if (last_prediction_valid_ && sample.temp_available) {
-        double residual = static_cast<double>(sample.package_temp_millic) - last_prediction_millic_;
+    const bool control_temp_valid = sample.filtered_temp_available != 0 || sample.temp_available != 0;
+    const double control_temp = sample.filtered_temp_available
+                                    ? static_cast<double>(sample.filtered_package_temp_millic)
+                                    : static_cast<double>(sample.package_temp_millic);
+
+    if (last_prediction_valid_ && control_temp_valid) {
+        double residual = control_temp - last_prediction_millic_;
         arx_model_.updateResidual(residual);
         double abs_residual = std::fabs(residual);
         std::uint64_t scaled = static_cast<std::uint64_t>(abs_residual + 0.5);
         tsd_metrics_add(TSD_METRIC_PREDICTIVE_ABS_ERROR_MILLIC, scaled);
-        tsd_log_debug("policy", "forecast residual=%.2f (actual=%d predicted=%.2f)", residual,
-                      sample.package_temp_millic, last_prediction_millic_);
+        tsd_log_debug("policy", "forecast residual=%.2f (actual=%.2f predicted=%.2f)", residual,
+                      control_temp, last_prediction_millic_);
     }
     last_prediction_valid_ = false;
 
@@ -107,8 +112,8 @@ void MPCController::pushSample(const tsd_thermal_eval_t &sample, simd_width_t wi
     entry.ratio_milli = static_cast<double>(sample.ratio_milli);
     entry.trimmed_ratio_milli = static_cast<double>(sample.trimmed_ratio_milli);
     entry.severity_milli = static_cast<double>(sample.severity_milli);
-    entry.temperature_millic = static_cast<double>(sample.package_temp_millic);
-    entry.temp_valid = sample.temp_available != 0;
+    entry.temperature_millic = control_temp;
+    entry.temp_valid = control_temp_valid;
     entry.width = width;
     entry.timestamp = std::chrono::steady_clock::now();
     history_.push_back(entry);

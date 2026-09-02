@@ -6,16 +6,20 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 #include <openssl/err.h>
 #include <openssl/ssl.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cctype>
+#include <condition_variable>
 #include <cstdint>
 #include <cstring>
+#include <deque>
 #include <iomanip>
 #include <map>
 #include <mutex>
@@ -28,17 +32,25 @@
 namespace {
 
 using Clock = std::chrono::system_clock;
+constexpr size_t kMaxRequestBytes = 8192;
+constexpr size_t kClientQueueLimit = 32;
+constexpr size_t kWorkerCount = 4;
+constexpr long kClientTimeoutSeconds = 2;
 
 const char *width_to_string(simd_width_t width) {
     switch (width) {
-        case SIMD_SSE41:
-            return "sse41";
-        case SIMD_AVX2:
-            return "avx2";
-        case SIMD_AVX512:
-            return "avx512";
-        default:
-            return "unknown";
+        case SIMD_SSE41: return "sse41";
+        case SIMD_AVX2: return "avx2";
+        case SIMD_AVX512: return "avx512";
+        default: return "unknown";
+    }
+}
+
+const char *perf_mode_to_string(int mode) {
+    switch (mode) {
+        case 1: return "hardware";
+        case 2: return "software";
+        default: return "none";
     }
 }
 
@@ -46,7 +58,8 @@ std::string sanitize_for_statsd(const std::string &value) {
     std::string result;
     result.reserve(value.size());
     for (char ch : value) {
-        if ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '.' || ch == '-' || ch == '_') {
+        if ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+            (ch >= '0' && ch <= '9') || ch == '.' || ch == '-' || ch == '_') {
             result.push_back(ch);
         } else {
             result.push_back('_');
@@ -61,12 +74,8 @@ struct PatchKey {
     bool success;
 
     bool operator<(const PatchKey &other) const {
-        if (from != other.from) {
-            return from < other.from;
-        }
-        if (to != other.to) {
-            return to < other.to;
-        }
+        if (from != other.from) return from < other.from;
+        if (to != other.to) return to < other.to;
         return success < other.success;
     }
 };
@@ -82,9 +91,7 @@ struct SensorKey {
     int socket{0};
 
     bool operator<(const SensorKey &other) const {
-        if (sensor != other.sensor) {
-            return sensor < other.sensor;
-        }
+        if (sensor != other.sensor) return sensor < other.sensor;
         return socket < other.socket;
     }
 };
@@ -104,12 +111,12 @@ public:
     }
 
     void record_patch(simd_width_t from, simd_width_t to, int rc, uint64_t dwell_ms) {
-        const bool success = (rc == 0);
-        std::string statsd_name = std::string("tsd.patch_transition.") + width_to_string(from) + "." + width_to_string(to) + (success ? ".success" : ".failure");
+        const bool success = rc == 0;
+        std::string statsd_name = std::string("tsd.patch_transition.") + width_to_string(from) + "." +
+                                  width_to_string(to) + (success ? ".success" : ".failure");
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            PatchKey key{from, to, success};
-            patch_counts_[key] += 1;
+            patch_counts_[PatchKey{from, to, success}] += 1;
             if (dwell_ms > 0) {
                 DwellStats &stats = dwell_stats_[from];
                 stats.count += 1;
@@ -119,15 +126,13 @@ public:
         }
         observability::StatsdExporter::instance().send_counter(statsd_name, 1);
         if (dwell_ms > 0) {
-            std::string dwell_metric = std::string("tsd.dwell.observed.") + width_to_string(from);
-            observability::StatsdExporter::instance().send_gauge(dwell_metric, static_cast<double>(dwell_ms));
+            observability::StatsdExporter::instance().send_gauge(
+                std::string("tsd.dwell.observed.") + width_to_string(from), static_cast<double>(dwell_ms));
         }
     }
 
     void observe_dwell(simd_width_t width, uint64_t dwell_ms) {
-        if (dwell_ms == 0) {
-            return;
-        }
+        if (dwell_ms == 0) return;
         {
             std::lock_guard<std::mutex> lock(mutex_);
             DwellStats &stats = dwell_stats_[width];
@@ -135,8 +140,8 @@ public:
             stats.total_ms += dwell_ms;
             stats.max_ms = std::max(stats.max_ms, dwell_ms);
         }
-        std::string dwell_metric = std::string("tsd.dwell_time.") + width_to_string(width);
-        observability::StatsdExporter::instance().send_gauge(dwell_metric, static_cast<double>(dwell_ms));
+        observability::StatsdExporter::instance().send_gauge(
+            std::string("tsd.dwell_time.") + width_to_string(width), static_cast<double>(dwell_ms));
     }
 
     void record_sensor_health(const std::string &sensor, int socket, double health, double quality, bool valid) {
@@ -160,7 +165,7 @@ public:
         std::lock_guard<std::mutex> lock(mutex_);
         std::ostringstream body;
 
-        body << "# HELP tsd_patch_transitions_total Dispatcher patch attempts by outcome.\n";
+        body << "# HELP tsd_patch_transitions_total Dispatcher selection attempts by outcome.\n";
         body << "# TYPE tsd_patch_transitions_total counter\n";
         for (const auto &entry : patch_counts_) {
             const PatchKey &key = entry.first;
@@ -175,14 +180,12 @@ public:
             body << "tsd_dwell_time_ms_sum{width=\"" << width_to_string(entry.first)
                  << "\"} " << entry.second.total_ms << "\n";
         }
-
         body << "# HELP tsd_dwell_time_ms_count Number of dwell observations.\n";
         body << "# TYPE tsd_dwell_time_ms_count counter\n";
         for (const auto &entry : dwell_stats_) {
             body << "tsd_dwell_time_ms_count{width=\"" << width_to_string(entry.first)
                  << "\"} " << entry.second.count << "\n";
         }
-
         body << "# HELP tsd_dwell_time_ms_max Maximum dwell time observed.\n";
         body << "# TYPE tsd_dwell_time_ms_max gauge\n";
         for (const auto &entry : dwell_stats_) {
@@ -194,41 +197,32 @@ public:
         body << "# TYPE tsd_sensor_health_ratio gauge\n";
         for (const auto &entry : sensor_state_) {
             body << "tsd_sensor_health_ratio{sensor=\"" << entry.first.sensor
-                 << "\",socket=\"" << entry.first.socket << "\"} "
-                 << entry.second.health << "\n";
+                 << "\",socket=\"" << entry.first.socket << "\"} " << entry.second.health << "\n";
         }
-
         body << "# HELP tsd_sensor_quality_ratio Last reported sensor quality ratio.\n";
         body << "# TYPE tsd_sensor_quality_ratio gauge\n";
         for (const auto &entry : sensor_state_) {
             body << "tsd_sensor_quality_ratio{sensor=\"" << entry.first.sensor
-                 << "\",socket=\"" << entry.first.socket << "\"} "
-                 << entry.second.quality << "\n";
+                 << "\",socket=\"" << entry.first.socket << "\"} " << entry.second.quality << "\n";
         }
-
         body << "# HELP tsd_sensor_health_valid Last reported sensor validity (1=valid).\n";
         body << "# TYPE tsd_sensor_health_valid gauge\n";
         for (const auto &entry : sensor_state_) {
             body << "tsd_sensor_health_valid{sensor=\"" << entry.first.sensor
-                 << "\",socket=\"" << entry.first.socket << "\"} "
-                 << (entry.second.valid ? 1 : 0) << "\n";
+                 << "\",socket=\"" << entry.first.socket << "\"} " << (entry.second.valid ? 1 : 0) << "\n";
         }
-
         body << "# HELP tsd_sensor_health_timestamp_seconds UNIX time of last sensor report.\n";
         body << "# TYPE tsd_sensor_health_timestamp_seconds gauge\n";
         for (const auto &entry : sensor_state_) {
             auto secs = std::chrono::duration_cast<std::chrono::seconds>(entry.second.updated_at.time_since_epoch());
             body << "tsd_sensor_health_timestamp_seconds{sensor=\"" << entry.first.sensor
-                 << "\",socket=\"" << entry.first.socket << "\"} "
-                 << secs.count() << "\n";
+                 << "\",socket=\"" << entry.first.socket << "\"} " << secs.count() << "\n";
         }
-
         return body.str();
     }
 
 private:
     MetricsRegistry() = default;
-
     std::mutex mutex_;
     std::map<PatchKey, uint64_t> patch_counts_;
     std::map<simd_width_t, DwellStats> dwell_stats_;
@@ -267,20 +261,13 @@ public:
 
     int start(const ExporterConfig &config) {
         std::lock_guard<std::mutex> lock(server_mutex_);
-        if (running_) {
-            return -1;
-        }
+        if (running_.load(std::memory_order_acquire)) return -1;
 
         ExporterConfig local_config = config;
-        if (local_config.bind_address.empty()) {
-            local_config.bind_address = "127.0.0.1";
-        }
+        if (local_config.bind_address.empty()) local_config.bind_address = "127.0.0.1";
 
         int fd = ::socket(AF_INET, SOCK_STREAM, 0);
-        if (fd < 0) {
-            return -1;
-        }
-
+        if (fd < 0) return -1;
         int opt = 1;
         (void)::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
@@ -291,12 +278,7 @@ public:
             return -1;
         }
         addr.sin_port = htons(local_config.port);
-
-        if (::bind(fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) != 0) {
-            ::close(fd);
-            return -1;
-        }
-        if (::listen(fd, 16) != 0) {
+        if (::bind(fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) != 0 || ::listen(fd, 32) != 0) {
             ::close(fd);
             return -1;
         }
@@ -307,41 +289,66 @@ public:
             ::close(fd);
             return -1;
         }
-
         if (!initialize_tls(local_config.tls)) {
             ::close(fd);
             return -1;
         }
 
         observability::StatsdExporter::instance().configure(local_config.statsd_host, local_config.statsd_port);
-
         listen_fd_ = fd;
         listen_port_ = ntohs(actual.sin_port);
         bind_address_ = local_config.bind_address;
         config_ = local_config;
-        running_ = true;
-        server_thread_ = std::thread(&PrometheusExporter::serve, this);
+        running_.store(true, std::memory_order_release);
+
+        workers_.clear();
+        workers_.reserve(kWorkerCount);
+        for (size_t i = 0; i < kWorkerCount; ++i) {
+            workers_.emplace_back(&PrometheusExporter::worker_loop, this);
+        }
+        // The accept thread owns a stable descriptor value for its lifetime.
+        // stop() only shuts it down to wake accept(); the descriptor is closed
+        // after the accept thread has joined, eliminating close/reuse races.
+        server_thread_ = std::thread(&PrometheusExporter::serve, this, fd);
         return 0;
     }
 
     void stop() {
-        std::thread local_thread;
+        std::thread accept_thread;
+        std::vector<std::thread> workers;
+        int listener_fd = -1;
         {
             std::lock_guard<std::mutex> lock(server_mutex_);
-            if (!running_) {
-                return;
-            }
-            running_ = false;
+            if (!running_.exchange(false, std::memory_order_acq_rel)) return;
             observability::StatsdExporter::instance().shutdown();
-            if (listen_fd_ >= 0) {
-                ::shutdown(listen_fd_, SHUT_RDWR);
-                ::close(listen_fd_);
-                listen_fd_ = -1;
+            listener_fd = listen_fd_;
+            if (listener_fd >= 0) {
+                // Wake a blocking accept() without invalidating/reusing the fd
+                // while the accept thread can still reference it.
+                (void)::shutdown(listener_fd, SHUT_RDWR);
             }
-            local_thread = std::move(server_thread_);
+            accept_thread = std::move(server_thread_);
+            workers = std::move(workers_);
         }
-        if (local_thread.joinable()) {
-            local_thread.join();
+        {
+            std::lock_guard<std::mutex> lock(client_mutex_);
+            for (int client : clients_) ::close(client);
+            clients_.clear();
+        }
+        client_cv_.notify_all();
+        if (accept_thread.joinable()) accept_thread.join();
+
+        {
+            std::lock_guard<std::mutex> lock(server_mutex_);
+            if (listener_fd >= 0 && listen_fd_ == listener_fd) {
+                ::close(listener_fd);
+                listen_fd_ = -1;
+                listen_port_ = 0;
+            }
+        }
+
+        for (auto &worker : workers) {
+            if (worker.joinable()) worker.join();
         }
         destroy_tls();
     }
@@ -365,28 +372,19 @@ private:
             use_tls_ = false;
             return true;
         }
-
         static std::once_flag init_once;
         std::call_once(init_once, [] { SSL_library_init(); SSL_load_error_strings(); OpenSSL_add_all_algorithms(); });
-
         SSL_CTX *ctx = SSL_CTX_new(TLS_server_method());
-        if (!ctx) {
-            return false;
-        }
+        if (!ctx) return false;
         SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
-        if (SSL_CTX_use_certificate_file(ctx, tls.certificate.c_str(), SSL_FILETYPE_PEM) <= 0) {
+        if (SSL_CTX_use_certificate_file(ctx, tls.certificate.c_str(), SSL_FILETYPE_PEM) <= 0 ||
+            SSL_CTX_use_PrivateKey_file(ctx, tls.key.c_str(), SSL_FILETYPE_PEM) <= 0) {
             SSL_CTX_free(ctx);
             return false;
         }
-        if (SSL_CTX_use_PrivateKey_file(ctx, tls.key.c_str(), SSL_FILETYPE_PEM) <= 0) {
+        if (!tls.ca.empty() && SSL_CTX_load_verify_locations(ctx, tls.ca.c_str(), nullptr) <= 0) {
             SSL_CTX_free(ctx);
             return false;
-        }
-        if (!tls.ca.empty()) {
-            if (SSL_CTX_load_verify_locations(ctx, tls.ca.c_str(), nullptr) <= 0) {
-                SSL_CTX_free(ctx);
-                return false;
-            }
         }
         if (tls.require_client_auth) {
             if (tls.ca.empty()) {
@@ -395,7 +393,6 @@ private:
             }
             SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT, nullptr);
         }
-
         destroy_tls();
         ssl_ctx_ = ctx;
         use_tls_ = true;
@@ -407,6 +404,15 @@ private:
             SSL_CTX_free(ssl_ctx_);
             ssl_ctx_ = nullptr;
         }
+        use_tls_ = false;
+    }
+
+    static void set_client_timeouts(int client) {
+        timeval timeout{};
+        timeout.tv_sec = kClientTimeoutSeconds;
+        timeout.tv_usec = 0;
+        (void)::setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+        (void)::setsockopt(client, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
     }
 
     static std::string base64_decode(const std::string &input) {
@@ -416,16 +422,10 @@ private:
         uint32_t val = 0;
         int valb = -8;
         for (unsigned char c : input) {
-            if (std::isspace(c)) {
-                continue;
-            }
-            if (c == '=') {
-                break;
-            }
+            if (std::isspace(c)) continue;
+            if (c == '=') break;
             auto pos = alphabet.find(c);
-            if (pos == std::string::npos) {
-                return std::string();
-            }
+            if (pos == std::string::npos) return std::string();
             val = (val << 6U) | static_cast<uint32_t>(pos);
             valb += 6;
             if (valb >= 0) {
@@ -436,6 +436,17 @@ private:
         return output;
     }
 
+    static bool constant_time_equal(const std::string &a, const std::string &b) {
+        size_t max_len = std::max(a.size(), b.size());
+        unsigned int diff = static_cast<unsigned int>(a.size() ^ b.size());
+        for (size_t i = 0; i < max_len; ++i) {
+            unsigned char ac = i < a.size() ? static_cast<unsigned char>(a[i]) : 0;
+            unsigned char bc = i < b.size() ? static_cast<unsigned char>(b[i]) : 0;
+            diff |= static_cast<unsigned int>(ac ^ bc);
+        }
+        return diff == 0;
+    }
+
     struct HttpRequest {
         std::string method;
         std::string path;
@@ -443,35 +454,23 @@ private:
     };
 
     static std::optional<HttpRequest> parse_request(const std::string &buffer) {
+        if (buffer.find("\r\n\r\n") == std::string::npos) return std::nullopt;
         HttpRequest request;
         std::istringstream stream(buffer);
         std::string line;
-        if (!std::getline(stream, line)) {
-            return std::nullopt;
-        }
-        if (!line.empty() && line.back() == '\r') {
-            line.pop_back();
-        }
+        if (!std::getline(stream, line)) return std::nullopt;
+        if (!line.empty() && line.back() == '\r') line.pop_back();
         std::istringstream first(line);
-        if (!(first >> request.method >> request.path)) {
-            return std::nullopt;
-        }
+        std::string version;
+        if (!(first >> request.method >> request.path >> version) || version.rfind("HTTP/", 0) != 0) return std::nullopt;
         while (std::getline(stream, line)) {
-            if (!line.empty() && line.back() == '\r') {
-                line.pop_back();
-            }
-            if (line.empty()) {
-                break;
-            }
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            if (line.empty()) break;
             auto colon = line.find(':');
-            if (colon == std::string::npos) {
-                continue;
-            }
+            if (colon == std::string::npos) continue;
             std::string key = line.substr(0, colon);
             std::string value = line.substr(colon + 1);
-            while (!value.empty() && std::isspace(static_cast<unsigned char>(value.front()))) {
-                value.erase(value.begin());
-            }
+            while (!value.empty() && std::isspace(static_cast<unsigned char>(value.front()))) value.erase(value.begin());
             std::transform(key.begin(), key.end(), key.begin(), [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
             request.headers[key] = value;
         }
@@ -482,11 +481,10 @@ private:
         const char *data = payload.data();
         size_t remaining = payload.size();
         while (remaining > 0) {
-            ssize_t sent = ssl ? SSL_write(ssl, data, static_cast<int>(remaining)) : ::send(client, data, remaining, 0);
-            if (sent <= 0) {
-                return false;
-            }
-            data += static_cast<size_t>(sent);
+            int chunk = remaining > static_cast<size_t>(INT32_MAX) ? INT32_MAX : static_cast<int>(remaining);
+            int sent = ssl ? SSL_write(ssl, data, chunk) : static_cast<int>(::send(client, data, static_cast<size_t>(chunk), MSG_NOSIGNAL));
+            if (sent <= 0) return false;
+            data += sent;
             remaining -= static_cast<size_t>(sent);
         }
         return true;
@@ -496,45 +494,60 @@ private:
         std::string buffer;
         buffer.reserve(1024);
         char chunk[512];
-        while (buffer.find("\r\n\r\n") == std::string::npos) {
-            ssize_t received = ssl ? SSL_read(ssl, chunk, sizeof(chunk)) : ::recv(client, chunk, sizeof(chunk), 0);
-            if (received <= 0) {
-                break;
-            }
+        while (buffer.find("\r\n\r\n") == std::string::npos && buffer.size() <= kMaxRequestBytes) {
+            int received = ssl ? SSL_read(ssl, chunk, sizeof(chunk))
+                               : static_cast<int>(::recv(client, chunk, sizeof(chunk), 0));
+            if (received <= 0) break;
             buffer.append(chunk, static_cast<size_t>(received));
-            if (buffer.size() > 8192) {
-                break;
-            }
         }
+        if (buffer.size() > kMaxRequestBytes) return std::string();
         return buffer;
     }
 
     bool authorized(const HttpRequest &request) const {
-        if (!config_.auth.enabled) {
-            return true;
-        }
+        if (!config_.auth.enabled) return true;
         auto it = request.headers.find("authorization");
-        if (it == request.headers.end()) {
-            return false;
-        }
-        const std::string &value = it->second;
+        if (it == request.headers.end()) return false;
         const std::string prefix = "Basic ";
-        if (value.size() <= prefix.size() || value.compare(0, prefix.size(), prefix) != 0) {
-            return false;
-        }
-        std::string decoded = base64_decode(value.substr(prefix.size()));
+        if (it->second.size() <= prefix.size() || it->second.compare(0, prefix.size(), prefix) != 0) return false;
+        std::string decoded = base64_decode(it->second.substr(prefix.size()));
         std::string expected = config_.auth.username + ":" + config_.auth.password;
-        return decoded == expected;
+        return constant_time_equal(decoded, expected);
+    }
+
+    bool readiness_ok() const {
+        auto controller = observability::TelemetryState::instance().controller_snapshot();
+        auto fusion = observability::TelemetryState::instance().fusion_snapshot();
+        auto perf = observability::TelemetryState::instance().perf_snapshot();
+        auto now = std::chrono::system_clock::now();
+        bool controller_recent = controller.updated_at.time_since_epoch().count() != 0 &&
+                                 now >= controller.updated_at &&
+                                 (now - controller.updated_at) <= std::chrono::seconds(5);
+        bool fusion_recent = fusion.updated_at.time_since_epoch().count() != 0 &&
+                             now >= fusion.updated_at &&
+                             (now - fusion.updated_at) <= std::chrono::seconds(5);
+        bool perf_healthy = perf.mode == 1 && perf.counters_healthy;
+        return controller_recent && fusion_recent && !controller.fallback_active &&
+               fusion.running && !fusion.degraded && perf_healthy;
+    }
+
+    bool health_ok() const {
+        /* If this handler is serving the request, the process/exporter is live. */
+        return running_.load(std::memory_order_acquire);
     }
 
     std::string build_health_json() const {
         auto controller = observability::TelemetryState::instance().controller_snapshot();
         auto fusion = observability::TelemetryState::instance().fusion_snapshot();
+        auto perf = observability::TelemetryState::instance().perf_snapshot();
         auto controller_secs = std::chrono::duration_cast<std::chrono::seconds>(controller.updated_at.time_since_epoch()).count();
         auto fusion_secs = std::chrono::duration_cast<std::chrono::seconds>(fusion.updated_at.time_since_epoch()).count();
+        auto perf_secs = std::chrono::duration_cast<std::chrono::seconds>(perf.updated_at.time_since_epoch()).count();
 
         std::ostringstream json;
-        json << "{\"controller\":{\"fallbackActive\":" << (controller.fallback_active ? "true" : "false")
+        json << "{\"live\":" << (health_ok() ? "true" : "false")
+             << ",\"ready\":" << (readiness_ok() ? "true" : "false")
+             << ",\"controller\":{\"fallbackActive\":" << (controller.fallback_active ? "true" : "false")
              << ",\"currentWidth\":\"" << width_to_string(controller.current_width) << "\""
              << ",\"recommendedWidth\":\"" << width_to_string(controller.recommended_width) << "\""
              << ",\"issuedChange\":" << (controller.issued_change ? "true" : "false")
@@ -549,26 +562,13 @@ private:
              << ",\"thermalCpi\":" << fusion.thermal_cpi
              << ",\"powerAvailable\":" << (fusion.power_available ? "true" : "false")
              << ",\"powerBudgetW\":" << fusion.power_budget_w
-             << ",\"updatedAtSeconds\":" << fusion_secs << "}}";
+             << ",\"updatedAtSeconds\":" << fusion_secs << "},"
+             << "\"perf\":{\"mode\":\"" << perf_mode_to_string(perf.mode) << "\""
+             << ",\"countersHealthy\":" << (perf.counters_healthy ? "true" : "false")
+             << ",\"pinnedCpu\":" << perf.pinned_cpu
+             << ",\"monitorCpu\":" << perf.monitor_cpu
+             << ",\"updatedAtSeconds\":" << perf_secs << "}}";
         return json.str();
-    }
-
-    bool readiness_ok() const {
-        auto controller = observability::TelemetryState::instance().controller_snapshot();
-        auto fusion = observability::TelemetryState::instance().fusion_snapshot();
-        auto now = std::chrono::system_clock::now();
-        bool controller_recent = controller.updated_at.time_since_epoch().count() != 0 &&
-                                 (now - controller.updated_at) <= std::chrono::seconds(5);
-        bool fusion_recent = fusion.updated_at.time_since_epoch().count() != 0 &&
-                              (now - fusion.updated_at) <= std::chrono::seconds(5);
-        bool healthy = controller_recent && fusion_recent && !controller.fallback_active && fusion.running && !fusion.degraded;
-        return healthy;
-    }
-
-    bool health_ok() const {
-        auto controller = observability::TelemetryState::instance().controller_snapshot();
-        auto fusion = observability::TelemetryState::instance().fusion_snapshot();
-        return !controller.fallback_active && fusion.running && !fusion.degraded;
     }
 
     static std::string build_response(const std::string &status,
@@ -580,108 +580,126 @@ private:
         response << "Content-Type: " << content_type << "\r\n";
         response << "Content-Length: " << body.size() << "\r\n";
         response << "Cache-Control: no-cache\r\n";
-        for (const auto &header : headers) {
-            response << header.first << ": " << header.second << "\r\n";
-        }
-        response << "Connection: close\r\n\r\n";
-        response << body;
+        for (const auto &header : headers) response << header.first << ": " << header.second << "\r\n";
+        response << "Connection: close\r\n\r\n" << body;
         return response.str();
     }
 
-    void serve() {
-        while (true) {
-            int client = ::accept(listen_fd_, nullptr, nullptr);
+    void serve(int listener_fd) {
+        while (running_.load(std::memory_order_acquire)) {
+            int client = ::accept(listener_fd, nullptr, nullptr);
             if (client < 0) {
-                std::lock_guard<std::mutex> lock(server_mutex_);
-                if (!running_) {
-                    break;
-                }
+                if (!running_.load(std::memory_order_acquire)) break;
                 continue;
             }
-            if (use_tls_ && ssl_ctx_) {
-                SSL *ssl = SSL_new(ssl_ctx_);
-                if (!ssl) {
-                    ::close(client);
-                    continue;
+            set_client_timeouts(client);
+            bool queued = false;
+            {
+                std::lock_guard<std::mutex> lock(client_mutex_);
+                if (clients_.size() < kClientQueueLimit && running_.load(std::memory_order_acquire)) {
+                    clients_.push_back(client);
+                    queued = true;
                 }
-                SSL_set_fd(ssl, client);
-                if (SSL_accept(ssl) <= 0) {
-                    SSL_free(ssl);
-                    ::close(client);
-                    continue;
-                }
-                handle_client(client, ssl);
-                SSL_shutdown(ssl);
-                SSL_free(ssl);
-                ::close(client);
-            } else {
-                handle_client(client, nullptr);
-                ::close(client);
             }
+            if (queued) client_cv_.notify_one();
+            else ::close(client);
+        }
+    }
+
+    void worker_loop() {
+        while (true) {
+            int client = -1;
+            {
+                std::unique_lock<std::mutex> lock(client_mutex_);
+                client_cv_.wait(lock, [&] {
+                    return !running_.load(std::memory_order_acquire) || !clients_.empty();
+                });
+                if (clients_.empty()) {
+                    if (!running_.load(std::memory_order_acquire)) return;
+                    continue;
+                }
+                client = clients_.front();
+                clients_.pop_front();
+            }
+            serve_client(client);
+            ::close(client);
+        }
+    }
+
+    void serve_client(int client) {
+        SSL *ssl = nullptr;
+        if (use_tls_ && ssl_ctx_) {
+            ssl = SSL_new(ssl_ctx_);
+            if (!ssl) return;
+            SSL_set_fd(ssl, client);
+            if (SSL_accept(ssl) <= 0) {
+                SSL_free(ssl);
+                return;
+            }
+        }
+        handle_client(client, ssl);
+        if (ssl) {
+            (void)SSL_shutdown(ssl);
+            SSL_free(ssl);
         }
     }
 
     void handle_client(int client, SSL *ssl) {
         std::string request_payload = read_request_payload(client, ssl);
-        if (request_payload.empty()) {
+        if (request_payload.empty() || request_payload.find("\r\n\r\n") == std::string::npos) {
+            std::string response = build_response("408 Request Timeout", "text/plain", "request timeout or too large\n");
+            (void)send_payload(client, ssl, response);
             return;
         }
         auto parsed = parse_request(request_payload);
         if (!parsed) {
-            std::string response = build_response("400 Bad Request", "text/plain", "bad request\n");
-            send_payload(client, ssl, response);
+            (void)send_payload(client, ssl, build_response("400 Bad Request", "text/plain", "bad request\n"));
             return;
         }
         const HttpRequest &request = *parsed;
         if (request.method != "GET") {
-            std::string response = build_response("405 Method Not Allowed", "text/plain", "method not allowed\n");
-            send_payload(client, ssl, response);
+            (void)send_payload(client, ssl, build_response("405 Method Not Allowed", "text/plain", "method not allowed\n"));
             return;
         }
-
         if (!authorized(request)) {
             std::vector<std::pair<std::string, std::string>> headers = {{"WWW-Authenticate", "Basic realm=\"metrics\""}};
-            std::string response = build_response("401 Unauthorized", "text/plain", "unauthorized\n", headers);
-            send_payload(client, ssl, response);
+            (void)send_payload(client, ssl, build_response("401 Unauthorized", "text/plain", "unauthorized\n", headers));
             return;
         }
-
         if (request.path == "/metrics") {
-            std::string body = MetricsRegistry::instance().build_prometheus();
-            std::string response = build_response("200 OK", "text/plain; version=0.0.4", body);
-            send_payload(client, ssl, response);
+            (void)send_payload(client, ssl, build_response("200 OK", "text/plain; version=0.0.4",
+                                                           MetricsRegistry::instance().build_prometheus()));
             return;
         }
-
         if (request.path == "/healthz") {
             bool ok = health_ok();
-            std::string body = build_health_json();
-            std::string response = build_response(ok ? "200 OK" : "503 Service Unavailable", "application/json", body);
-            send_payload(client, ssl, response);
+            (void)send_payload(client, ssl, build_response(ok ? "200 OK" : "503 Service Unavailable",
+                                                           "application/json", build_health_json()));
             return;
         }
-
         if (request.path == "/readyz") {
             bool ok = readiness_ok();
-            std::string body = build_health_json();
-            std::string response = build_response(ok ? "200 OK" : "503 Service Unavailable", "application/json", body);
-            send_payload(client, ssl, response);
+            (void)send_payload(client, ssl, build_response(ok ? "200 OK" : "503 Service Unavailable",
+                                                           "application/json", build_health_json()));
             return;
         }
-
-        std::string response = build_response("404 Not Found", "text/plain", "not found\n");
-        send_payload(client, ssl, response);
+        (void)send_payload(client, ssl, build_response("404 Not Found", "text/plain", "not found\n"));
     }
 
     mutable std::mutex server_mutex_;
     std::thread server_thread_;
-    bool running_{false};
+    std::vector<std::thread> workers_;
+    std::atomic<bool> running_{false};
     int listen_fd_{-1};
     uint16_t listen_port_{0};
     std::string bind_address_{"127.0.0.1"};
     ExporterConfig config_{};
     bool use_tls_{false};
     SSL_CTX *ssl_ctx_{nullptr};
+
+    std::mutex client_mutex_;
+    std::condition_variable client_cv_;
+    std::deque<int> clients_;
 };
 
 } // namespace
@@ -691,35 +709,21 @@ extern "C" {
 int tsd_metrics_exporter_start_with_config(const tsd_metrics_exporter_config_t *config) {
     ExporterConfig exporter_config;
     if (config) {
-        if (config->bind_address) {
-            exporter_config.bind_address = config->bind_address;
-        }
+        if (config->bind_address) exporter_config.bind_address = config->bind_address;
         exporter_config.port = config->port;
         if (config->tls) {
             exporter_config.tls.enabled = true;
-            if (config->tls->certificate_path) {
-                exporter_config.tls.certificate = config->tls->certificate_path;
-            }
-            if (config->tls->private_key_path) {
-                exporter_config.tls.key = config->tls->private_key_path;
-            }
-            if (config->tls->ca_certificate_path) {
-                exporter_config.tls.ca = config->tls->ca_certificate_path;
-            }
+            if (config->tls->certificate_path) exporter_config.tls.certificate = config->tls->certificate_path;
+            if (config->tls->private_key_path) exporter_config.tls.key = config->tls->private_key_path;
+            if (config->tls->ca_certificate_path) exporter_config.tls.ca = config->tls->ca_certificate_path;
             exporter_config.tls.require_client_auth = config->tls->require_client_auth != 0;
         }
         if (config->basic_auth) {
             exporter_config.auth.enabled = true;
-            if (config->basic_auth->username) {
-                exporter_config.auth.username = config->basic_auth->username;
-            }
-            if (config->basic_auth->password) {
-                exporter_config.auth.password = config->basic_auth->password;
-            }
+            if (config->basic_auth->username) exporter_config.auth.username = config->basic_auth->username;
+            if (config->basic_auth->password) exporter_config.auth.password = config->basic_auth->password;
         }
-        if (config->statsd_host) {
-            exporter_config.statsd_host = config->statsd_host;
-        }
+        if (config->statsd_host) exporter_config.statsd_host = config->statsd_host;
         exporter_config.statsd_port = config->statsd_port;
     }
     return PrometheusExporter::instance().start(exporter_config);
@@ -753,9 +757,7 @@ void tsd_metrics_exporter_record_sensor_health(const char *sensor_name,
                                                double health,
                                                double quality,
                                                int valid) {
-    if (!sensor_name) {
-        return;
-    }
+    if (!sensor_name) return;
     PrometheusExporter::instance().registry().record_sensor_health(sensor_name, socket, health, quality, valid != 0);
 }
 

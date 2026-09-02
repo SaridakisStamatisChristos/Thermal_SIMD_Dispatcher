@@ -23,25 +23,30 @@ int tsd_telemetry_fusion_start_for_cpu(int cpu);
 void tsd_telemetry_fusion_stop(void);
 
 /*
- * Publish a normalized direct sample into the fusion bus. This gives platform
- * adapters a stable C boundary for contributing temperature/frequency data
- * without depending on the C++ collector implementation.
+ * Publish a normalized direct sample into the fusion bus. Raw values are kept
+ * on the safety channel before any configured EWMA is applied; filtered values
+ * are exposed separately for forecasting/control.
  */
 int tsd_telemetry_fusion_publish_sample(const tsd_telemetry_sample_t *sample);
 
 /*
- * Returns 0 only when at least one usable temperature/frequency signal is
- * available. Empty/degraded snapshots return -1 so callers can fall back to
- * their authoritative direct telemetry source.
+ * Returns 0 when at least one usable raw or filtered temperature/frequency
+ * signal is available. The raw fields are freshness-checked safety values;
+ * filtered_* fields are the optional control/forecast view.
  */
 int tsd_telemetry_fusion_sample(tsd_telemetry_sample_t *out);
 
 /*
  * Safety gate used by the immutable dispatcher. Before fusion starts this is
  * permissive for legacy startup compatibility. Once fusion is running, wider
- * SIMD selections require a currently usable package-temperature signal.
+ * SIMD selections require a fresh RAW package-temperature signal.
  */
 int tsd_telemetry_temperature_upgrade_allowed(void);
+
+#ifdef TSD_ENABLE_TESTS
+/* Deterministic bridge tests can suppress host-specific direct sysfs/MSR data. */
+void tsd_telemetry_fusion_test_disable_direct_helper(int disabled);
+#endif
 
 #ifdef __cplusplus
 }

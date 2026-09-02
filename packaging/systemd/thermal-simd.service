@@ -8,8 +8,8 @@ ExecStartPre=/usr/local/bin/thermal_simd --interval=50 --sandbox-only
 ExecStart=/usr/local/bin/thermal_simd --interval=50 --metrics-bind=127.0.0.1 --metrics-port=9464
 Environment=TSD_LOG_LEVEL=info
 Environment=TSD_PREDICTIVE_COEFF_PATH=/etc/thermal-simd/controller_coeffs.json
-CapabilityBoundingSet=CAP_PERFMON CAP_SYS_ADMIN
-AmbientCapabilities=CAP_PERFMON CAP_SYS_ADMIN
+CapabilityBoundingSet=CAP_PERFMON
+AmbientCapabilities=CAP_PERFMON
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
@@ -29,6 +29,11 @@ StandardError=journal
 IPAddressAllow=127.0.0.1
 IPAddressAllow=::1
 IPAddressDeny=any
+
+# Optional MSR-backed APERF/MPERF telemetry is deliberately not enabled by
+# this default unit. Prefer granting the service account read access to the
+# required /dev/cpu/*/msr devices. If the host requires a capability instead,
+# add CAP_SYS_RAWIO explicitly rather than CAP_SYS_ADMIN.
 
 [Install]
 WantedBy=multi-user.target
