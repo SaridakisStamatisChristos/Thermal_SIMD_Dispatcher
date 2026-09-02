@@ -11,9 +11,12 @@ namespace {
 struct DispatcherPolicyState {
     tsd_policy_config config;
     bool fallback_active;
+    bool last_temp_available;
+    bool have_sample;
     std::unique_ptr<tsd::policy::MPCController> controller;
 
-    DispatcherPolicyState() : config{}, fallback_active(false), controller(nullptr) {}
+    DispatcherPolicyState()
+        : config{}, fallback_active(false), last_temp_available(false), have_sample(false), controller(nullptr) {}
 };
 
 void publish_state(const DispatcherPolicyState &state,
@@ -80,6 +83,8 @@ void tsd_dispatcher_policy_reset(tsd_dispatcher_policy_state *opaque, const tsd_
     }
     state->controller->reset(state->config);
     state->fallback_active = false;
+    state->last_temp_available = false;
+    state->have_sample = false;
     publish_state(*state, SIMD_SSE41, SIMD_SSE41, false);
 }
 
@@ -90,6 +95,8 @@ void tsd_dispatcher_policy_record(tsd_dispatcher_policy_state *opaque,
         return;
     }
     auto *state = reinterpret_cast<DispatcherPolicyState*>(opaque);
+    state->last_temp_available = sample->temp_available != 0;
+    state->have_sample = true;
     if (!state->controller) {
         try {
             state->controller = std::make_unique<tsd::policy::MPCController>(state->config);
@@ -109,6 +116,9 @@ int tsd_dispatcher_policy_recommend(tsd_dispatcher_policy_state *opaque,
                                     int *fallback_active) {
     if (fallback_active) {
         *fallback_active = 0;
+    }
+    if (out_width) {
+        *out_width = current_width;
     }
     if (!opaque) {
         return 0;
@@ -136,15 +146,22 @@ int tsd_dispatcher_policy_recommend(tsd_dispatcher_policy_state *opaque,
     simd_width_t target = current_width;
     bool changed = state->controller->recommend(current_width, max_width, target);
     if (!changed) {
-        if (out_width) {
-            *out_width = current_width;
-        }
         return 0;
     }
+
+    /*
+     * Missing package temperature must never authorize a wider SIMD width.
+     * Downgrades remain available so degraded telemetry can still fail closed.
+     */
+    if (target > current_width && (!state->have_sample || !state->last_temp_available)) {
+        publish_state(*state, current_width, current_width, false);
+        return 0;
+    }
+
     if (out_width) {
         *out_width = target;
     }
-    publish_state(*state, current_width, target, changed);
+    publish_state(*state, current_width, target, true);
     return 1;
 }
 
