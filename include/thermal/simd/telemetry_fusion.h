@@ -7,7 +7,16 @@
 extern "C" {
 #endif
 
+/* Backward-compatible entry point: starts fusion on CPU 0. */
 int tsd_telemetry_fusion_start(void);
+
+/*
+ * Starts (or acquires a reference to) the process-wide fusion service using
+ * the supplied workload CPU for direct APERF/MPERF/cpufreq telemetry.
+ */
+int tsd_telemetry_fusion_start_for_cpu(int cpu);
+
+/* Releases one process-wide fusion reference; the last user stops the thread. */
 void tsd_telemetry_fusion_stop(void);
 
 /*
