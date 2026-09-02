@@ -17,6 +17,8 @@ std::unique_ptr<telemetry::TelemetryFusion> g_fusion;
 std::shared_ptr<telemetry::TelemetryBusManager> g_manager;
 tsd_telemetry_helper_t g_direct_helper{};
 bool g_direct_helper_ready = false;
+unsigned int g_fusion_users = 0;
+int g_direct_cpu = -1;
 
 telemetry::TelemetryFusionConfig default_config() {
     telemetry::TelemetryFusionConfig config;
@@ -88,11 +90,13 @@ void fill_missing_from_direct(tsd_telemetry_sample_t *out,
     }
 }
 
-}  // namespace
+int start_unlocked(int cpu) {
+    if (cpu < 0) {
+        return -1;
+    }
 
-extern "C" int tsd_telemetry_fusion_start(void) {
-    std::lock_guard<std::mutex> lock(g_fusion_mutex);
     if (g_fusion && g_fusion->running()) {
+        ++g_fusion_users;
         return 0;
     }
 
@@ -100,21 +104,31 @@ extern "C" int tsd_telemetry_fusion_start(void) {
     telemetry::TelemetryFusionConfig config = default_config();
     g_fusion = std::make_unique<telemetry::TelemetryFusion>(config, g_manager);
 
-    /*
-     * The dispatcher workload is pinned to CPU 0. Seed the production fusion
-     * bus from the same direct Linux telemetry helper so an empty collector
-     * graph can never suppress otherwise available temperature/frequency data.
-     * Future platform-specific collectors can still be registered on the same
-     * manager and compete by timestamp/quality through TelemetryBus.
-     */
-    g_direct_helper_ready = tsd_telemetry_helper_init(&g_direct_helper, 0) == 0;
-
+    g_direct_cpu = cpu;
+    g_direct_helper_ready = tsd_telemetry_helper_init(&g_direct_helper, cpu) == 0;
     g_fusion->start();
+    g_fusion_users = 1;
     return 0;
+}
+
+}  // namespace
+
+extern "C" int tsd_telemetry_fusion_start(void) {
+    return tsd_telemetry_fusion_start_for_cpu(0);
+}
+
+extern "C" int tsd_telemetry_fusion_start_for_cpu(int cpu) {
+    std::lock_guard<std::mutex> lock(g_fusion_mutex);
+    return start_unlocked(cpu);
 }
 
 extern "C" void tsd_telemetry_fusion_stop(void) {
     std::lock_guard<std::mutex> lock(g_fusion_mutex);
+    if (g_fusion_users > 1) {
+        --g_fusion_users;
+        return;
+    }
+    g_fusion_users = 0;
     if (g_fusion) {
         g_fusion->stop();
         g_fusion.reset();
@@ -124,6 +138,7 @@ extern "C" void tsd_telemetry_fusion_stop(void) {
         tsd_telemetry_helper_destroy(&g_direct_helper);
         g_direct_helper_ready = false;
     }
+    g_direct_cpu = -1;
 }
 
 extern "C" int tsd_telemetry_fusion_publish_sample(const tsd_telemetry_sample_t *sample) {
