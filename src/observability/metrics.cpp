@@ -306,21 +306,26 @@ public:
         for (size_t i = 0; i < kWorkerCount; ++i) {
             workers_.emplace_back(&PrometheusExporter::worker_loop, this);
         }
-        server_thread_ = std::thread(&PrometheusExporter::serve, this);
+        // The accept thread owns a stable descriptor value for its lifetime.
+        // stop() only shuts it down to wake accept(); the descriptor is closed
+        // after the accept thread has joined, eliminating close/reuse races.
+        server_thread_ = std::thread(&PrometheusExporter::serve, this, fd);
         return 0;
     }
 
     void stop() {
         std::thread accept_thread;
         std::vector<std::thread> workers;
+        int listener_fd = -1;
         {
             std::lock_guard<std::mutex> lock(server_mutex_);
             if (!running_.exchange(false, std::memory_order_acq_rel)) return;
             observability::StatsdExporter::instance().shutdown();
-            if (listen_fd_ >= 0) {
-                ::shutdown(listen_fd_, SHUT_RDWR);
-                ::close(listen_fd_);
-                listen_fd_ = -1;
+            listener_fd = listen_fd_;
+            if (listener_fd >= 0) {
+                // Wake a blocking accept() without invalidating/reusing the fd
+                // while the accept thread can still reference it.
+                (void)::shutdown(listener_fd, SHUT_RDWR);
             }
             accept_thread = std::move(server_thread_);
             workers = std::move(workers_);
@@ -332,6 +337,16 @@ public:
         }
         client_cv_.notify_all();
         if (accept_thread.joinable()) accept_thread.join();
+
+        {
+            std::lock_guard<std::mutex> lock(server_mutex_);
+            if (listener_fd >= 0 && listen_fd_ == listener_fd) {
+                ::close(listener_fd);
+                listen_fd_ = -1;
+                listen_port_ = 0;
+            }
+        }
+
         for (auto &worker : workers) {
             if (worker.joinable()) worker.join();
         }
@@ -570,9 +585,9 @@ private:
         return response.str();
     }
 
-    void serve() {
+    void serve(int listener_fd) {
         while (running_.load(std::memory_order_acquire)) {
-            int client = ::accept(listen_fd_, nullptr, nullptr);
+            int client = ::accept(listener_fd, nullptr, nullptr);
             if (client < 0) {
                 if (!running_.load(std::memory_order_acquire)) break;
                 continue;
