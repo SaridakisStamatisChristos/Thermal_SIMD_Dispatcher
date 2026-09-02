@@ -219,6 +219,24 @@ public:
             body << "tsd_sensor_health_timestamp_seconds{sensor=\"" << entry.first.sensor
                  << "\",socket=\"" << entry.first.socket << "\"} " << secs.count() << "\n";
         }
+
+        const auto fusion = observability::TelemetryState::instance().fusion_snapshot();
+        body << "# HELP tsd_package_temperature_c Package temperature by safety/control channel.\n";
+        body << "# TYPE tsd_package_temperature_c gauge\n";
+        if (fusion.raw_temp_available) {
+            body << "tsd_package_temperature_c{channel=\"raw_safety\"} "
+                 << fusion.raw_package_temp_c << "\n";
+        }
+        if (fusion.filtered_temp_available) {
+            body << "tsd_package_temperature_c{channel=\"filtered_control\"} "
+                 << fusion.filtered_package_temp_c << "\n";
+        }
+        body << "# HELP tsd_package_temperature_available Package temperature channel availability.\n";
+        body << "# TYPE tsd_package_temperature_available gauge\n";
+        body << "tsd_package_temperature_available{channel=\"raw_safety\"} "
+             << (fusion.raw_temp_available ? 1 : 0) << "\n";
+        body << "tsd_package_temperature_available{channel=\"filtered_control\"} "
+             << (fusion.filtered_temp_available ? 1 : 0) << "\n";
         return body.str();
     }
 
@@ -552,6 +570,10 @@ private:
              << ",\"degraded\":" << (fusion.degraded ? "true" : "false")
              << ",\"tempAvailable\":" << (fusion.temp_available ? "true" : "false")
              << ",\"packageTempC\":" << std::fixed << std::setprecision(2) << fusion.package_temp_c
+             << ",\"rawTempAvailable\":" << (fusion.raw_temp_available ? "true" : "false")
+             << ",\"rawPackageTempC\":" << fusion.raw_package_temp_c
+             << ",\"filteredTempAvailable\":" << (fusion.filtered_temp_available ? "true" : "false")
+             << ",\"filteredPackageTempC\":" << fusion.filtered_package_temp_c
              << ",\"freqAvailable\":" << (fusion.freq_available ? "true" : "false")
              << ",\"freqRatio\":" << fusion.freq_ratio
              << ",\"cpiAvailable\":" << (fusion.cpi_available ? "true" : "false")
