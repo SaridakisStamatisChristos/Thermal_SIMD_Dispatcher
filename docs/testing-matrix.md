@@ -6,14 +6,15 @@ This document maps dispatcher subsystems to automated coverage and hardware-only
 
 | Subsystem | Test binary | Path | Coverage |
 | --- | --- | --- | --- |
-| Dispatcher core | `test_thermal_simd` | [`tests/test_thermal_simd.c`](../tests/test_thermal_simd.c) | Width transitions, fallback paths, policy timing and fault escalation. |
+| Dispatcher core | `test_thermal_simd` | [`tests/test_thermal_simd.c`](../tests/test_thermal_simd.c) | Width transitions, fallback paths, policy timing, explicit thermal authorization for upgrades and fault escalation. |
+| Perf resilience | `test_perf_resilience` | [`tests/perf/test_perf_resilience.c`](../tests/perf/test_perf_resilience.c) | Runtime group-loss fail-closed behavior, allowed-cpuset CPU selection and fusion service reference counting. |
 | Immutable executable-memory dispatch | `test_trampoline_security` | [`tests/patcher/test_trampoline_security.cpp`](../tests/patcher/test_trampoline_security.cpp) | RX-only mappings, CET/IBT landing pads, native 128/256/512-bit payload encodings, fail-closed selection and attestation mismatch detection. |
 | Predictive policy | `test_policy_controller` | [`tests/policy/test_policy_controller.c`](../tests/policy/test_policy_controller.c) | Candidate convergence/stability, explicit fallback and missing-temperature semantics. |
 | ARX estimator | `test_arx_model` | [`tests/policy/test_arx_model.cpp`](../tests/policy/test_arx_model.cpp) | Coefficient parsing, temperature forecasting and residual handling. |
 | Telemetry fusion | `test_telemetry`, `test_telemetry_fusion`, `test_telemetry_fusion_stress` | [`tests/telemetry/`](../tests/telemetry) | Sensor normalization, frequency-ratio units, bridge publication, staleness, fusion-thread behavior and concurrent access. |
 | Config parsing | `test_config_parser`, `test_runtime_config_cli` | [`tests/`](../tests) | CLI/env precedence and malformed override rejection. |
 | Statistics helpers | `test_statistics` | [`tests/test_statistics.c`](../tests/test_statistics.c) | EWMA/trimmed statistics used by policy heuristics. |
-| Observability | `test_logging_metrics`, `test_observability_metrics` | [`tests/observability/`](../tests/observability) | Counters, exporters, TLS/auth configuration and snapshots. |
+| Observability | `test_logging_metrics`, `test_observability_metrics` | [`tests/observability/`](../tests/observability) | Counters, exporters, TLS/auth configuration, degraded perf readiness and snapshots. |
 
 All registered tests run through `ctest` when `BUILD_TESTING=ON`.
 
@@ -30,7 +31,7 @@ Production trampolines are not rewritten at runtime. Initialization creates the 
 5. AVX2 contains a YMM broadcast and AVX-512 contains a ZMM broadcast, preventing regression to XMM-only encodings;
 6. attestation rejects a deliberately modified test-only immutable payload.
 
-The test-only override path allocates a fresh RW page, writes the injected payload, seals it RX and never rewrites it. Production builds do not expose this override path.
+Attestation readers are serialized with width selection so the reported hash cannot race a transition. The test-only override path allocates a fresh RW page, writes the injected payload, seals it RX and never rewrites it. Production builds do not expose this override path.
 
 ## GitHub Actions
 
@@ -82,6 +83,7 @@ A release candidate should not be promoted solely because hosted CI is green. Re
 - at least one representative hardware-smoke run passed on the deployment CPU family;
 - AVX-512 deployments have a successful AVX-512 HIL run rather than relying on CPUID mocks;
 - soak/stress results show no oscillatory or unsafe width-selection behavior under sustained load;
+- runtime perf-event loss enters software/degraded mode and subsequent hot recovery is observed on the deployment kernel;
 - the active trampoline self-validator reports RX-only mappings on the deployment kernel;
 - metrics/health endpoints are bound and authenticated according to the deployment threat model.
 
@@ -97,4 +99,4 @@ A release candidate should not be promoted solely because hosted CI is green. Re
 - Add TSan where signal/executable-memory test behavior is reliable enough to avoid false positives.
 - Record HIL CPU model, microcode, kernel and governor metadata as workflow artifacts.
 - Add calibrated throughput-per-watt measurements for representative real kernels, not only the built-in demonstration payload.
-- Add long-haul hardware-counter loss/recovery coverage if runtime perf-event hot re-probing is introduced.
+- Add a long-haul HIL fault-injection run that revokes/restores perf access and records software-to-hardware re-probe timing.
