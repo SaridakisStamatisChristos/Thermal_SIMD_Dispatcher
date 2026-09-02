@@ -40,10 +40,28 @@ void tsd_kernel_dispatch_destroy(tsd_kernel_dispatch_t *dispatch);
  * non-NULL, receives the implementation actually called after ISA/fallback
  * clamping. Successful work is also accounted into the software-perf workload
  * counter so degraded-mode adaptation remains meaningful for registered code.
+ *
+ * One call is one non-preemptible kernel invocation from the dispatcher's
+ * perspective. Applications with long-running kernels should prefer
+ * tsd_kernel_dispatch_execute_chunked() so thermal downgrade decisions can be
+ * observed between bounded chunks.
  */
 int tsd_kernel_dispatch_execute(tsd_kernel_dispatch_t *dispatch,
                                 size_t work_items,
                                 simd_width_t *used_width);
+
+/*
+ * Cooperatively executes `total_work_items` in chunks no larger than
+ * `max_chunk_items`, re-resolving the currently authorized SIMD width before
+ * every chunk. Kernels therefore need to interpret repeated calls as
+ * successive units of work (typically by keeping any cursor/state in
+ * `variants.context`). `last_used_width`, when non-NULL, receives the width of
+ * the final chunk. A zero total performs no kernel call but still succeeds.
+ */
+int tsd_kernel_dispatch_execute_chunked(tsd_kernel_dispatch_t *dispatch,
+                                        size_t total_work_items,
+                                        size_t max_chunk_items,
+                                        simd_width_t *last_used_width);
 
 /* Resolve without executing; useful for diagnostics and tests. */
 int tsd_kernel_dispatch_resolve(const tsd_kernel_dispatch_t *dispatch,

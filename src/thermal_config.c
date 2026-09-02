@@ -55,6 +55,7 @@ static const tsd_runtime_config k_default_config = {
     .memory_guard_divisor = 5,
     .memory_guard_offset_milli = 200,
     .demo_duration_sec = 10,
+    .run_forever = 0,
     .work_iters = 10000000,
     .cooldown_down_ticks = 0,
     .cooldown_up_ticks = 0,
@@ -823,8 +824,9 @@ void tsd_runtime_config_print_usage(const char *prog) {
     printf("  --memory-guard-offset=M Additional memory guard in milli-ratio [0-1000000] (default: 200)\n");
     printf("  --thermal-temp-weight=W Temperature severity weight in milli [0-100000] (default: 0)\n");
     printf("  --thermal-ratio-weight=W Frequency ratio severity weight in milli [0-100000] (default: 0)\n");
-    printf("  --duration-sec=S       Demo duration (default: 10)\n");
-    printf("  --work-iters=N         Inner work iterations per second (default: 10000000)\n");
+    printf("  --duration-sec=S       Finite demo duration in wall-clock seconds (default: 10)\n");
+    printf("  --run-forever          Run until SIGINT/SIGTERM instead of using --duration-sec\n");
+    printf("  --work-iters=N         Inner workload batch size (default: 10000000)\n");
     printf("  --metrics-port=P       Prometheus metrics port (0 to disable, default: %d)\n", k_default_config.metrics_port);
     printf("  --metrics-bind=ADDR    Metrics bind address (default: %s)\n", k_default_config.metrics_bind_host);
     printf("  --metrics-cert=PATH    Enable TLS for metrics endpoint (requires --metrics-key)\n");
@@ -948,6 +950,8 @@ int tsd_runtime_config_parse_cli(tsd_runtime_config *cfg, int argc, char **argv)
             if (tsd_parse_int_option(argv[i] + 15, 1, 86400, &cfg->demo_duration_sec) != 0) {
                 die_invalid_option("--duration-sec", argv[i] + 15);
             }
+        } else if (!strcmp(argv[i], "--run-forever")) {
+            cfg->run_forever = 1;
         } else if (!strncmp(argv[i], "--work-iters=", 13)) {
             if (tsd_parse_int_option(argv[i] + 13, 1, INT_MAX, &cfg->work_iters) != 0) {
                 die_invalid_option("--work-iters", argv[i] + 13);

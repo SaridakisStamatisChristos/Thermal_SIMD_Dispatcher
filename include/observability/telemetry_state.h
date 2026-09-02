@@ -55,6 +55,7 @@ struct ControllerTelemetrySnapshot {
     simd_width_t recommended_width{SIMD_SSE41};
     bool issued_change{false};
     std::chrono::system_clock::time_point updated_at{std::chrono::system_clock::time_point{}};
+    std::chrono::steady_clock::time_point freshness_at{std::chrono::steady_clock::time_point{}};
 };
 
 struct FusionTelemetrySnapshot {
@@ -69,6 +70,7 @@ struct FusionTelemetrySnapshot {
     bool power_available{false};
     double power_budget_w{0.0};
     std::chrono::system_clock::time_point updated_at{std::chrono::system_clock::time_point{}};
+    std::chrono::steady_clock::time_point freshness_at{std::chrono::steady_clock::time_point{}};
 };
 
 struct PerfTelemetrySnapshot {
@@ -77,6 +79,7 @@ struct PerfTelemetrySnapshot {
     int pinned_cpu{-1};
     int monitor_cpu{-1};
     std::chrono::system_clock::time_point updated_at{std::chrono::system_clock::time_point{}};
+    std::chrono::steady_clock::time_point freshness_at{std::chrono::steady_clock::time_point{}};
 };
 
 class TelemetryState {

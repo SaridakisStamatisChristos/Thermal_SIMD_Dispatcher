@@ -17,6 +17,8 @@ extern "C" {
 
 #include <thermal/simd/logging.h>
 #include <thermal/simd/metrics.h>
+#include <thermal/simd/thermal_config.h>
+#include <thermal/simd/thermal_cpu.h>
 
 #include <array>
 #include <atomic>
@@ -385,6 +387,17 @@ int tsd_trampoline_patch(simd_width_t new_width) {
             set_error("invalid SIMD width", EINVAL);
             break;
         }
+#ifndef TSD_ENABLE_TESTS
+        if (!tsd_cpu_has_sse41()) {
+            set_error("SSE4.1 is not supported by this host", ENOTSUP);
+            break;
+        }
+        simd_width_t allowed_width = tsd_detect_max_simd(&g_tsd_config);
+        if (new_width > allowed_width) {
+            set_error("requested SIMD width exceeds host or runtime policy", ENOTSUP);
+            break;
+        }
+#endif
         if (!g_tsd_trampoline_ctx.page_a && build_canonical_code_page() != 0) {
             break;
         }

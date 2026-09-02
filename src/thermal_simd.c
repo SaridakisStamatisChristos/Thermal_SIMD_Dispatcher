@@ -20,6 +20,7 @@
 #include <thermal/simd/thermal_perf.h>
 #include <thermal/simd/thermal_signals.h>
 #include <thermal/simd/thermal_trampoline.h>
+#include <thermal/simd/runtime.h>
 #include <thermal/simd/logging.h>
 #include <thermal/simd/health_check.h>
 #include <thermal/simd/policy/dispatcher_policy.h>
@@ -30,11 +31,26 @@
 #endif
 
 static _Atomic int g_tsd_running = 1;
-static _Atomic int g_tsd_reload_requested = 0;
+static volatile sig_atomic_t g_tsd_reload_requested = 0;
+static volatile sig_atomic_t g_tsd_stop_requested = 0;
+
+struct tsd_runtime {
+    perf_ctx_t *perf;
+    pthread_t monitor;
+    int monitor_started;
+};
+
+static pthread_mutex_t g_tsd_runtime_lock = PTHREAD_MUTEX_INITIALIZER;
+static tsd_runtime_t *g_tsd_active_runtime = NULL;
 
 static void tsd_handle_sighup(int sig) {
     (void)sig;
-    atomic_store_explicit(&g_tsd_reload_requested, 1, memory_order_relaxed);
+    g_tsd_reload_requested = 1;
+}
+
+static void tsd_handle_shutdown_signal(int sig) {
+    (void)sig;
+    g_tsd_stop_requested = 1;
 }
 
 static int32_t simd_shim(int32_t a, int32_t b);
@@ -108,6 +124,9 @@ static int32_t simd_shim(int32_t a __attribute__((unused)),
 
 static void workload_loop(int iterations) {
     for (int i = 0; i < iterations; ++i) {
+        if ((i & 0x3fff) == 0 && g_tsd_stop_requested) {
+            break;
+        }
         workload_once();
     }
 }
@@ -133,30 +152,33 @@ static uint64_t monotonic_elapsed_ns(const struct timespec *start, const struct 
     return (uint64_t)sec * UINT64_C(1000000000) + (uint64_t)nsec;
 }
 
-static tsd_demo_result_t run_workload_for_duration(int duration_sec, int batch_iterations) {
+static tsd_demo_result_t run_workload(int duration_sec, int batch_iterations, int run_forever) {
     tsd_demo_result_t result = {0};
-    if (duration_sec <= 0 || batch_iterations <= 0) {
+    if (batch_iterations <= 0 || (!run_forever && duration_sec <= 0)) {
         return result;
     }
 
     struct timespec start = {0};
     struct timespec now = {0};
     if (clock_gettime(CLOCK_MONOTONIC, &start) != 0) {
-        tsd_log_error("runtime", "CLOCK_MONOTONIC unavailable; cannot honor --duration-sec");
+        tsd_log_error("runtime", "CLOCK_MONOTONIC unavailable; cannot run workload");
         return result;
     }
 
     uint64_t before = atomic_load_explicit(&g_tsd_workload_iterations, memory_order_relaxed);
-    const uint64_t target_ns = (uint64_t)duration_sec * UINT64_C(1000000000);
+    const uint64_t target_ns = run_forever ? UINT64_MAX : (uint64_t)duration_sec * UINT64_C(1000000000);
     do {
         workload_loop(batch_iterations);
+        if (g_tsd_stop_requested || !atomic_load_explicit(&g_tsd_running, memory_order_acquire)) {
+            break;
+        }
         if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
             break;
         }
         result.elapsed_ns = monotonic_elapsed_ns(&start, &now);
-    } while (result.elapsed_ns < target_ns);
+    } while (run_forever || result.elapsed_ns < target_ns);
 
-    if (result.elapsed_ns == 0 && clock_gettime(CLOCK_MONOTONIC, &now) == 0) {
+    if (clock_gettime(CLOCK_MONOTONIC, &now) == 0) {
         result.elapsed_ns = monotonic_elapsed_ns(&start, &now);
     }
     uint64_t after = atomic_load_explicit(&g_tsd_workload_iterations, memory_order_relaxed);
@@ -174,7 +196,7 @@ static void log_demo_result(const tsd_demo_result_t *result) {
                                 result->elapsed_ns);
     }
     tsd_log_info("runtime",
-                 "Workload demo complete: elapsed_ms=%" PRIu64 " iterations=%" PRIu64
+                 "Workload complete: elapsed_ms=%" PRIu64 " iterations=%" PRIu64
                  " throughput_iter_per_sec=%" PRIu64,
                  result->elapsed_ns / UINT64_C(1000000), result->iterations, throughput);
 }
@@ -213,7 +235,8 @@ static void print_configuration(simd_width_t max_width) {
                  g_tsd_config.cooldown_down_ticks,
                  g_tsd_config.cooldown_up_ticks,
                  g_tsd_config.min_dwell_ticks);
-    tsd_log_info(LOG_COMPONENT, "  Demo: %d wall-clock sec, work batch: %d iterations",
+    tsd_log_info(LOG_COMPONENT, "  Runtime: %s, finite duration: %d sec, work batch: %d iterations",
+                 g_tsd_config.run_forever ? "persistent" : "finite",
                  g_tsd_config.demo_duration_sec, g_tsd_config.work_iters);
 }
 
@@ -254,12 +277,15 @@ void* thermal_monitor_thread(void *arg) {
     CPU_SET((size_t)tsd_perf_get_monitor_cpu(ctx), &cpuset);
     (void)sched_setaffinity(0, sizeof(cpuset), &cpuset);
 
-    while (atomic_load_explicit(&g_tsd_running, memory_order_acquire)) {
+    while (atomic_load_explicit(&g_tsd_running, memory_order_acquire) && !g_tsd_stop_requested) {
         struct timespec interval = {
             .tv_sec = g_tsd_config.check_interval_us / 1000000,
             .tv_nsec = (long)(g_tsd_config.check_interval_us % 1000000) * 1000L,
         };
-        while (nanosleep(&interval, &interval) == -1 && errno == EINTR) {}
+        while (nanosleep(&interval, &interval) == -1 && errno == EINTR) {
+            if (g_tsd_stop_requested) break;
+        }
+        if (g_tsd_stop_requested || !atomic_load_explicit(&g_tsd_running, memory_order_acquire)) break;
         dwell_ticks++;
 
         /* Fail-closed selections can originate inside telemetry evaluation. */
@@ -267,7 +293,8 @@ void* thermal_monitor_thread(void *arg) {
 
         if (policy_state) {
             tsd_dispatcher_policy_heartbeat(policy_state, width);
-            if (atomic_exchange_explicit(&g_tsd_reload_requested, 0, memory_order_relaxed)) {
+            if (g_tsd_reload_requested) {
+                g_tsd_reload_requested = 0;
                 if (tsd_dispatcher_policy_reload(policy_state) != 0) {
                     tsd_log_warn(LOG_COMPONENT, "SIGHUP coefficient reload failed; retaining existing/fallback policy state");
                 } else {
@@ -461,50 +488,209 @@ void* thermal_monitor_thread(void *arg) {
     return NULL;
 }
 
+static int ensure_runtime_prerequisites(void) {
+    if (g_tsd_config.check_interval_us <= 0) {
+        tsd_runtime_config_set_defaults(&g_tsd_config);
+        if (tsd_runtime_config_refresh_ticks(&g_tsd_config) != 0) {
+            return -1;
+        }
+    }
+    if (!tsd_cpu_has_sse41()) {
+        errno = ENOTSUP;
+        return -1;
+    }
+    if (tsd_trampoline_init() != 0 || tsd_trampoline_patch(SIMD_SSE41) != 0) {
+        return -1;
+    }
+
+    if (!tsd_runtime_flags_sandbox_complete()) {
+        tsd_runtime_flags_init();
+        char sandbox_diag[256] = {0};
+        int sandbox_rc = tsd_sandbox_run(sandbox_diag, sizeof(sandbox_diag));
+        if (sandbox_rc == 0) {
+            tsd_runtime_flags_record_sandbox_success();
+        } else {
+            tsd_runtime_flags_record_sandbox_failure(sandbox_diag);
+            tsd_log_warn(LOG_COMPONENT,
+                         "runtime sandbox failed: %s; continuing in SSE4.1-only safe mode",
+                         tsd_runtime_flags_status_message());
+        }
+    }
+    return 0;
+}
+
+int tsd_runtime_start(tsd_runtime_t **out_runtime, tsd_workload_fn workload) {
+    if (!out_runtime) {
+        errno = EINVAL;
+        return -1;
+    }
+    *out_runtime = NULL;
+
+    pthread_mutex_lock(&g_tsd_runtime_lock);
+    if (g_tsd_active_runtime) {
+        pthread_mutex_unlock(&g_tsd_runtime_lock);
+        errno = EBUSY;
+        return -1;
+    }
+    if (ensure_runtime_prerequisites() != 0) {
+        pthread_mutex_unlock(&g_tsd_runtime_lock);
+        return -1;
+    }
+
+    tsd_runtime_t *runtime = calloc(1, sizeof(*runtime));
+    if (!runtime) {
+        pthread_mutex_unlock(&g_tsd_runtime_lock);
+        return -1;
+    }
+
+    runtime->perf = tsd_perf_init(workload);
+    if (!runtime->perf) {
+        free(runtime);
+        pthread_mutex_unlock(&g_tsd_runtime_lock);
+        return -1;
+    }
+
+    tsd_perf_mode_t mode = tsd_perf_get_mode(runtime->perf);
+    if (mode == TSD_PERF_MODE_HARDWARE) {
+        tsd_perf_enable(runtime->perf);
+    }
+    tsd_perf_measure_baseline(runtime->perf, &g_tsd_config);
+
+    /* Baseline/telemetry validation may fail closed, but never start wide. */
+    if (atomic_load_explicit(&g_tsd_current_width, memory_order_acquire) != SIMD_SSE41) {
+        if (tsd_trampoline_patch(SIMD_SSE41) != 0) {
+            tsd_perf_cleanup(runtime->perf);
+            free(runtime);
+            pthread_mutex_unlock(&g_tsd_runtime_lock);
+            return -1;
+        }
+    }
+
+    g_tsd_stop_requested = 0;
+    atomic_store_explicit(&g_tsd_running, 1, memory_order_release);
+    int monitor_err = pthread_create(&runtime->monitor, NULL, thermal_monitor_thread, runtime->perf);
+    if (monitor_err != 0) {
+        atomic_store_explicit(&g_tsd_running, 0, memory_order_release);
+        tsd_perf_cleanup(runtime->perf);
+        free(runtime);
+        pthread_mutex_unlock(&g_tsd_runtime_lock);
+        errno = monitor_err;
+        return -1;
+    }
+    runtime->monitor_started = 1;
+    g_tsd_active_runtime = runtime;
+    *out_runtime = runtime;
+
+    tsd_log_info(LOG_COMPONENT,
+                 "adaptive runtime started in SSE4.1 safe mode; perf=%s workload_cpu=%d monitor_cpu=%d",
+                 tsd_perf_get_mode(runtime->perf) == TSD_PERF_MODE_HARDWARE ? "hardware" : "software",
+                 tsd_perf_get_pinned_cpu(runtime->perf),
+                 tsd_perf_get_monitor_cpu(runtime->perf));
+    pthread_mutex_unlock(&g_tsd_runtime_lock);
+    return 0;
+}
+
+void tsd_runtime_request_stop(tsd_runtime_t *runtime) {
+    if (!runtime) return;
+    atomic_store_explicit(&g_tsd_running, 0, memory_order_release);
+}
+
+int tsd_runtime_stop(tsd_runtime_t *runtime) {
+    if (!runtime) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    pthread_mutex_lock(&g_tsd_runtime_lock);
+    if (runtime != g_tsd_active_runtime) {
+        pthread_mutex_unlock(&g_tsd_runtime_lock);
+        errno = EINVAL;
+        return -1;
+    }
+
+    atomic_store_explicit(&g_tsd_running, 0, memory_order_release);
+    if (runtime->monitor_started) {
+        pthread_join(runtime->monitor, NULL);
+        runtime->monitor_started = 0;
+    }
+    if (atomic_load_explicit(&g_tsd_current_width, memory_order_acquire) != SIMD_SSE41) {
+        (void)tsd_trampoline_patch(SIMD_SSE41);
+    }
+    tsd_perf_cleanup(runtime->perf);
+    runtime->perf = NULL;
+    g_tsd_active_runtime = NULL;
+    free(runtime);
+    pthread_mutex_unlock(&g_tsd_runtime_lock);
+    return 0;
+}
+
+int tsd_runtime_is_running(const tsd_runtime_t *runtime) {
+    return runtime && runtime == g_tsd_active_runtime &&
+           atomic_load_explicit(&g_tsd_running, memory_order_acquire);
+}
+
+tsd_perf_mode_t tsd_runtime_perf_mode(const tsd_runtime_t *runtime) {
+    if (!runtime || runtime != g_tsd_active_runtime || !runtime->perf) {
+        return TSD_PERF_MODE_NONE;
+    }
+    return tsd_perf_get_mode(runtime->perf);
+}
+
 static void run_demo(void) TSD_MAYBE_UNUSED;
 static void run_demo(void) {
-    atomic_store_explicit(&g_tsd_running, 1, memory_order_release);
-    perf_ctx_t *perf = tsd_perf_init(workload_once);
-    if (!perf) {
-        tsd_log_warn(LOG_COMPONENT, "Performance monitoring unavailable; running without thermal adaptation.");
-        tsd_log_info(LOG_COMPONENT, "Suggestions: run as root, adjust kernel.perf_event_paranoid, or add container capabilities.");
-        tsd_demo_result_t result = run_workload_for_duration(g_tsd_config.demo_duration_sec,
-                                                             g_tsd_config.work_iters);
+    tsd_runtime_t *runtime = NULL;
+    if (tsd_runtime_start(&runtime, workload_once) != 0) {
+        char errbuf[128];
+        tsd_log_error(LOG_COMPONENT, "Failed to start adaptive runtime: %s",
+                      tsd_log_strerror(errno, errbuf, sizeof(errbuf)));
+        g_tsd_stop_requested = 0;
+        atomic_store_explicit(&g_tsd_running, 1, memory_order_release);
+        tsd_demo_result_t result = run_workload(g_tsd_config.demo_duration_sec,
+                                                g_tsd_config.work_iters,
+                                                g_tsd_config.run_forever);
         log_demo_result(&result);
         return;
     }
 
-    tsd_perf_mode_t mode = tsd_perf_get_mode(perf);
-    if (mode == TSD_PERF_MODE_HARDWARE) {
-        tsd_perf_enable(perf);
-        tsd_perf_measure_baseline(perf, &g_tsd_config);
-        tsd_log_info(LOG_COMPONENT, "Perf target CPU: %d (monitor thread on CPU %d)",
-                     tsd_perf_get_pinned_cpu(perf), tsd_perf_get_monitor_cpu(perf));
+    if (g_tsd_config.run_forever) {
+        tsd_log_info(LOG_COMPONENT, "Running persistent workload until SIGINT/SIGTERM (batch iterations: %d)",
+                     g_tsd_config.work_iters);
     } else {
-        tsd_log_warn(LOG_COMPONENT, "Hardware performance counters unavailable; using software telemetry fallback.");
-        tsd_perf_measure_baseline(perf, &g_tsd_config);
+        tsd_log_info(LOG_COMPONENT, "Running workload for %d wall-clock seconds (batch iterations: %d)",
+                     g_tsd_config.demo_duration_sec, g_tsd_config.work_iters);
     }
-
-    pthread_t monitor;
-    int monitor_err = pthread_create(&monitor, NULL, thermal_monitor_thread, perf);
-    if (monitor_err != 0) {
-        char errbuf[128];
-        tsd_log_error(LOG_COMPONENT, "Failed to start monitor thread: %s",
-                      tsd_log_strerror(monitor_err, errbuf, sizeof(errbuf)));
-        atomic_store_explicit(&g_tsd_running, 0, memory_order_release);
-        tsd_perf_cleanup(perf);
-        return;
-    }
-
-    tsd_log_info(LOG_COMPONENT, "Running workload for %d wall-clock seconds (batch iterations: %d)",
-                 g_tsd_config.demo_duration_sec, g_tsd_config.work_iters);
     tsd_log_info(LOG_COMPONENT, "Tip: stress-ng --cpu 8 --cpu-load 100 to simulate thermal load");
-    tsd_demo_result_t result = run_workload_for_duration(g_tsd_config.demo_duration_sec,
-                                                         g_tsd_config.work_iters);
+
+    tsd_demo_result_t result = run_workload(g_tsd_config.demo_duration_sec,
+                                            g_tsd_config.work_iters,
+                                            g_tsd_config.run_forever);
     log_demo_result(&result);
-    atomic_store_explicit(&g_tsd_running, 0, memory_order_release);
-    pthread_join(monitor, NULL);
-    tsd_perf_cleanup(perf);
+    tsd_runtime_request_stop(runtime);
+    if (tsd_runtime_stop(runtime) != 0) {
+        tsd_log_error(LOG_COMPONENT, "adaptive runtime cleanup failed");
+    }
+}
+
+static void install_runtime_signal_handlers(void) {
+    struct sigaction reload_action;
+    memset(&reload_action, 0, sizeof(reload_action));
+    reload_action.sa_handler = tsd_handle_sighup;
+    sigemptyset(&reload_action.sa_mask);
+    if (sigaction(SIGHUP, &reload_action, NULL) != 0) {
+        char errbuf[128];
+        tsd_log_warn(LOG_COMPONENT, "Unable to install executable SIGHUP reload handler: %s",
+                     tsd_log_strerror(errno, errbuf, sizeof(errbuf)));
+    }
+
+    struct sigaction stop_action;
+    memset(&stop_action, 0, sizeof(stop_action));
+    stop_action.sa_handler = tsd_handle_shutdown_signal;
+    sigemptyset(&stop_action.sa_mask);
+    if (sigaction(SIGINT, &stop_action, NULL) != 0 || sigaction(SIGTERM, &stop_action, NULL) != 0) {
+        char errbuf[128];
+        tsd_log_warn(LOG_COMPONENT, "Unable to install graceful shutdown handlers: %s",
+                     tsd_log_strerror(errno, errbuf, sizeof(errbuf)));
+    }
 }
 
 #undef TSD_MAYBE_UNUSED
@@ -563,26 +749,20 @@ int tsd_dispatcher_main(int argc, char **argv) {
 
     if (tsd_trampoline_init() != 0) {
         tsd_log_error(LOG_COMPONENT, "Failed to create trampolines");
-        if (metrics_started) {
-            tsd_metrics_exporter_stop();
-        }
+        if (metrics_started) tsd_metrics_exporter_stop();
         return 1;
     }
 
     simd_width_t max_width = tsd_detect_max_simd(&g_tsd_config);
     if (max_width == SIMD_SSE41 && !tsd_cpu_has_sse41()) {
         tsd_log_error(LOG_COMPONENT, "SSE4.1 required but not available");
-        if (metrics_started) {
-            tsd_metrics_exporter_stop();
-        }
+        if (metrics_started) tsd_metrics_exporter_stop();
         return 1;
     }
 
     if (tsd_trampoline_patch(SIMD_SSE41) != 0) {
         tsd_log_error(LOG_COMPONENT, "Failed to install baseline trampoline patch");
-        if (metrics_started) {
-            tsd_metrics_exporter_stop();
-        }
+        if (metrics_started) tsd_metrics_exporter_stop();
         return 1;
     }
 
@@ -598,25 +778,20 @@ int tsd_dispatcher_main(int argc, char **argv) {
     }
 
     if (tsd_runtime_flags_sandbox_only()) {
-        if (metrics_started) {
-            tsd_metrics_exporter_stop();
-        }
+        if (metrics_started) tsd_metrics_exporter_stop();
         return sandbox_rc == 0 ? 0 : 1;
     }
 
-    if (tsd_runtime_flags_allow_transitions() && max_width != SIMD_SSE41) {
-        if (tsd_trampoline_patch(max_width) != 0) {
-            tsd_log_error(LOG_COMPONENT, "Failed to install initial trampoline patch");
-            if (metrics_started) {
-                tsd_metrics_exporter_stop();
-            }
-            return 1;
+    if (max_width != SIMD_SSE41) {
+        if (tsd_runtime_flags_allow_transitions()) {
+            tsd_log_info(LOG_COMPONENT,
+                         "Detected wider SIMD capability but retaining SSE4.1 until live perf/thermal validation authorizes upgrade");
+        } else {
+            tsd_log_warn(LOG_COMPONENT,
+                         "Operating in safe SIMD mode; detected maximum %d but constrained: %s",
+                         (int)max_width,
+                         tsd_runtime_flags_status_message());
         }
-    } else if (!tsd_runtime_flags_allow_transitions() && max_width != SIMD_SSE41) {
-        tsd_log_warn(LOG_COMPONENT,
-                     "Operating in safe SIMD mode; detected maximum %d but constrained: %s",
-                     (int)max_width,
-                     tsd_runtime_flags_status_message());
     }
 
     print_configuration(max_width);
@@ -624,26 +799,13 @@ int tsd_dispatcher_main(int argc, char **argv) {
     if (g_tsd_config.health_check_mode) {
         tsd_log_info(LOG_COMPONENT, "Running health check mode");
         int rc = tsd_run_health_check();
-        if (metrics_started) {
-            tsd_metrics_exporter_stop();
-        }
+        if (metrics_started) tsd_metrics_exporter_stop();
         return (sandbox_rc == 0) ? rc : 1;
     }
 
-    struct sigaction reload_action;
-    memset(&reload_action, 0, sizeof(reload_action));
-    reload_action.sa_handler = tsd_handle_sighup;
-    sigemptyset(&reload_action.sa_mask);
-    if (sigaction(SIGHUP, &reload_action, NULL) != 0) {
-        char errbuf[128];
-        tsd_log_warn(LOG_COMPONENT, "Unable to install executable SIGHUP reload handler: %s",
-                     tsd_log_strerror(errno, errbuf, sizeof(errbuf)));
-    }
-
+    install_runtime_signal_handlers();
     run_demo();
-    if (metrics_started) {
-        tsd_metrics_exporter_stop();
-    }
+    if (metrics_started) tsd_metrics_exporter_stop();
     return 0;
 }
 
@@ -664,7 +826,8 @@ void tsd_test_reset_runtime(void) {
     tsd_cpu_clear_detect_override();
     tsd_reset_patch_state();
     atomic_store_explicit(&g_tsd_running, 1, memory_order_relaxed);
-    atomic_store_explicit(&g_tsd_reload_requested, 0, memory_order_relaxed);
+    g_tsd_reload_requested = 0;
+    g_tsd_stop_requested = 0;
     atomic_store_explicit(&g_tsd_workload_iterations, 0, memory_order_relaxed);
     tsd_runtime_config_refresh_ticks(&g_tsd_config);
     tsd_runtime_flags_record_sandbox_success();
