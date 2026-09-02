@@ -82,6 +82,21 @@ static void test_cli_predictive_and_metrics(void) {
     assert(cfg.statsd_port == 9000);
 }
 
+static void test_service_cli(void) {
+    tsd_runtime_config cfg;
+    char *argv[] = {
+        "thermal_simd",
+        "--run-forever",
+        "--work-iters=1234",
+        "--duration-sec=17",
+    };
+    assert(tsd_runtime_config_parse_cli(&cfg, 4, argv) == 0);
+    assert(cfg.run_forever == 1);
+    assert(cfg.work_iters == 1234);
+    /* Finite duration remains configured but is ignored by persistent mode. */
+    assert(cfg.demo_duration_sec == 17);
+}
+
 static void test_config_file_loading(void) {
     char path[64];
     const char *json =
@@ -172,6 +187,7 @@ static void test_cli_overrides_config(void) {
 
 int main(void) {
     test_cli_predictive_and_metrics();
+    test_service_cli();
     test_config_file_loading();
     test_cli_overrides_config();
     return 0;
