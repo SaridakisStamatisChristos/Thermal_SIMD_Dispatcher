@@ -15,6 +15,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include <observability/telemetry_state.h>
 #include <thermal/simd/statistics.h>
 #include <thermal/simd/telemetry_helper.h>
 #include <thermal/simd/telemetry_fusion.h>
@@ -29,6 +30,8 @@
 #define MPKI_SCALE 1000000ULL
 #define TSD_TEMP_REF_MILLIC 85000
 #define TSD_FREQ_REF_MILLI 1000
+#define PERF_INITIAL_BACKOFF_SEC 5
+#define PERF_MAX_BACKOFF_SEC 60
 
 typedef struct {
     uint64_t nr;
@@ -48,8 +51,8 @@ struct perf_ctx {
     uint64_t slow_llc_mpki;
     uint64_t fast_llc_mpki;
     uint32_t ratio_history[RATIO_HISTORY];
-    size_t   ratio_history_count;
-    size_t   ratio_history_cursor;
+    size_t ratio_history_count;
+    size_t ratio_history_cursor;
     uint32_t ratio_trimmed_milli;
     int pinned_cpu;
     int monitor_cpu;
@@ -64,6 +67,9 @@ struct perf_ctx {
     tsd_telemetry_helper_t telemetry;
     struct timespec mode_entered_at;
     int timeout_notified;
+    time_t perf_retry_deadline;
+    int perf_retry_backoff_seconds;
+    int force_software;
 };
 
 _Atomic(uint64_t) g_tsd_workload_iterations = 0;
@@ -72,6 +78,7 @@ static int warned_llc_unavailable = 0;
 static int warned_perf_group_layout = 0;
 
 static uint64_t timespec_diff_ns(const struct timespec *start, const struct timespec *end);
+static void perf_fail_closed(perf_ctx_t *ctx, const char *reason);
 
 static int allow_software_upgrades(void) {
     static int cached = -1;
@@ -79,51 +86,68 @@ static int allow_software_upgrades(void) {
         return cached;
     }
     const char *env = getenv("TSD_ALLOW_SOFTWARE_UPGRADES");
-    if (env && env[0] != '\0' && strcmp(env, "0") != 0) {
-        cached = 1;
-    } else {
-        cached = 0;
-    }
+    cached = (env && env[0] != '\0' && strcmp(env, "0") != 0) ? 1 : 0;
     return cached;
 }
 
-#ifdef TSD_ENABLE_TESTS
-#define TSD_PERF_TEST_MAX_STREAMS 4
-#define TSD_PERF_TEST_READ_DEFER ((ssize_t)-2)
-
-typedef struct {
-    tsd_perf_test_read_stream_t spec;
-    size_t step_index;
-    size_t data_offset;
-} tsd_perf_test_read_stream_state_t;
-
-static tsd_perf_test_read_stream_state_t g_test_read_streams[TSD_PERF_TEST_MAX_STREAMS] = {0};
-static size_t g_test_read_stream_count = 0;
-#endif
-
-#ifdef TSD_ENABLE_TESTS
-typedef ssize_t (*tsd_perf_test_read_hook_t)(int fd, void *buf, size_t count);
-static tsd_perf_test_read_hook_t g_test_read_hook = NULL;
-#endif
-
-static ssize_t tsd_perf_sys_read(int fd, void *buf, size_t count) {
-#ifdef TSD_ENABLE_TESTS
-    if (g_test_read_hook) {
-        ssize_t rv = g_test_read_hook(fd, buf, count);
-        if (rv != TSD_PERF_TEST_READ_DEFER) {
-            return rv;
-        }
+static void publish_perf_state(const perf_ctx_t *ctx, int healthy) {
+    if (!ctx) {
+        return;
     }
-#endif
-    return read(fd, buf, count);
+    tsd_perf_telemetry_t telemetry = {0};
+    telemetry.mode = (int)ctx->mode;
+    telemetry.counters_healthy = healthy ? 1 : 0;
+    telemetry.pinned_cpu = ctx->pinned_cpu;
+    telemetry.monitor_cpu = ctx->monitor_cpu;
+    tsd_observability_update_perf(&telemetry);
+}
+
+static time_t now_seconds(void) {
+    time_t now = time(NULL);
+    return now < 0 ? 0 : now;
+}
+
+static void reset_perf_retry(perf_ctx_t *ctx) {
+    if (!ctx) {
+        return;
+    }
+    ctx->perf_retry_deadline = 0;
+    ctx->perf_retry_backoff_seconds = PERF_INITIAL_BACKOFF_SEC;
+}
+
+static void schedule_perf_retry(perf_ctx_t *ctx) {
+    if (!ctx || ctx->force_software) {
+        return;
+    }
+    if (ctx->perf_retry_backoff_seconds <= 0) {
+        ctx->perf_retry_backoff_seconds = PERF_INITIAL_BACKOFF_SEC;
+    }
+    int delay = ctx->perf_retry_backoff_seconds;
+    if (delay > PERF_MAX_BACKOFF_SEC) {
+        delay = PERF_MAX_BACKOFF_SEC;
+    }
+    ctx->perf_retry_deadline = now_seconds() + (time_t)delay;
+    if (ctx->perf_retry_backoff_seconds < PERF_MAX_BACKOFF_SEC) {
+        int next = ctx->perf_retry_backoff_seconds * 2;
+        ctx->perf_retry_backoff_seconds = next > PERF_MAX_BACKOFF_SEC ? PERF_MAX_BACKOFF_SEC : next;
+    }
+}
+
+static int perf_retry_due(const perf_ctx_t *ctx) {
+    if (!ctx || ctx->force_software) {
+        return 0;
+    }
+    return ctx->perf_retry_deadline == 0 || now_seconds() >= ctx->perf_retry_deadline;
 }
 
 static void perf_set_mode(perf_ctx_t *ctx, tsd_perf_mode_t mode, const char *reason) {
     if (!ctx) {
         return;
     }
-    if (ctx->mode == mode) {
+    tsd_perf_mode_t previous = ctx->mode;
+    if (previous == mode) {
         clock_gettime(CLOCK_MONOTONIC, &ctx->mode_entered_at);
+        publish_perf_state(ctx, mode == TSD_PERF_MODE_HARDWARE);
         return;
     }
     ctx->mode = mode;
@@ -142,27 +166,57 @@ static void perf_set_mode(perf_ctx_t *ctx, tsd_perf_mode_t mode, const char *rea
                 tsd_log_warn(LOG_COMPONENT, "event=perf_mode action=forced-width width=SSE4.1 reason=%s", why);
             }
         }
+        publish_perf_state(ctx, 0);
     } else if (mode == TSD_PERF_MODE_HARDWARE) {
-        tsd_metrics_increment(TSD_METRIC_PERF_RECOVERIES);
+        if (previous == TSD_PERF_MODE_SOFTWARE) {
+            tsd_metrics_increment(TSD_METRIC_PERF_RECOVERIES);
+        }
         tsd_runtime_config_exit_degraded_mode(&g_tsd_config, why);
         tsd_log_info(LOG_COMPONENT,
                      "event=perf_mode state=hardware reason=%s pinned_cpu=%d monitor_cpu=%d",
                      why, ctx->pinned_cpu, ctx->monitor_cpu);
+        publish_perf_state(ctx, 1);
+    } else {
+        publish_perf_state(ctx, 0);
     }
 }
 
 static int perf_software_timeout_exceeded(perf_ctx_t *ctx, int timeout_sec) {
-    if (!ctx || timeout_sec <= 0) {
-        return 0;
-    }
-    if (ctx->mode != TSD_PERF_MODE_SOFTWARE) {
+    if (!ctx || timeout_sec <= 0 || ctx->mode != TSD_PERF_MODE_SOFTWARE) {
         return 0;
     }
     struct timespec now = {0};
     clock_gettime(CLOCK_MONOTONIC, &now);
     uint64_t elapsed_ns = timespec_diff_ns(&ctx->mode_entered_at, &now);
-    uint64_t limit_ns = (uint64_t)timeout_sec * UINT64_C(1000000000);
-    return elapsed_ns >= limit_ns;
+    return elapsed_ns >= (uint64_t)timeout_sec * UINT64_C(1000000000);
+}
+
+#ifdef TSD_ENABLE_TESTS
+#define TSD_PERF_TEST_MAX_STREAMS 4
+#define TSD_PERF_TEST_READ_DEFER ((ssize_t)-2)
+
+typedef struct {
+    tsd_perf_test_read_stream_t spec;
+    size_t step_index;
+    size_t data_offset;
+} tsd_perf_test_read_stream_state_t;
+
+static tsd_perf_test_read_stream_state_t g_test_read_streams[TSD_PERF_TEST_MAX_STREAMS] = {0};
+static size_t g_test_read_stream_count = 0;
+typedef ssize_t (*tsd_perf_test_read_hook_t)(int fd, void *buf, size_t count);
+static tsd_perf_test_read_hook_t g_test_read_hook = NULL;
+#endif
+
+static ssize_t tsd_perf_sys_read(int fd, void *buf, size_t count) {
+#ifdef TSD_ENABLE_TESTS
+    if (g_test_read_hook) {
+        ssize_t rv = g_test_read_hook(fd, buf, count);
+        if (rv != TSD_PERF_TEST_READ_DEFER) {
+            return rv;
+        }
+    }
+#endif
+    return read(fd, buf, count);
 }
 
 static int tsd_perf_read_exact(int fd, void *buf, size_t size) {
@@ -186,6 +240,7 @@ static int tsd_perf_read_exact(int fd, void *buf, size_t size) {
     }
     return 0;
 }
+
 #ifdef TSD_ENABLE_TESTS
 static ssize_t tsd_perf_test_stream_hook(int fd, void *buf, size_t count) {
     for (size_t i = 0; i < g_test_read_stream_count; ++i) {
@@ -220,7 +275,7 @@ static ssize_t tsd_perf_test_stream_hook(int fd, void *buf, size_t count) {
 }
 
 void tsd_perf_test_set_read_streams(const tsd_perf_test_read_stream_t *streams, size_t count) {
-    g_test_read_stream_count = (count > TSD_PERF_TEST_MAX_STREAMS) ? TSD_PERF_TEST_MAX_STREAMS : count;
+    g_test_read_stream_count = count > TSD_PERF_TEST_MAX_STREAMS ? TSD_PERF_TEST_MAX_STREAMS : count;
     for (size_t i = 0; i < g_test_read_stream_count; ++i) {
         g_test_read_streams[i].spec = streams[i];
         g_test_read_streams[i].step_index = 0;
@@ -248,6 +303,8 @@ perf_ctx_t* tsd_perf_test_create_dummy_context(void) {
     ctx->mode = TSD_PERF_MODE_NONE;
     ctx->pinned_cpu = 0;
     ctx->monitor_cpu = 0;
+    ctx->force_software = 1;
+    reset_perf_retry(ctx);
     return ctx;
 }
 
@@ -281,11 +338,9 @@ void tsd_test_perf_rewind_mode(perf_ctx_t *ctx, int seconds) {
     }
     clock_gettime(CLOCK_MONOTONIC, &ctx->mode_entered_at);
     if (seconds > 0) {
-        if (ctx->mode_entered_at.tv_sec > seconds) {
-            ctx->mode_entered_at.tv_sec -= seconds;
-        } else {
-            ctx->mode_entered_at.tv_sec = 0;
-        }
+        ctx->mode_entered_at.tv_sec = ctx->mode_entered_at.tv_sec > seconds
+                                          ? ctx->mode_entered_at.tv_sec - seconds
+                                          : 0;
     }
     ctx->timeout_notified = 0;
 }
@@ -333,7 +388,7 @@ static void fetch_fused_telemetry(perf_ctx_t *ctx, tsd_telemetry_sample_t *out) 
     if (tsd_telemetry_fusion_sample(out) == 0) {
         return;
     }
-    tsd_telemetry_helper_sample(&ctx->telemetry, out);
+    (void)tsd_telemetry_helper_sample(&ctx->telemetry, out);
 }
 
 static void try_perf_ioctl(int fd, unsigned long request, const char *what) {
@@ -363,7 +418,7 @@ static uint64_t timespec_diff_ns(const struct timespec *start, const struct time
     if (sec < 0) {
         return 0;
     }
-    return (uint64_t)sec * 1000000000ULL + (uint64_t)nsec;
+    return (uint64_t)sec * UINT64_C(1000000000) + (uint64_t)nsec;
 }
 
 static inline uint64_t scale_counter(uint64_t delta, uint64_t time_enabled, uint64_t time_running) {
@@ -374,48 +429,76 @@ static inline uint64_t scale_counter(uint64_t delta, uint64_t time_enabled, uint
     return (uint64_t)(num / (__uint128_t)time_running);
 }
 
-perf_ctx_t* tsd_perf_init(tsd_workload_fn workload_cb) {
-    perf_ctx_t *ctx = calloc(1, sizeof(perf_ctx_t));
+static void close_perf_events(perf_ctx_t *ctx) {
     if (!ctx) {
-        return NULL;
+        return;
+    }
+    if (ctx->fd_cycles >= 0) {
+        close(ctx->fd_cycles);
+    }
+    if (ctx->fd_insns >= 0) {
+        close(ctx->fd_insns);
+    }
+    if (ctx->fd_llc_misses >= 0) {
+        close(ctx->fd_llc_misses);
     }
     ctx->fd_cycles = -1;
     ctx->fd_insns = -1;
     ctx->fd_llc_misses = -1;
     ctx->last_group_valid = 0;
     ctx->last_llc_value = 0;
-    ctx->mode = TSD_PERF_MODE_NONE;
-    ctx->software_adaptation = 0;
-    ctx->sw_last_iterations = 0;
-    ctx->sw_last_timestamp.tv_sec = 0;
-    ctx->sw_last_timestamp.tv_nsec = 0;
-    ctx->workload = workload_cb;
-    clock_gettime(CLOCK_MONOTONIC, &ctx->mode_entered_at);
-    ctx->timeout_notified = 0;
+}
 
-    cpu_set_t cpuset;
-    CPU_ZERO(&cpuset);
-    CPU_SET(0, &cpuset);
-    (void)sched_setaffinity(0, sizeof(cpuset), &cpuset);
-    ctx->pinned_cpu = 0;
-    ctx->monitor_cpu = 0;
-    long cpu_count = sysconf(_SC_NPROCESSORS_ONLN);
-    if (cpu_count > 1) {
-        ctx->monitor_cpu = (ctx->pinned_cpu + 1) % (int)cpu_count;
-        if (ctx->monitor_cpu == ctx->pinned_cpu) {
-            ctx->monitor_cpu = ctx->pinned_cpu;
+static void select_runtime_cpus(perf_ctx_t *ctx) {
+    if (!ctx) {
+        return;
+    }
+    cpu_set_t allowed;
+    CPU_ZERO(&allowed);
+    int first = -1;
+    int second = -1;
+    if (sched_getaffinity(0, sizeof(allowed), &allowed) == 0) {
+        for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
+            if (!CPU_ISSET(cpu, &allowed)) {
+                continue;
+            }
+            if (first < 0) {
+                first = cpu;
+            } else {
+                second = cpu;
+                break;
+            }
         }
     }
-
-    tsd_telemetry_helper_init(&ctx->telemetry, ctx->monitor_cpu);
-    tsd_telemetry_fusion_start();
-
-    const char *force_sw_env = getenv("TSD_FAKE_PERF");
-    int force_sw = force_sw_env && force_sw_env[0] != '\0' && strcmp(force_sw_env, "0") != 0;
-    if (force_sw) {
-        perf_set_mode(ctx, TSD_PERF_MODE_SOFTWARE, "forced");
-        return ctx;
+    if (first < 0) {
+        int current = sched_getcpu();
+        first = current >= 0 ? current : 0;
+        second = first;
+        tsd_log_warn(LOG_COMPONENT, "sched_getaffinity failed; using current cpu=%d", first);
     }
+    if (second < 0) {
+        second = first;
+    }
+
+    ctx->pinned_cpu = first;
+    ctx->monitor_cpu = second;
+
+    cpu_set_t pin;
+    CPU_ZERO(&pin);
+    CPU_SET((size_t)first, &pin);
+    if (sched_setaffinity(0, sizeof(pin), &pin) != 0) {
+        char errbuf[128];
+        tsd_log_warn(LOG_COMPONENT, "failed to pin workload cpu=%d: %s", first,
+                     tsd_log_strerror(errno, errbuf, sizeof(errbuf)));
+    }
+}
+
+static int open_perf_events(perf_ctx_t *ctx) {
+    if (!ctx) {
+        errno = EINVAL;
+        return -1;
+    }
+    close_perf_events(ctx);
 
     struct perf_event_attr pe = {0};
     pe.type = PERF_TYPE_HARDWARE;
@@ -428,19 +511,7 @@ perf_ctx_t* tsd_perf_init(tsd_workload_fn workload_cb) {
     pe.config = PERF_COUNT_HW_CPU_CYCLES;
     long fd_cycles = perf_event_open_sys(&pe, 0, ctx->pinned_cpu, -1, 0);
     if (fd_cycles < 0) {
-        int err = errno;
-        char errbuf[128];
-        if (should_fallback_to_software(err)) {
-            tsd_log_warn(LOG_COMPONENT,
-                         "perf_event_open cycles (falling back to software): %s",
-                         tsd_log_strerror(err, errbuf, sizeof(errbuf)));
-            perf_set_mode(ctx, TSD_PERF_MODE_SOFTWARE, "cycles-permission");
-            return ctx;
-        }
-        tsd_log_error(LOG_COMPONENT, "perf_event_open cycles: %s",
-                      tsd_log_strerror(err, errbuf, sizeof(errbuf)));
-        free(ctx);
-        return NULL;
+        return -1;
     }
     ctx->fd_cycles = (int)fd_cycles;
 
@@ -448,20 +519,9 @@ perf_ctx_t* tsd_perf_init(tsd_workload_fn workload_cb) {
     long fd_insns = perf_event_open_sys(&pe, 0, ctx->pinned_cpu, ctx->fd_cycles, 0);
     if (fd_insns < 0) {
         int err = errno;
-        char errbuf[128];
-        close(ctx->fd_cycles);
-        ctx->fd_cycles = -1;
-        if (should_fallback_to_software(err)) {
-            tsd_log_warn(LOG_COMPONENT,
-                         "perf_event_open instructions (falling back to software): %s",
-                         tsd_log_strerror(err, errbuf, sizeof(errbuf)));
-            perf_set_mode(ctx, TSD_PERF_MODE_SOFTWARE, "instructions-permission");
-            return ctx;
-        }
-        tsd_log_error(LOG_COMPONENT, "perf_event_open instructions: %s",
-                      tsd_log_strerror(err, errbuf, sizeof(errbuf)));
-        free(ctx);
-        return NULL;
+        close_perf_events(ctx);
+        errno = err;
+        return -1;
     }
     ctx->fd_insns = (int)fd_insns;
 
@@ -480,6 +540,59 @@ perf_ctx_t* tsd_perf_init(tsd_workload_fn workload_cb) {
         }
     } else {
         ctx->fd_llc_misses = (int)fd_llc;
+    }
+    reset_perf_retry(ctx);
+    return 0;
+}
+
+static void perf_fail_closed(perf_ctx_t *ctx, const char *reason) {
+    if (!ctx) {
+        return;
+    }
+    close_perf_events(ctx);
+    ctx->software_adaptation = 0;
+    schedule_perf_retry(ctx);
+    perf_set_mode(ctx, TSD_PERF_MODE_SOFTWARE, reason ? reason : "counter-loss");
+}
+
+perf_ctx_t* tsd_perf_init(tsd_workload_fn workload_cb) {
+    perf_ctx_t *ctx = calloc(1, sizeof(perf_ctx_t));
+    if (!ctx) {
+        return NULL;
+    }
+    ctx->fd_cycles = -1;
+    ctx->fd_insns = -1;
+    ctx->fd_llc_misses = -1;
+    ctx->mode = TSD_PERF_MODE_NONE;
+    ctx->workload = workload_cb;
+    reset_perf_retry(ctx);
+    clock_gettime(CLOCK_MONOTONIC, &ctx->mode_entered_at);
+    select_runtime_cpus(ctx);
+    publish_perf_state(ctx, 0);
+
+    (void)tsd_telemetry_helper_init(&ctx->telemetry, ctx->pinned_cpu);
+    (void)tsd_telemetry_fusion_start_for_cpu(ctx->pinned_cpu);
+
+    const char *force_sw_env = getenv("TSD_FAKE_PERF");
+    ctx->force_software = force_sw_env && force_sw_env[0] != '\0' && strcmp(force_sw_env, "0") != 0;
+    if (ctx->force_software) {
+        perf_set_mode(ctx, TSD_PERF_MODE_SOFTWARE, "forced");
+        return ctx;
+    }
+
+    if (open_perf_events(ctx) != 0) {
+        int err = errno;
+        char errbuf[128];
+        if (should_fallback_to_software(err)) {
+            tsd_log_warn(LOG_COMPONENT, "perf_event_open unavailable; falling back to software: %s",
+                         tsd_log_strerror(err, errbuf, sizeof(errbuf)));
+        } else {
+            tsd_log_error(LOG_COMPONENT, "perf_event_open failed; entering recoverable software mode: %s",
+                          tsd_log_strerror(err, errbuf, sizeof(errbuf)));
+        }
+        schedule_perf_retry(ctx);
+        perf_set_mode(ctx, TSD_PERF_MODE_SOFTWARE, "perf-open");
+        return ctx;
     }
 
     perf_set_mode(ctx, TSD_PERF_MODE_HARDWARE, "init");
@@ -512,17 +625,11 @@ void tsd_perf_cleanup(perf_ctx_t *ctx) {
         return;
     }
     tsd_perf_disable(ctx);
-    if (ctx->fd_cycles >= 0) {
-        close(ctx->fd_cycles);
-    }
-    if (ctx->fd_insns >= 0) {
-        close(ctx->fd_insns);
-    }
-    if (ctx->fd_llc_misses >= 0) {
-        close(ctx->fd_llc_misses);
-    }
+    close_perf_events(ctx);
     tsd_telemetry_helper_destroy(&ctx->telemetry);
     tsd_telemetry_fusion_stop();
+    ctx->mode = TSD_PERF_MODE_NONE;
+    publish_perf_state(ctx, 0);
     free(ctx);
 }
 
@@ -542,12 +649,12 @@ void tsd_perf_measure_baseline(perf_ctx_t *ctx, const tsd_runtime_config *cfg) {
             clock_gettime(CLOCK_MONOTONIC, &end);
         }
         uint64_t after_iters = atomic_load_explicit(&g_tsd_workload_iterations, memory_order_relaxed);
-        uint64_t delta_iters = (after_iters > before_iters) ? (after_iters - before_iters) : (uint64_t)loops;
+        uint64_t delta_iters = after_iters > before_iters ? after_iters - before_iters : (uint64_t)loops;
         uint64_t elapsed_ns = timespec_diff_ns(&start, &end);
         if (elapsed_ns == 0) {
             elapsed_ns = 1;
         }
-        uint64_t surrogate_cpi = (delta_iters == 0) ? 1000 : ((elapsed_ns * 1000ULL) / delta_iters);
+        uint64_t surrogate_cpi = delta_iters == 0 ? 1000 : ((elapsed_ns * 1000ULL) / delta_iters);
         if (surrogate_cpi == 0) {
             surrogate_cpi = 1000;
         }
@@ -565,21 +672,17 @@ void tsd_perf_measure_baseline(perf_ctx_t *ctx, const tsd_runtime_config *cfg) {
         clock_gettime(CLOCK_MONOTONIC, &ctx->sw_last_timestamp);
         tsd_log_info(LOG_COMPONENT, "Baseline (software) CPI surrogate: %lu.%03lu",
                      surrogate_cpi / 1000, surrogate_cpi % 1000);
-        tsd_log_info(LOG_COMPONENT, "Baseline MPKI surrogate: %lu.%03lu",
-                     ctx->baseline_llc_mpki_milli / 1000, ctx->baseline_llc_mpki_milli % 1000);
         return;
     }
 
     perf_group_read_t rd_before = {0}, rd_after = {0};
     uint64_t llc_before = 0, llc_after = 0;
     if (tsd_perf_read_exact(ctx->fd_cycles, &rd_before, sizeof(rd_before)) != 0 || rd_before.nr != 2) {
-        ctx->baseline_cpi = 1000;
+        perf_fail_closed(ctx, "baseline-read-before");
         return;
     }
-    if (ctx->fd_llc_misses >= 0) {
-        if (tsd_perf_read_exact(ctx->fd_llc_misses, &llc_before, sizeof(llc_before)) != 0) {
-            llc_before = 0;
-        }
+    if (ctx->fd_llc_misses >= 0 && tsd_perf_read_exact(ctx->fd_llc_misses, &llc_before, sizeof(llc_before)) != 0) {
+        llc_before = 0;
     }
     if (ctx->workload) {
         for (int i = 0; i < 100000; i++) {
@@ -587,13 +690,11 @@ void tsd_perf_measure_baseline(perf_ctx_t *ctx, const tsd_runtime_config *cfg) {
         }
     }
     if (tsd_perf_read_exact(ctx->fd_cycles, &rd_after, sizeof(rd_after)) != 0 || rd_after.nr != 2) {
-        ctx->baseline_cpi = 1000;
+        perf_fail_closed(ctx, "baseline-read-after");
         return;
     }
-    if (ctx->fd_llc_misses >= 0) {
-        if (tsd_perf_read_exact(ctx->fd_llc_misses, &llc_after, sizeof(llc_after)) != 0) {
-            llc_after = llc_before;
-        }
+    if (ctx->fd_llc_misses >= 0 && tsd_perf_read_exact(ctx->fd_llc_misses, &llc_after, sizeof(llc_after)) != 0) {
+        llc_after = llc_before;
     }
     uint64_t delta_cycles = scale_counter(rd_after.values[0] - rd_before.values[0],
                                           rd_after.time_enabled - rd_before.time_enabled,
@@ -601,13 +702,13 @@ void tsd_perf_measure_baseline(perf_ctx_t *ctx, const tsd_runtime_config *cfg) {
     uint64_t delta_insns = scale_counter(rd_after.values[1] - rd_before.values[1],
                                          rd_after.time_enabled - rd_before.time_enabled,
                                          rd_after.time_running - rd_before.time_running);
-    ctx->baseline_cpi = (delta_cycles * 1000) / (delta_insns ?: 1);
+    ctx->baseline_cpi = (delta_cycles * 1000) / (delta_insns ? delta_insns : 1);
     uint64_t delta_llc = (ctx->fd_llc_misses >= 0 && llc_after >= llc_before) ? (llc_after - llc_before) : 0;
     ctx->baseline_llc_mpki_milli = delta_insns ? (delta_llc * MPKI_SCALE) / delta_insns : 0;
     if (ctx->baseline_llc_mpki_milli == 0) {
         ctx->baseline_llc_mpki_milli = 1000;
     }
-    ctx->slow_cpi = ctx->fast_cpi = ctx->baseline_cpi ?: 1000;
+    ctx->slow_cpi = ctx->fast_cpi = ctx->baseline_cpi ? ctx->baseline_cpi : 1000;
     ctx->slow_llc_mpki = ctx->fast_llc_mpki = ctx->baseline_llc_mpki_milli;
     ctx->ratio_history_count = 0;
     ctx->ratio_history_cursor = 0;
@@ -621,7 +722,32 @@ void tsd_perf_measure_baseline(perf_ctx_t *ctx, const tsd_runtime_config *cfg) {
                  ctx->baseline_llc_mpki_milli / 1000, ctx->baseline_llc_mpki_milli % 1000);
     tsd_telemetry_sample_t baseline_sample = {0};
     fetch_fused_telemetry(ctx, &baseline_sample);
-    (void)baseline_sample;
+}
+
+static int try_recover_hardware(perf_ctx_t *ctx) {
+    if (!ctx || ctx->mode != TSD_PERF_MODE_SOFTWARE || !perf_retry_due(ctx)) {
+        return 0;
+    }
+    if (open_perf_events(ctx) != 0) {
+        int err = errno;
+        char errbuf[128];
+        tsd_log_debug(LOG_COMPONENT, "event=perf_reprobe state=pending errno=%d detail=%s",
+                      err, tsd_log_strerror(err, errbuf, sizeof(errbuf)));
+        schedule_perf_retry(ctx);
+        publish_perf_state(ctx, 0);
+        return 0;
+    }
+
+    perf_set_mode(ctx, TSD_PERF_MODE_HARDWARE, "reprobe");
+    tsd_perf_enable(ctx);
+    tsd_perf_measure_baseline(ctx, &g_tsd_config);
+    if (ctx->mode != TSD_PERF_MODE_HARDWARE) {
+        return 0;
+    }
+    ctx->software_adaptation = 0;
+    reset_perf_retry(ctx);
+    publish_perf_state(ctx, 1);
+    return 1;
 }
 
 static int process_measurement(perf_ctx_t *ctx, tsd_thermal_eval_t *out, uint64_t current_cpi,
@@ -633,24 +759,24 @@ static int process_measurement(perf_ctx_t *ctx, tsd_thermal_eval_t *out, uint64_
     ctx->fast_cpi = tsd_update_ewma(ctx->fast_cpi, current_cpi, FAST_EWMA_SHIFT);
     ctx->slow_cpi = tsd_update_ewma(ctx->slow_cpi, current_cpi, SLOW_EWMA_SHIFT);
     if (ctx->slow_cpi == 0) {
-        ctx->slow_cpi = current_cpi ?: (ctx->baseline_cpi ?: 1000);
+        ctx->slow_cpi = current_cpi ? current_cpi : (ctx->baseline_cpi ? ctx->baseline_cpi : 1000);
     }
     ctx->fast_llc_mpki = tsd_update_ewma(ctx->fast_llc_mpki, mpki_milli, FAST_EWMA_SHIFT);
     ctx->slow_llc_mpki = tsd_update_ewma(ctx->slow_llc_mpki, mpki_milli, SLOW_EWMA_SHIFT);
 
-    uint64_t reference_cpi = ctx->slow_cpi ?: (ctx->baseline_cpi ?: 1);
+    uint64_t reference_cpi = ctx->slow_cpi ? ctx->slow_cpi : (ctx->baseline_cpi ? ctx->baseline_cpi : 1);
     __uint128_t ratio_num = (__uint128_t)current_cpi * 1000u;
     uint64_t ratio_milli = (uint64_t)((ratio_num + reference_cpi / 2) / reference_cpi);
     if (ctx->ratio_history_count < RATIO_HISTORY) {
         ctx->ratio_history_count++;
     }
-    uint32_t stored_ratio = (ratio_milli > UINT32_MAX) ? UINT32_MAX : (uint32_t)ratio_milli;
+    uint32_t stored_ratio = ratio_milli > UINT32_MAX ? UINT32_MAX : (uint32_t)ratio_milli;
     ctx->ratio_history[ctx->ratio_history_cursor] = stored_ratio;
     ctx->ratio_history_cursor = (ctx->ratio_history_cursor + 1) % RATIO_HISTORY;
     ctx->ratio_trimmed_milli = tsd_compute_trimmed_mean(ctx->ratio_history, ctx->ratio_history_count);
 
-    uint64_t baseline_mpki = ctx->baseline_llc_mpki_milli ?: 1000;
-    uint64_t mpki_reference = ctx->slow_llc_mpki ?: mpki_milli;
+    uint64_t baseline_mpki = ctx->baseline_llc_mpki_milli ? ctx->baseline_llc_mpki_milli : 1000;
+    uint64_t mpki_reference = ctx->slow_llc_mpki ? ctx->slow_llc_mpki : mpki_milli;
     __uint128_t mpki_ratio_num = (__uint128_t)mpki_reference * 1000u;
     uint64_t mpki_ratio = (uint64_t)((mpki_ratio_num + baseline_mpki / 2) / baseline_mpki);
     int memory_bound = ctx->fd_llc_misses >= 0 && mpki_ratio > 2500;
@@ -658,7 +784,7 @@ static int process_measurement(perf_ctx_t *ctx, tsd_thermal_eval_t *out, uint64_
     uint64_t dynamic_threshold = cfg ? cfg->down_ratio_milli : 1500;
     if (ctx->fast_cpi > ctx->slow_cpi) {
         uint64_t delta = ctx->fast_cpi - ctx->slow_cpi;
-        uint64_t delta_ratio = (uint64_t)(((__uint128_t)delta * 1000u) / (ctx->slow_cpi ?: 1));
+        uint64_t delta_ratio = (uint64_t)(((__uint128_t)delta * 1000u) / (ctx->slow_cpi ? ctx->slow_cpi : 1));
         uint64_t slope_penalty = delta_ratio / 5;
         if (slope_penalty > dynamic_threshold / 4) {
             slope_penalty = dynamic_threshold / 4;
@@ -668,18 +794,15 @@ static int process_measurement(perf_ctx_t *ctx, tsd_thermal_eval_t *out, uint64_
         }
     }
     if (memory_bound && cfg) {
-        uint64_t guard = 0;
-        if (cfg->memory_guard_divisor > 0) {
-            guard = dynamic_threshold / (uint64_t)cfg->memory_guard_divisor;
-        }
+        uint64_t guard = cfg->memory_guard_divisor > 0
+                             ? dynamic_threshold / (uint64_t)cfg->memory_guard_divisor
+                             : 0;
         guard += (uint64_t)cfg->memory_guard_offset_milli;
         dynamic_threshold += guard;
     }
 
     uint64_t consensus_ratio = (ratio_milli + ctx->ratio_trimmed_milli) / 2;
-    uint64_t base_severity = (consensus_ratio > dynamic_threshold) ?
-                             (consensus_ratio - dynamic_threshold) : 0;
-
+    uint64_t base_severity = consensus_ratio > dynamic_threshold ? consensus_ratio - dynamic_threshold : 0;
     uint64_t thermal_severity = 0;
     if (cfg && telemetry) {
         if (telemetry->temp_available && cfg->thermal_temp_weight_milli > 0) {
@@ -697,7 +820,6 @@ static int process_measurement(perf_ctx_t *ctx, tsd_thermal_eval_t *out, uint64_
     }
 
     uint64_t severity = base_severity + thermal_severity;
-
     if (out) {
         out->cpi_milli = current_cpi;
         out->ratio_milli = (uint32_t)ratio_milli;
@@ -711,11 +833,6 @@ static int process_measurement(perf_ctx_t *ctx, tsd_thermal_eval_t *out, uint64_
             out->freq_ratio_available = telemetry->freq_ratio_available;
             out->package_temp_millic = telemetry->package_temp_millic;
             out->freq_ratio_milli = telemetry->freq_ratio_milli;
-        } else {
-            out->temp_available = 0;
-            out->freq_ratio_available = 0;
-            out->package_temp_millic = 0;
-            out->freq_ratio_milli = 0;
         }
     }
     return severity > 0;
@@ -725,7 +842,14 @@ int tsd_perf_evaluate(perf_ctx_t *ctx, tsd_thermal_eval_t *out, const tsd_runtim
     if (!ctx) {
         return 0;
     }
+    if (out) {
+        memset(out, 0, sizeof(*out));
+    }
+
     if (ctx->mode == TSD_PERF_MODE_SOFTWARE) {
+        if (try_recover_hardware(ctx)) {
+            return 0;
+        }
 #ifdef TSD_ENABLE_TESTS
         if (g_test_perf_script.enabled && g_test_perf_script.count > 0) {
             size_t script_index = g_test_perf_script.index;
@@ -733,17 +857,13 @@ int tsd_perf_evaluate(perf_ctx_t *ctx, tsd_thermal_eval_t *out, const tsd_runtim
             if (g_test_perf_script.index + 1 < g_test_perf_script.count) {
                 g_test_perf_script.index++;
             }
-            uint64_t baseline = ctx->slow_cpi ?: (ctx->baseline_cpi ?: 1000);
-            if (baseline == 0) {
-                baseline = 1000;
-            }
+            uint64_t baseline = ctx->slow_cpi ? ctx->slow_cpi : (ctx->baseline_cpi ? ctx->baseline_cpi : 1000);
             uint64_t current_cpi = (uint64_t)(((__uint128_t)baseline * ratio + 500u) / 1000u);
             tsd_telemetry_sample_t scripted_telemetry = {0};
             if (g_test_perf_script.telemetry_count > 0) {
-                size_t tele_index = script_index;
-                if (tele_index >= g_test_perf_script.telemetry_count) {
-                    tele_index = g_test_perf_script.telemetry_count - 1;
-                }
+                size_t tele_index = script_index < g_test_perf_script.telemetry_count
+                                        ? script_index
+                                        : g_test_perf_script.telemetry_count - 1;
                 scripted_telemetry = g_test_perf_script.telemetry[tele_index];
             } else {
                 fetch_fused_telemetry(ctx, &scripted_telemetry);
@@ -760,7 +880,7 @@ int tsd_perf_evaluate(perf_ctx_t *ctx, tsd_thermal_eval_t *out, const tsd_runtim
         struct timespec now = {0};
         clock_gettime(CLOCK_MONOTONIC, &now);
         uint64_t now_iters = atomic_load_explicit(&g_tsd_workload_iterations, memory_order_relaxed);
-        uint64_t delta_iters = (now_iters >= ctx->sw_last_iterations) ? (now_iters - ctx->sw_last_iterations) : 0;
+        uint64_t delta_iters = now_iters >= ctx->sw_last_iterations ? now_iters - ctx->sw_last_iterations : 0;
         uint64_t delta_ns = timespec_diff_ns(&ctx->sw_last_timestamp, &now);
         ctx->sw_last_iterations = now_iters;
         ctx->sw_last_timestamp = now;
@@ -769,7 +889,7 @@ int tsd_perf_evaluate(perf_ctx_t *ctx, tsd_thermal_eval_t *out, const tsd_runtim
         }
         uint64_t current_cpi = (delta_ns * 1000ULL) / delta_iters;
         if (current_cpi == 0) {
-            current_cpi = ctx->baseline_cpi ?: 1000;
+            current_cpi = ctx->baseline_cpi ? ctx->baseline_cpi : 1000;
         }
         tsd_telemetry_sample_t telemetry = {0};
         fetch_fused_telemetry(ctx, &telemetry);
@@ -778,25 +898,38 @@ int tsd_perf_evaluate(perf_ctx_t *ctx, tsd_thermal_eval_t *out, const tsd_runtim
 
     perf_group_read_t rd_now = {0};
     uint64_t llc_now = 0;
-    if (tsd_perf_read_exact(ctx->fd_cycles, &rd_now, sizeof(rd_now)) == 0 && rd_now.nr != 2 && !warned_perf_group_layout) {
-        tsd_log_warn(LOG_COMPONENT,
-                     "perf group returned %" PRIu64 " counters (expected 2); cycle telemetry disabled",
-                     (uint64_t)rd_now.nr);
-        warned_perf_group_layout = 1;
+    if (tsd_perf_read_exact(ctx->fd_cycles, &rd_now, sizeof(rd_now)) != 0) {
+        tsd_log_error(LOG_COMPONENT, "perf group read failed; entering software degraded mode");
+        perf_fail_closed(ctx, "group-read");
+        if (out) {
+            out->severity_milli = 1;
+        }
+        return 1;
     }
     if (rd_now.nr != 2) {
-        ctx->last_group_valid = 0;
-        return 0;
-    }
-    if (ctx->fd_llc_misses >= 0) {
-        if (tsd_perf_read_exact(ctx->fd_llc_misses, &llc_now, sizeof(llc_now)) != 0) {
-            llc_now = ctx->last_llc_value;
+        if (!warned_perf_group_layout) {
+            tsd_log_warn(LOG_COMPONENT,
+                         "perf group returned %" PRIu64 " counters (expected 2); entering software degraded mode",
+                         (uint64_t)rd_now.nr);
+            warned_perf_group_layout = 1;
         }
+        perf_fail_closed(ctx, "group-layout");
+        if (out) {
+            out->severity_milli = 1;
+        }
+        return 1;
+    }
+    if (ctx->fd_llc_misses >= 0 && tsd_perf_read_exact(ctx->fd_llc_misses, &llc_now, sizeof(llc_now)) != 0) {
+        tsd_log_warn(LOG_COMPONENT, "LLC counter read failed; disabling memory-bound guard until reprobe");
+        close(ctx->fd_llc_misses);
+        ctx->fd_llc_misses = -1;
+        llc_now = 0;
     }
     if (!ctx->last_group_valid) {
         ctx->last_group_read = rd_now;
         ctx->last_group_valid = 1;
         ctx->last_llc_value = llc_now;
+        publish_perf_state(ctx, 1);
         return 0;
     }
 
@@ -806,13 +939,15 @@ int tsd_perf_evaluate(perf_ctx_t *ctx, tsd_thermal_eval_t *out, const tsd_runtim
     uint64_t delta_insns = scale_counter(rd_now.values[1] - ctx->last_group_read.values[1],
                                          rd_now.time_enabled - ctx->last_group_read.time_enabled,
                                          rd_now.time_running - ctx->last_group_read.time_running);
-    uint64_t current_cpi = (delta_cycles * 1000) / (delta_insns ?: 1);
+    uint64_t current_cpi = (delta_cycles * 1000) / (delta_insns ? delta_insns : 1);
     uint64_t delta_llc = (ctx->fd_llc_misses >= 0 && llc_now >= ctx->last_llc_value)
-                         ? (llc_now - ctx->last_llc_value) : 0;
+                             ? (llc_now - ctx->last_llc_value)
+                             : 0;
     uint64_t mpki_milli = delta_insns ? (delta_llc * MPKI_SCALE) / delta_insns : 0;
 
     ctx->last_group_read = rd_now;
     ctx->last_llc_value = llc_now;
+    publish_perf_state(ctx, 1);
 
     tsd_telemetry_sample_t telemetry = {0};
     fetch_fused_telemetry(ctx, &telemetry);
@@ -832,10 +967,7 @@ int tsd_perf_get_monitor_cpu(const perf_ctx_t *ctx) {
 }
 
 int tsd_perf_check_software_timeout(perf_ctx_t *ctx, int timeout_sec) {
-    if (!ctx || timeout_sec <= 0) {
-        return 0;
-    }
-    if (ctx->timeout_notified) {
+    if (!ctx || timeout_sec <= 0 || ctx->timeout_notified) {
         return 0;
     }
     if (!perf_software_timeout_exceeded(ctx, timeout_sec)) {
