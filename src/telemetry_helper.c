@@ -1,19 +1,18 @@
 #include <thermal/simd/telemetry_helper.h>
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/types.h>
-#include <unistd.h>
-#include <dirent.h>
 #include <time.h>
+#include <unistd.h>
 
 #ifndef MSR_IA32_APERF
 #define MSR_IA32_APERF 0xE8
 #endif
-
 #ifndef MSR_IA32_MPERF
 #define MSR_IA32_MPERF 0xE7
 #endif
@@ -24,55 +23,260 @@
 #define LOG_COMPONENT "telemetry"
 #define INITIAL_BACKOFF_SEC 5
 #define MAX_BACKOFF_SEC 600
+#define TSD_TEMP_MIN_MILLIC (-50000LL)
+#define TSD_TEMP_MAX_MILLIC 150000LL
 
 static time_t tsd_now_seconds(void) {
     time_t now = time(NULL);
-    if (now < 0) {
-        return 0;
-    }
-    return now;
+    return now < 0 ? 0 : now;
 }
 
 static void schedule_retry(time_t *deadline, int *backoff) {
-    if (!deadline || !backoff) {
-        return;
-    }
-    if (*backoff <= 0) {
-        *backoff = INITIAL_BACKOFF_SEC;
-    }
-    int next = *backoff;
-    if (next > MAX_BACKOFF_SEC) {
-        next = MAX_BACKOFF_SEC;
-    }
-    time_t now = tsd_now_seconds();
-    *deadline = now + (time_t)next;
+    if (!deadline || !backoff) return;
+    if (*backoff <= 0) *backoff = INITIAL_BACKOFF_SEC;
+    int next = *backoff > MAX_BACKOFF_SEC ? MAX_BACKOFF_SEC : *backoff;
+    *deadline = tsd_now_seconds() + (time_t)next;
     if (*backoff < MAX_BACKOFF_SEC) {
-        int new_backoff = *backoff * 2;
-        if (new_backoff > MAX_BACKOFF_SEC) {
-            new_backoff = MAX_BACKOFF_SEC;
-        }
-        *backoff = new_backoff;
+        int doubled = *backoff * 2;
+        *backoff = doubled > MAX_BACKOFF_SEC ? MAX_BACKOFF_SEC : doubled;
     }
 }
 
 static void reset_retry(time_t *deadline, int *backoff) {
-    if (deadline) {
-        *deadline = 0;
+    if (deadline) *deadline = 0;
+    if (backoff) *backoff = INITIAL_BACKOFF_SEC;
+}
+
+static int read_text_from_path(const char *path, char *buffer, size_t size) {
+    if (!path || !buffer || size < 2) {
+        errno = EINVAL;
+        return -1;
     }
-    if (backoff) {
-        *backoff = INITIAL_BACKOFF_SEC;
+    FILE *fp = fopen(path, "r");
+    if (!fp) return -1;
+    if (!fgets(buffer, (int)size, fp)) {
+        fclose(fp);
+        return -1;
+    }
+    fclose(fp);
+    size_t len = strlen(buffer);
+    while (len > 0 && (buffer[len - 1] == '\n' || buffer[len - 1] == '\r' ||
+                       buffer[len - 1] == ' ' || buffer[len - 1] == '\t')) {
+        buffer[--len] = '\0';
+    }
+    return 0;
+}
+
+static void lowercase_ascii(char *text) {
+    if (!text) return;
+    for (char *p = text; *p; ++p) {
+        if (*p >= 'A' && *p <= 'Z') *p = (char)(*p - 'A' + 'a');
     }
 }
 
-static int reopen_msr(tsd_telemetry_helper_t *helper, int emit_events) {
-    if (!helper) {
+static int read_long_from_path(const char *path, long long *value) {
+    if (!path || !value) {
+        errno = EINVAL;
         return -1;
     }
+    char buffer[64];
+    if (read_text_from_path(path, buffer, sizeof(buffer)) != 0) return -1;
+    char *endptr = NULL;
+    errno = 0;
+    long long parsed = strtoll(buffer, &endptr, 10);
+    if (errno != 0 || endptr == buffer || *endptr != '\0') return -1;
+    *value = parsed;
+    return 0;
+}
+
+static int copy_path(char *dest, size_t dest_size, const char *path) {
+    if (!dest || !path || dest_size == 0) return -1;
+    int written = snprintf(dest, dest_size, "%s", path);
+    return written >= 0 && (size_t)written < dest_size ? 0 : -1;
+}
+
+static int physical_package_id(int cpu) {
+    char path[256];
+    int written = snprintf(path, sizeof(path),
+                           "/sys/devices/system/cpu/cpu%d/topology/physical_package_id", cpu);
+    if (written < 0 || (size_t)written >= sizeof(path)) return -1;
+    long long package = -1;
+    if (read_long_from_path(path, &package) != 0 || package < 0 || package > 4096) return -1;
+    return (int)package;
+}
+
+static int label_mentions_package(const char *label, int package_id) {
+    if (!label || package_id < 0) return 0;
+    char needle[64];
+    (void)snprintf(needle, sizeof(needle), "package id %d", package_id);
+    if (strstr(label, needle)) return 1;
+    (void)snprintf(needle, sizeof(needle), "package %d", package_id);
+    if (strstr(label, needle)) return 1;
+    (void)snprintf(needle, sizeof(needle), "pkg%d", package_id);
+    return strstr(label, needle) != NULL;
+}
+
+static int temperature_candidate_score(const char *driver, const char *label, int package_id) {
+    int score = 0;
+    if (driver) {
+        if (strstr(driver, "x86_pkg_temp")) score = 120;
+        else if (strstr(driver, "coretemp")) score = 110;
+        else if (strstr(driver, "k10temp")) score = 110;
+        else if (strstr(driver, "zenpower")) score = 105;
+        else if (strstr(driver, "cpu")) score = 50;
+    }
+    if (label) {
+        if (label_mentions_package(label, package_id)) score += 150;
+        else if (strstr(label, "package")) score += 100;
+        else if (strstr(label, "pkg")) score += 90;
+        else if (strstr(label, "tctl")) score += 85;
+        else if (strstr(label, "tdie")) score += 80;
+        else if (strstr(label, "cpu")) score += 50;
+        else if (strstr(label, "core")) score += 10;
+    }
+    return score;
+}
+
+static void consider_temp_candidate(const char *path, int score,
+                                    char *best_path, size_t best_path_size, int *best_score) {
+    if (!path || !best_path || !best_score || score <= *best_score || access(path, R_OK) != 0) return;
+    long long value = 0;
+    if (read_long_from_path(path, &value) != 0 || value < TSD_TEMP_MIN_MILLIC || value > TSD_TEMP_MAX_MILLIC) {
+        return;
+    }
+    if (copy_path(best_path, best_path_size, path) == 0) *best_score = score;
+}
+
+static void scan_thermal_zones(int package_id, char *best_path, size_t best_path_size, int *best_score) {
+    DIR *dir = opendir("/sys/class/thermal");
+    if (!dir) return;
+    struct dirent *entry = NULL;
+    while ((entry = readdir(dir)) != NULL) {
+        if (strncmp(entry->d_name, "thermal_zone", 12) != 0) continue;
+        char type_path[320];
+        char temp_path[320];
+        int n1 = snprintf(type_path, sizeof(type_path), "/sys/class/thermal/%s/type", entry->d_name);
+        int n2 = snprintf(temp_path, sizeof(temp_path), "/sys/class/thermal/%s/temp", entry->d_name);
+        if (n1 < 0 || n2 < 0 || (size_t)n1 >= sizeof(type_path) || (size_t)n2 >= sizeof(temp_path)) continue;
+        char type[128];
+        if (read_text_from_path(type_path, type, sizeof(type)) != 0) continue;
+        lowercase_ascii(type);
+        int score = temperature_candidate_score(type, type, package_id);
+        if (score >= 50) consider_temp_candidate(temp_path, score, best_path, best_path_size, best_score);
+    }
+    closedir(dir);
+}
+
+static int parse_hwmon_temp_input(const char *name, unsigned int *index) {
+    if (!name || !index || strncmp(name, "temp", 4) != 0) return 0;
+    const char *cursor = name + 4;
+    if (*cursor < '0' || *cursor > '9') return 0;
+    unsigned long value = 0;
+    while (*cursor >= '0' && *cursor <= '9') {
+        value = value * 10UL + (unsigned long)(*cursor - '0');
+        if (value > 9999UL) return 0;
+        ++cursor;
+    }
+    if (strcmp(cursor, "_input") != 0) return 0;
+    *index = (unsigned int)value;
+    return 1;
+}
+
+static void scan_hwmon(int package_id, char *best_path, size_t best_path_size, int *best_score) {
+    DIR *root = opendir("/sys/class/hwmon");
+    if (!root) return;
+    struct dirent *hw = NULL;
+    while ((hw = readdir(root)) != NULL) {
+        if (strncmp(hw->d_name, "hwmon", 5) != 0) continue;
+        char base[320];
+        int bn = snprintf(base, sizeof(base), "/sys/class/hwmon/%s", hw->d_name);
+        if (bn < 0 || (size_t)bn >= sizeof(base)) continue;
+
+        char name_path[384];
+        (void)snprintf(name_path, sizeof(name_path), "%s/name", base);
+        char driver[128] = {0};
+        if (read_text_from_path(name_path, driver, sizeof(driver)) != 0) continue;
+        lowercase_ascii(driver);
+        int driver_score = temperature_candidate_score(driver, NULL, package_id);
+        if (driver_score == 0) continue;
+
+        DIR *dir = opendir(base);
+        if (!dir) continue;
+        struct dirent *entry = NULL;
+        while ((entry = readdir(dir)) != NULL) {
+            unsigned int index = 0;
+            if (!parse_hwmon_temp_input(entry->d_name, &index)) continue;
+            char input_path[384];
+            char label_path[384];
+            int in = snprintf(input_path, sizeof(input_path), "%s/%s", base, entry->d_name);
+            int ln = snprintf(label_path, sizeof(label_path), "%s/temp%u_label", base, index);
+            if (in < 0 || ln < 0 || (size_t)in >= sizeof(input_path) || (size_t)ln >= sizeof(label_path)) continue;
+            char label[128] = {0};
+            if (read_text_from_path(label_path, label, sizeof(label)) == 0) lowercase_ascii(label);
+            int score = driver_score + temperature_candidate_score(NULL, label, package_id);
+            consider_temp_candidate(input_path, score, best_path, best_path_size, best_score);
+        }
+        closedir(dir);
+    }
+    closedir(root);
+}
+
+static int detect_temp_sensor(tsd_telemetry_helper_t *helper) {
+    if (!helper) return 0;
+    helper->temp_available = 0;
+    helper->temp_path[0] = '\0';
+
+    char best_path[sizeof(helper->temp_path)] = {0};
+    int best_score = -1;
+    int package_id = physical_package_id(helper->cpu);
+    scan_thermal_zones(package_id, best_path, sizeof(best_path), &best_score);
+    scan_hwmon(package_id, best_path, sizeof(best_path), &best_score);
+
+    if (best_score < 0 || best_path[0] == '\0' || copy_path(helper->temp_path, sizeof(helper->temp_path), best_path) != 0) {
+        return 0;
+    }
+    helper->temp_available = 1;
+    tsd_log_debug(LOG_COMPONENT, "selected package temperature sensor cpu=%d package=%d score=%d path=%s",
+                  helper->cpu, package_id, best_score, helper->temp_path);
+    return 1;
+}
+
+static int detect_cpufreq_paths(tsd_telemetry_helper_t *helper) {
+    if (!helper) return 0;
+    char path[256];
+    int written = snprintf(path, sizeof(path),
+                           "/sys/devices/system/cpu/cpu%d/cpufreq/scaling_cur_freq", helper->cpu);
+    if (written < 0 || (size_t)written >= sizeof(path) || access(path, R_OK) != 0) {
+        helper->freq_sysfs_available = 0;
+        helper->freq_cur_path[0] = '\0';
+        helper->freq_max_khz = 0;
+        return 0;
+    }
+    if (copy_path(helper->freq_cur_path, sizeof(helper->freq_cur_path), path) != 0) return 0;
+
+    long long max_khz = 0;
+    written = snprintf(path, sizeof(path),
+                       "/sys/devices/system/cpu/cpu%d/cpufreq/scaling_max_freq", helper->cpu);
+    if (written < 0 || (size_t)written >= sizeof(path) || read_long_from_path(path, &max_khz) != 0 || max_khz <= 0) {
+        written = snprintf(path, sizeof(path),
+                           "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_max_freq", helper->cpu);
+        if (written < 0 || (size_t)written >= sizeof(path) || read_long_from_path(path, &max_khz) != 0 || max_khz <= 0) {
+            helper->freq_sysfs_available = 0;
+            helper->freq_max_khz = 0;
+            helper->freq_cur_path[0] = '\0';
+            return 0;
+        }
+    }
+    helper->freq_sysfs_available = 1;
+    helper->freq_max_khz = (uint64_t)max_khz;
+    return 1;
+}
+
+static int reopen_msr(tsd_telemetry_helper_t *helper, int emit_events) {
+    if (!helper) return -1;
     char msr_path[128];
     int written = snprintf(msr_path, sizeof(msr_path), "/dev/cpu/%d/msr", helper->cpu);
-    if (written < 0 || (size_t)written >= sizeof(msr_path)) {
-        return -1;
-    }
+    if (written < 0 || (size_t)written >= sizeof(msr_path)) return -1;
     int fd = open(msr_path, O_RDONLY);
     if (fd >= 0) {
         helper->msr_fd = fd;
@@ -87,129 +291,8 @@ static int reopen_msr(tsd_telemetry_helper_t *helper, int emit_events) {
     helper->msr_fd = -1;
     helper->msr_available = 0;
     schedule_retry(&helper->msr_retry_deadline, &helper->msr_backoff_seconds);
-    if (emit_events) {
-        tsd_log_debug(LOG_COMPONENT, "event=telemetry_sensor state=pending sensor=msr errno=%d", errno);
-    }
+    if (emit_events) tsd_log_debug(LOG_COMPONENT, "event=telemetry_sensor state=pending sensor=msr errno=%d", errno);
     return -1;
-}
-
-static int read_long_from_path(const char *path, long long *value) {
-    if (!path || !value) {
-        errno = EINVAL;
-        return -1;
-    }
-    FILE *fp = fopen(path, "r");
-    if (!fp) {
-        return -1;
-    }
-    char buffer[64];
-    if (!fgets(buffer, sizeof(buffer), fp)) {
-        fclose(fp);
-        return -1;
-    }
-    fclose(fp);
-    char *endptr = NULL;
-    errno = 0;
-    long long parsed = strtoll(buffer, &endptr, 10);
-    if (errno != 0 || endptr == buffer) {
-        return -1;
-    }
-    *value = parsed;
-    return 0;
-}
-
-static int detect_temp_sensor(tsd_telemetry_helper_t *helper) {
-    if (!helper) {
-        return 0;
-    }
-    helper->temp_available = 0;
-    helper->temp_path[0] = '\0';
-    DIR *dir = opendir("/sys/class/thermal");
-    if (!dir) {
-        return 0;
-    }
-    struct dirent *entry = NULL;
-    while ((entry = readdir(dir)) != NULL) {
-        if (strncmp(entry->d_name, "thermal_zone", 12) != 0) {
-            continue;
-        }
-        char type_path[256];
-        int written = snprintf(type_path, sizeof(type_path), "/sys/class/thermal/%s/type", entry->d_name);
-        if (written < 0 || (size_t)written >= sizeof(type_path)) {
-            continue;
-        }
-        FILE *type_fp = fopen(type_path, "r");
-        if (!type_fp) {
-            continue;
-        }
-        char type_buf[128];
-        if (!fgets(type_buf, sizeof(type_buf), type_fp)) {
-            fclose(type_fp);
-            continue;
-        }
-        fclose(type_fp);
-        for (char *p = type_buf; *p; ++p) {
-            if (*p >= 'A' && *p <= 'Z') {
-                *p = (char)(*p - 'A' + 'a');
-            }
-        }
-        if (strstr(type_buf, "pkg") == NULL && strstr(type_buf, "package") == NULL &&
-            strstr(type_buf, "cpu") == NULL) {
-            continue;
-        }
-        written = snprintf(helper->temp_path, sizeof(helper->temp_path),
-                           "/sys/class/thermal/%s/temp", entry->d_name);
-        if (written < 0 || (size_t)written >= sizeof(helper->temp_path)) {
-            helper->temp_path[0] = '\0';
-            continue;
-        }
-        if (access(helper->temp_path, R_OK) == 0) {
-            helper->temp_available = 1;
-            closedir(dir);
-            return 1;
-        }
-    }
-    closedir(dir);
-    return 0;
-}
-
-static int detect_cpufreq_paths(tsd_telemetry_helper_t *helper) {
-    if (!helper) {
-        return 0;
-    }
-    char path[256];
-    int written = snprintf(path, sizeof(path),
-                           "/sys/devices/system/cpu/cpu%d/cpufreq/scaling_cur_freq", helper->cpu);
-    if (written < 0 || (size_t)written >= sizeof(path) || access(path, R_OK) != 0) {
-        helper->freq_sysfs_available = 0;
-        helper->freq_cur_path[0] = '\0';
-        helper->freq_max_khz = 0;
-        return 0;
-    }
-    written = snprintf(helper->freq_cur_path, sizeof(helper->freq_cur_path), "%s", path);
-    if (written < 0 || (size_t)written >= sizeof(helper->freq_cur_path)) {
-        helper->freq_sysfs_available = 0;
-        helper->freq_cur_path[0] = '\0';
-        helper->freq_max_khz = 0;
-        return 0;
-    }
-    long long max_khz = 0;
-    written = snprintf(path, sizeof(path),
-                       "/sys/devices/system/cpu/cpu%d/cpufreq/scaling_max_freq", helper->cpu);
-    if (read_long_from_path(path, &max_khz) != 0 || max_khz <= 0) {
-        written = snprintf(path, sizeof(path),
-                           "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_max_freq", helper->cpu);
-        if (written < 0 || (size_t)written >= sizeof(path) ||
-            read_long_from_path(path, &max_khz) != 0 || max_khz <= 0) {
-            helper->freq_sysfs_available = 0;
-            helper->freq_max_khz = 0;
-            helper->freq_cur_path[0] = '\0';
-            return 0;
-        }
-    }
-    helper->freq_sysfs_available = 1;
-    helper->freq_max_khz = (uint64_t)max_khz;
-    return 1;
 }
 
 static int read_msr64(int fd, off_t offset, uint64_t *value) {
@@ -219,15 +302,13 @@ static int read_msr64(int fd, off_t offset, uint64_t *value) {
     }
     uint64_t tmp = 0;
     ssize_t n = pread(fd, &tmp, sizeof(tmp), offset);
-    if (n != (ssize_t)sizeof(tmp)) {
-        return -1;
-    }
+    if (n != (ssize_t)sizeof(tmp)) return -1;
     *value = tmp;
     return 0;
 }
 
 int tsd_telemetry_helper_init(tsd_telemetry_helper_t *helper, int cpu) {
-    if (!helper) {
+    if (!helper || cpu < 0) {
         errno = EINVAL;
         return -1;
     }
@@ -237,14 +318,8 @@ int tsd_telemetry_helper_init(tsd_telemetry_helper_t *helper, int cpu) {
     reset_retry(&helper->temp_retry_deadline, &helper->temp_backoff_seconds);
     reset_retry(&helper->freq_retry_deadline, &helper->freq_backoff_seconds);
     reset_retry(&helper->msr_retry_deadline, &helper->msr_backoff_seconds);
-    detect_temp_sensor(helper);
-    if (helper->temp_available) {
-        reset_retry(&helper->temp_retry_deadline, &helper->temp_backoff_seconds);
-    }
-    if (detect_cpufreq_paths(helper)) {
-        reset_retry(&helper->freq_retry_deadline, &helper->freq_backoff_seconds);
-    }
-
+    if (detect_temp_sensor(helper)) reset_retry(&helper->temp_retry_deadline, &helper->temp_backoff_seconds);
+    if (detect_cpufreq_paths(helper)) reset_retry(&helper->freq_retry_deadline, &helper->freq_backoff_seconds);
     if (reopen_msr(helper, 0) != 0) {
         tsd_metrics_increment(TSD_METRIC_TELEMETRY_MSR_DROPS);
         tsd_log_warn(LOG_COMPONENT, "event=telemetry_sensor state=degraded sensor=msr errno=%d", errno);
@@ -253,19 +328,14 @@ int tsd_telemetry_helper_init(tsd_telemetry_helper_t *helper, int cpu) {
 }
 
 void tsd_telemetry_helper_destroy(tsd_telemetry_helper_t *helper) {
-    if (!helper) {
-        return;
-    }
-    if (helper->msr_fd >= 0) {
-        close(helper->msr_fd);
-        helper->msr_fd = -1;
-    }
+    if (!helper) return;
+    if (helper->msr_fd >= 0) close(helper->msr_fd);
+    helper->msr_fd = -1;
+    helper->msr_available = 0;
 }
 
 static void sample_temperature(tsd_telemetry_helper_t *helper, tsd_telemetry_sample_t *out) {
-    if (!helper || !out) {
-        return;
-    }
+    if (!helper || !out) return;
     if (!helper->temp_available || helper->temp_path[0] == '\0') {
         time_t now = tsd_now_seconds();
         if (helper->temp_retry_deadline == 0 || now >= helper->temp_retry_deadline) {
@@ -277,38 +347,32 @@ static void sample_temperature(tsd_telemetry_helper_t *helper, tsd_telemetry_sam
                 schedule_retry(&helper->temp_retry_deadline, &helper->temp_backoff_seconds);
             }
         }
-        if (!helper->temp_available) {
-            return;
-        }
+        if (!helper->temp_available) return;
     }
+
     long long temp_value = 0;
     char path_copy[256];
-    strncpy(path_copy, helper->temp_path, sizeof(path_copy));
-    path_copy[sizeof(path_copy) - 1] = '\0';
-    if (read_long_from_path(helper->temp_path, &temp_value) == 0) {
+    (void)copy_path(path_copy, sizeof(path_copy), helper->temp_path);
+    if (read_long_from_path(helper->temp_path, &temp_value) == 0 &&
+        temp_value >= TSD_TEMP_MIN_MILLIC && temp_value <= TSD_TEMP_MAX_MILLIC) {
         out->temp_available = 1;
         out->package_temp_millic = (int32_t)temp_value;
-    } else {
-        helper->temp_available = 0;
-        tsd_metrics_increment(TSD_METRIC_TELEMETRY_TEMP_DROPS);
-        tsd_log_warn(LOG_COMPONENT, "event=telemetry_sensor state=degraded sensor=temp path=%s errno=%d", path_copy, errno);
-        helper->temp_path[0] = '\0';
-        schedule_retry(&helper->temp_retry_deadline, &helper->temp_backoff_seconds);
+        return;
     }
+
+    helper->temp_available = 0;
+    tsd_metrics_increment(TSD_METRIC_TELEMETRY_TEMP_DROPS);
+    tsd_log_warn(LOG_COMPONENT, "event=telemetry_sensor state=degraded sensor=temp path=%s errno=%d", path_copy, errno);
+    helper->temp_path[0] = '\0';
+    schedule_retry(&helper->temp_retry_deadline, &helper->temp_backoff_seconds);
 }
 
 static void sample_msr_ratio(tsd_telemetry_helper_t *helper, tsd_telemetry_sample_t *out) {
-    if (!helper || !out) {
-        return;
-    }
+    if (!helper || !out) return;
     if (!helper->msr_available || helper->msr_fd < 0) {
         time_t now = tsd_now_seconds();
-        if (helper->msr_retry_deadline == 0 || now >= helper->msr_retry_deadline) {
-            reopen_msr(helper, 1);
-        }
-        if (!helper->msr_available || helper->msr_fd < 0) {
-            return;
-        }
+        if (helper->msr_retry_deadline == 0 || now >= helper->msr_retry_deadline) reopen_msr(helper, 1);
+        if (!helper->msr_available || helper->msr_fd < 0) return;
     }
     uint64_t aperf = 0;
     uint64_t mperf = 0;
@@ -327,7 +391,8 @@ static void sample_msr_ratio(tsd_telemetry_helper_t *helper, tsd_telemetry_sampl
         uint64_t delta_mperf = mperf - helper->last_mperf;
         if (delta_mperf > 0) {
             __uint128_t num = (__uint128_t)delta_aperf * 1000u;
-            out->freq_ratio_milli = (uint32_t)(num / delta_mperf);
+            uint64_t ratio = (uint64_t)(num / delta_mperf);
+            out->freq_ratio_milli = ratio > UINT32_MAX ? UINT32_MAX : (uint32_t)ratio;
             out->freq_ratio_available = 1;
         }
     }
@@ -336,9 +401,7 @@ static void sample_msr_ratio(tsd_telemetry_helper_t *helper, tsd_telemetry_sampl
 }
 
 static void sample_cpufreq_ratio(tsd_telemetry_helper_t *helper, tsd_telemetry_sample_t *out) {
-    if (!helper || !out) {
-        return;
-    }
+    if (!helper || !out) return;
     if (!helper->freq_sysfs_available || helper->freq_cur_path[0] == '\0' || helper->freq_max_khz == 0) {
         time_t now = tsd_now_seconds();
         if (helper->freq_retry_deadline == 0 || now >= helper->freq_retry_deadline) {
@@ -350,21 +413,21 @@ static void sample_cpufreq_ratio(tsd_telemetry_helper_t *helper, tsd_telemetry_s
                 schedule_retry(&helper->freq_retry_deadline, &helper->freq_backoff_seconds);
             }
         }
-        if (!helper->freq_sysfs_available) {
-            return;
-        }
+        if (!helper->freq_sysfs_available) return;
     }
     long long cur_khz = 0;
     if (read_long_from_path(helper->freq_cur_path, &cur_khz) != 0 || cur_khz <= 0) {
         helper->freq_sysfs_available = 0;
         tsd_metrics_increment(TSD_METRIC_TELEMETRY_FREQ_DROPS);
-        tsd_log_warn(LOG_COMPONENT, "event=telemetry_sensor state=degraded sensor=cpufreq path=%s errno=%d", helper->freq_cur_path, errno);
+        tsd_log_warn(LOG_COMPONENT, "event=telemetry_sensor state=degraded sensor=cpufreq path=%s errno=%d",
+                     helper->freq_cur_path, errno);
         helper->freq_cur_path[0] = '\0';
         schedule_retry(&helper->freq_retry_deadline, &helper->freq_backoff_seconds);
         return;
     }
     __uint128_t num = (__uint128_t)cur_khz * 1000u;
-    out->freq_ratio_milli = (uint32_t)(num / helper->freq_max_khz);
+    uint64_t ratio = (uint64_t)(num / helper->freq_max_khz);
+    out->freq_ratio_milli = ratio > UINT32_MAX ? UINT32_MAX : (uint32_t)ratio;
     out->freq_ratio_available = 1;
 }
 
@@ -376,8 +439,6 @@ int tsd_telemetry_helper_sample(tsd_telemetry_helper_t *helper, tsd_telemetry_sa
     memset(out, 0, sizeof(*out));
     sample_temperature(helper, out);
     sample_msr_ratio(helper, out);
-    if (!out->freq_ratio_available) {
-        sample_cpufreq_ratio(helper, out);
-    }
-    return 0;
+    if (!out->freq_ratio_available) sample_cpufreq_ratio(helper, out);
+    return (out->temp_available || out->freq_ratio_available) ? 0 : -1;
 }
