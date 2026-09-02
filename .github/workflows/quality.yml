@@ -147,6 +147,9 @@ jobs:
           test -f stage/include/thermal/simd/adaptive_dispatch.h
           test -f stage/include/thermal/simd/runtime.h
           test -f stage/lib/cmake/thermal_simd_dispatcher/thermal_simd_dispatcherConfig.cmake
+          test -f stage/share/doc/thermal_simd_dispatcher/LICENSE
+          test -f stage/share/doc/thermal_simd_dispatcher/NOTICE
+          test -f stage/share/doc/thermal_simd_dispatcher/THIRD_PARTY_NOTICES.md
 
       - name: Build external installed-package consumer
         run: |
@@ -157,7 +160,14 @@ jobs:
           ./build-consumer/thermal_simd_consumer
 
       - name: Build container image
-        run: docker build -f packaging/Dockerfile -t thermal-simd:ci .
+        run: |
+          docker build -f packaging/Dockerfile -t thermal-simd:ci .
+          docker run --rm --entrypoint test thermal-simd:ci \
+            -f /usr/share/doc/thermal-simd-dispatcher/LICENSE
+          docker run --rm --entrypoint test thermal-simd:ci \
+            -f /usr/share/doc/thermal-simd-dispatcher/NOTICE
+          docker run --rm --entrypoint test thermal-simd:ci \
+            -f /usr/share/doc/thermal-simd-dispatcher/THIRD_PARTY_NOTICES.md
 
   software-benchmark-smoke:
     name: Software benchmark smoke

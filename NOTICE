@@ -1,0 +1,16 @@
+Thermal-Aware SIMD Dispatcher
+Copyright (c) 2025-2026 Stamatis-Christos Saridakis. All rights reserved.
+
+Except for the third-party component identified in THIRD_PARTY_NOTICES.md, this
+software is source-available, not open source. It is licensed for a time-limited
+evaluation under the PolyForm Free Trial License 1.0.0 found in the LICENSE
+file.
+
+Any production use, non-evaluation commercial use, use after the evaluation
+period, redistribution, sublicensing, and acquisition of broader rights require
+a separate written agreement with the copyright holder.
+
+Public availability on GitHub does not place this software in the public
+domain. GitHub users retain only the platform-specific viewing and forking
+permissions granted by GitHub's Terms of Service in addition to the rights
+expressly granted by LICENSE.

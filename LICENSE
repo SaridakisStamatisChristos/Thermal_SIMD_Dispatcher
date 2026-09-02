@@ -1,58 +1,83 @@
-Proprietary Software License Agreement
+# PolyForm Free Trial License 1.0.0
 
-Copyright (c) 2025 Thermal SIMD Dispatcher Contributors. All rights reserved.
+<https://polyformproject.org/licenses/free-trial/1.0.0>
 
-1. Grant of License.
-   Subject to your compliance with the terms of this Agreement, the Licensor grants you a limited,
-   non-exclusive, non-transferable, non-sublicensable right to install and use the Software solely
-   for your internal business purposes. No other rights are granted.
+## Acceptance
 
-2. Restrictions.
-   You may not: (a) copy, modify, adapt, translate, or create derivative works of the Software;
-   (b) distribute, sell, rent, lease, sublicense, loan, or otherwise make the Software available to
-   any third party; (c) reverse engineer, decompile, disassemble, or otherwise attempt to derive the
-   source code of the Software, except to the extent such activities are expressly permitted by
-   applicable law; (d) remove, alter, or obscure any proprietary notices on or in the Software; or
-   (e) use the Software for the benefit of any third party or in any manner that infringes the
-   intellectual property rights of the Licensor or any third party.
+In order to get any license under these terms, you must agree to them as both
+strict obligations and conditions to all your licenses.
 
-3. Ownership.
-   The Software is licensed, not sold. The Licensor retains all rights, title, and interest in and to
-   the Software, including all intellectual property rights therein.
+## Copyright License
 
-4. Confidentiality.
-   You acknowledge that the Software contains proprietary and confidential information of the
-   Licensor. You agree to maintain the confidentiality of the Software and not to disclose the
-   Software to any third party without the Licensor's prior written consent.
+The licensor grants you a copyright license for the software to do everything
+you might do with the software that would otherwise infringe the licensor's
+copyright in it for any permitted purpose. However, you may only make changes
+or new works based on the software according to
+[Changes and New Works License](#changes-and-new-works-license), and you may not
+distribute copies of the software.
 
-5. Termination.
-   This Agreement is effective until terminated. The Licensor may terminate this Agreement at any
-   time if you fail to comply with any of its terms. Upon termination, you must cease all use of the
-   Software and destroy all copies of the Software in your possession or control.
+## Changes and New Works License
 
-6. Warranty Disclaimer.
-   THE SOFTWARE IS PROVIDED "AS IS" WITHOUT WARRANTY OF ANY KIND, WHETHER EXPRESS, IMPLIED, OR STATUTORY,
-   INCLUDING WITHOUT LIMITATION THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE,
-   TITLE, AND NON-INFRINGEMENT. THE ENTIRE RISK ARISING OUT OF THE USE OR PERFORMANCE OF THE SOFTWARE
-   REMAINS WITH YOU.
+The licensor grants you an additional copyright license to make changes and new
+works based on the software for any permitted purpose.
 
-7. Limitation of Liability.
-   TO THE MAXIMUM EXTENT PERMITTED BY LAW, IN NO EVENT SHALL THE LICENSOR BE LIABLE FOR ANY INDIRECT,
-   INCIDENTAL, CONSEQUENTIAL, SPECIAL, EXEMPLARY, OR PUNITIVE DAMAGES, OR FOR ANY LOSS OF PROFITS,
-   REVENUE, DATA, OR USE, EVEN IF THE LICENSOR HAS BEEN ADVISED OF THE POSSIBILITY OF SUCH DAMAGES.
-   THE LICENSOR'S TOTAL LIABILITY FOR ANY CLAIM ARISING OUT OF OR RELATING TO THIS AGREEMENT OR THE
-   SOFTWARE SHALL NOT EXCEED THE AMOUNT YOU PAID, IF ANY, TO OBTAIN THE SOFTWARE.
+## Patent License
 
-8. Governing Law and Venue.
-   This Agreement shall be governed by and construed in accordance with the laws of the jurisdiction
-   specified by the Licensor, without regard to conflict of law principles. Any disputes arising out
-   of or relating to this Agreement shall be resolved exclusively in the courts located in that
-   jurisdiction, and you consent to the personal jurisdiction of such courts.
+The licensor grants you a patent license for the software that covers patent
+claims the licensor can license, or becomes able to license, that you would
+infringe by using the software.
 
-9. Entire Agreement.
-   This Agreement constitutes the entire agreement between you and the Licensor with respect to the
-   Software and supersedes all prior or contemporaneous understandings regarding the Software. Any
-   amendments or modifications must be in writing and signed by both parties.
+## Fair Use
 
-By installing, copying, or otherwise using the Software, you acknowledge that you have read this
-Agreement, understand it, and agree to be bound by its terms.
+You may have "fair use" rights for the software under the law. These terms do
+not limit them.
+
+## Free Trial
+
+Use to evaluate whether the software suits a particular application for less
+than 32 consecutive calendar days, on behalf of you or your company, is use for
+a permitted purpose.
+
+## No Other Rights
+
+These terms do not allow you to sublicense or transfer any of your licenses to
+anyone else, or prevent the licensor from granting licenses to anyone else.
+These terms do not imply any other licenses.
+
+## Patent Defense
+
+If you make any written claim that the software infringes or contributes to
+infringement of any patent, your patent license for the software granted under
+these terms ends immediately. If your company makes such a claim, your patent
+license ends immediately for work on behalf of your company.
+
+## Violations
+
+If you violate any of these terms, or do anything with the software not covered
+by your licenses, all your licenses end immediately.
+
+## No Liability
+
+***As far as the law allows, the software comes as is, without any warranty or
+condition, and the licensor will not be liable to you for any damages arising
+out of these terms or the use or nature of the software, under any kind of legal
+claim.***
+
+## Definitions
+
+The **licensor** is the individual or entity offering these terms, and the
+**software** is the software the licensor makes available under these terms.
+
+**You** refers to the individual or entity agreeing to these terms.
+
+**Your company** is any legal entity, sole proprietorship, or other kind of
+organization that you work for, plus all organizations that have control over,
+are under the control of, or are under common control with that organization.
+**Control** means ownership of substantially all the assets of an entity, or the
+power to direct its management and policies by vote, contract, or otherwise.
+Control can be direct or indirect.
+
+**Your licenses** are all the licenses granted to you for the software under
+these terms.
+
+**Use** means anything you do with the software requiring one of your licenses.
