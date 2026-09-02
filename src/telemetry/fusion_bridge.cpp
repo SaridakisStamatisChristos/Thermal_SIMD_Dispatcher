@@ -10,6 +10,7 @@
 #include <telemetry/bus.h>
 #include <telemetry/collector.h>
 #include <telemetry/fusion.h>
+#include <thermal/simd/logging.h>
 #include <thermal/simd/thermal_config.h>
 #include <thermal/simd/thermal_trampoline.h>
 
@@ -124,6 +125,18 @@ void update_temperature_gate_unlocked(bool temperature_available) {
 
 int start_unlocked(int cpu) {
     if (cpu < 0) {
+        return -1;
+    }
+
+    /*
+     * A profile-manifest parser has never existed in the production path.
+     * Reject a configured profile explicitly rather than accepting a knob
+     * that has no effect. The caller will retain its CPU-local direct helper.
+     */
+    if (g_tsd_config.telemetry_profile_path[0] != '\0') {
+        tsd_log_error("telemetry",
+                      "telemetry profile manifests are not implemented; refusing fusion startup for profile=%s",
+                      g_tsd_config.telemetry_profile_path);
         return -1;
     }
 
