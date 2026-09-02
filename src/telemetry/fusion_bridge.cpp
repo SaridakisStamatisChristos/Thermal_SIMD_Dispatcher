@@ -76,6 +76,18 @@ bool copy_usable_snapshot(const telemetry::TelemetrySnapshot &snapshot,
     return true;
 }
 
+void fill_missing_from_direct(tsd_telemetry_sample_t *out,
+                              const tsd_telemetry_sample_t &direct) {
+    if (!out->temp_available && direct.temp_available) {
+        out->temp_available = 1;
+        out->package_temp_millic = direct.package_temp_millic;
+    }
+    if (!out->freq_ratio_available && direct.freq_ratio_available) {
+        out->freq_ratio_available = 1;
+        out->freq_ratio_milli = direct.freq_ratio_milli;
+    }
+}
+
 }  // namespace
 
 extern "C" int tsd_telemetry_fusion_start(void) {
@@ -136,25 +148,25 @@ extern "C" int tsd_telemetry_fusion_sample(tsd_telemetry_sample_t *out) {
         return -1;
     }
 
-    auto snapshot = g_fusion->latest_snapshot();
-    if (snapshot && copy_usable_snapshot(*snapshot, out)) {
-        return 0;
-    }
-
     /*
-     * Fail open to the authoritative direct helper rather than returning an
-     * empty fused snapshot. Publish that sample into the bus so subsequent
-     * fusion generations also carry the real hardware signals.
+     * Always advance the direct helper's retry/recovery state. If we only
+     * sampled it when the fused snapshot was completely empty, one healthy
+     * signal could mask the recovery of another indefinitely.
      */
-    if (g_direct_helper_ready) {
-        tsd_telemetry_sample_t direct{};
-        if (tsd_telemetry_helper_sample(&g_direct_helper, &direct) == 0 &&
-            (direct.temp_available || direct.freq_ratio_available)) {
+    tsd_telemetry_sample_t direct{};
+    bool direct_usable = false;
+    if (g_direct_helper_ready && tsd_telemetry_helper_sample(&g_direct_helper, &direct) == 0) {
+        direct_usable = direct.temp_available || direct.freq_ratio_available;
+        if (direct_usable) {
             (void)publish_sample_unlocked(direct);
-            *out = direct;
-            return 0;
         }
     }
 
-    return -1;
+    auto snapshot = g_fusion->latest_snapshot();
+    bool fused_usable = snapshot && copy_usable_snapshot(*snapshot, out);
+    if (direct_usable) {
+        fill_missing_from_direct(out, direct);
+    }
+
+    return (fused_usable || direct_usable) ? 0 : -1;
 }
