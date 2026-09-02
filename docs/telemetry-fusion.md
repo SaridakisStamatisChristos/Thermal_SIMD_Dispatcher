@@ -37,6 +37,8 @@ The bridge initializes a helper for CPU 0, which is also the dispatcher workload
 - quality;
 - monotonic timestamp.
 
+Collector registration and bus-manager access are mutex-protected. `poll()` takes a stable copy of the current bus/collector set before invoking providers, so collectors may be registered without racing the polling loop.
+
 A newly published reading replaces the current one when it has at least the current quality or a newer timestamp.
 
 The production C boundary can publish already-normalized direct samples with:
@@ -59,6 +61,8 @@ The C++ collector layer provides reusable provider-backed classes:
 
 These classes do **not** magically discover hardware. A caller must register a collector with a concrete provider. The production runtime currently guarantees temperature/frequency input through the direct-helper bridge; additional perf, RAPL or OEM providers can be registered by integrations that have those data sources.
 
+`PerfSample::freq_hint` is defined in frequency-ratio milli-units (`1000 == 1.0x`), not MHz.
+
 ## Snapshot generation
 
 `TelemetryFusion` owns a polling thread. The production bridge uses:
@@ -76,7 +80,7 @@ Each generation may contain:
 - thermal CPI;
 - power budget.
 
-A snapshot is marked degraded when temperature, frequency or CPI is missing. Power is currently optional for the degraded flag.
+The production fusion layer marks a snapshot degraded when either temperature or frequency ratio is missing. CPI remains authoritative in `thermal_perf.c`, and power is optional enrichment, so their absence alone does not mark an otherwise valid thermal snapshot degraded.
 
 `tsd_telemetry_fusion_sample()` returns success only when at least one temperature/frequency signal is usable. Empty snapshots return `-1`, allowing callers to use their direct source instead of silently consuming zero-valued telemetry.
 
