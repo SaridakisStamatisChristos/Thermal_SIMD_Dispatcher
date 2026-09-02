@@ -7,13 +7,27 @@ Type=simple
 ExecStartPre=/usr/local/bin/thermal_simd --interval=50 --sandbox-only
 ExecStart=/usr/local/bin/thermal_simd --interval=50 --metrics-bind=127.0.0.1 --metrics-port=9464
 Environment=TSD_LOG_LEVEL=info
+Environment=TSD_PREDICTIVE_COEFF_PATH=/etc/thermal-simd/controller_coeffs.json
 CapabilityBoundingSet=CAP_PERFMON CAP_SYS_ADMIN
 AmbientCapabilities=CAP_PERFMON CAP_SYS_ADMIN
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+LockPersonality=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 Restart=on-failure
 RestartSec=5s
 StandardOutput=journal
 StandardError=journal
 IPAddressAllow=127.0.0.1
+IPAddressAllow=::1
 IPAddressDeny=any
 
 [Install]
