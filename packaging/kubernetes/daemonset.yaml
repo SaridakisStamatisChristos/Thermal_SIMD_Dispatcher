@@ -19,6 +19,7 @@ spec:
         app: thermal-simd
     spec:
       serviceAccountName: thermal-simd
+      terminationGracePeriodSeconds: 15
       initContainers:
         - name: sandbox
           image: registry.example.com/thermal-simd:latest
@@ -47,6 +48,7 @@ spec:
         - name: dispatcher
           image: registry.example.com/thermal-simd:latest
           args:
+            - "--run-forever"
             - "--interval=50"
             - "--metrics-bind=0.0.0.0"
             - "--metrics-port=9464"
