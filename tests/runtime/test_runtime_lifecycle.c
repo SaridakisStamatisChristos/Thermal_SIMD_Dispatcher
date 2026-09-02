@@ -3,10 +3,12 @@
 #include <errno.h>
 #include <pthread.h>
 #include <stdatomic.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
 
 #include <config/runtime_flags.h>
+#include <observability/telemetry_state.h>
 #include <thermal/simd/runtime.h>
 #include <thermal/simd/thermal_config.h>
 #include <thermal/simd/thermal_trampoline.h>
@@ -76,9 +78,28 @@ int main(void) {
 
     /* A stopped tombstone cannot interfere with a later runtime generation. */
     configure_runtime();
+    /* Suppress process-wide fusion for this deterministic value-guard check;
+       the perf context deliberately falls back to CPU-local direct telemetry. */
+    (void)snprintf(g_tsd_config.telemetry_profile_path,
+                   sizeof(g_tsd_config.telemetry_profile_path),
+                   "%s", "test-unsupported-profile");
+    assert(setenv("TSD_ALLOW_SOFTWARE_UPGRADES", "1", 1) == 0);
     assert(tsd_runtime_start(&second, NULL) == 0);
     assert(second != NULL);
     assert(tsd_runtime_is_running(second));
+
+    tsd_temperature_channels_t channels = {0};
+    channels.raw_available = 1;
+    channels.raw_package_temp_c = 100.0;
+    channels.filtered_available = 1;
+    channels.filtered_package_temp_c = 70.0;
+    tsd_observability_update_temperature_channels(&channels);
+    assert(tsd_runtime_width_authorized(SIMD_AVX2) == 0);
+
+    channels.raw_package_temp_c = 60.0;
+    tsd_observability_update_temperature_channels(&channels);
+    assert(tsd_runtime_width_authorized(SIMD_AVX2) == 1);
+
     tsd_runtime_request_stop(runtime);
     usleep(2000);
     assert(tsd_runtime_is_running(second));
@@ -92,6 +113,7 @@ int main(void) {
     assert(tsd_runtime_destroy(second) == 0);
     assert(tsd_runtime_destroy(runtime) == 0);
 
+    unsetenv("TSD_ALLOW_SOFTWARE_UPGRADES");
     unsetenv("TSD_FAKE_PERF");
     return 0;
 }

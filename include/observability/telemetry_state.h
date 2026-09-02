@@ -51,6 +51,7 @@ void tsd_observability_update_perf(const tsd_perf_telemetry_t *telemetry);
 int tsd_observability_runtime_guard_active(void);
 int tsd_observability_perf_mode(void);
 int tsd_observability_perf_hardware_fresh(void);
+int tsd_observability_raw_temperature_c(double *out_temp_c, int max_age_ms);
 
 #ifdef __cplusplus
 }
@@ -88,6 +89,7 @@ struct FusionTelemetrySnapshot {
     double power_budget_w{0.0};
     std::chrono::system_clock::time_point updated_at{std::chrono::system_clock::time_point{}};
     std::chrono::steady_clock::time_point freshness_at{std::chrono::steady_clock::time_point{}};
+    std::chrono::steady_clock::time_point raw_temp_freshness_at{std::chrono::steady_clock::time_point{}};
 };
 
 struct PerfTelemetrySnapshot {
@@ -115,6 +117,7 @@ public:
     bool runtime_guard_active() const;
     int perf_mode() const;
     bool perf_hardware_fresh(std::chrono::seconds max_age) const;
+    bool raw_temperature(double &out_temp_c, std::chrono::milliseconds max_age) const;
 
 private:
     TelemetryState() = default;
