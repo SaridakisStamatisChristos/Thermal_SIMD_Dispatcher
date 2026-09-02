@@ -49,7 +49,9 @@ int main(void) {
     assert(tsd_runtime_perf_mode(runtime) == TSD_PERF_MODE_SOFTWARE);
     assert(atomic_load_explicit(&g_tsd_current_width, memory_order_acquire) == SIMD_SSE41);
 
-    /* The public compatibility selector must obey live degraded-mode policy. */
+    /* Isolate the live perf guard from the deliberately degraded fake-perf
+       sandbox result. Production never overrides a real sandbox failure. */
+    tsd_runtime_flags_record_sandbox_success();
     errno = 0;
     assert(tsd_trampoline_patch(SIMD_AVX2) != 0);
     assert(errno == EAGAIN);
@@ -87,6 +89,7 @@ int main(void) {
     assert(tsd_runtime_start(&second, NULL) == 0);
     assert(second != NULL);
     assert(tsd_runtime_is_running(second));
+    tsd_runtime_flags_record_sandbox_success();
 
     tsd_temperature_channels_t channels = {0};
     channels.raw_available = 1;
