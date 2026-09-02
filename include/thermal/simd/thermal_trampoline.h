@@ -73,6 +73,9 @@ int tsd_trampoline_init(void);
 /*
  * Compatibility name retained for existing callers. This no longer rewrites
  * executable memory; it atomically selects an already-sealed implementation.
+ * Production builds also reject widths that exceed host ISA support or the
+ * configured runtime AVX-512 policy. White-box test builds retain controlled
+ * override hooks for deterministic executable-memory regression tests.
  */
 int tsd_trampoline_patch(simd_width_t new_width);
 int init_double_buffer_trampoline(void);
