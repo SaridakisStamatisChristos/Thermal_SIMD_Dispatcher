@@ -14,6 +14,10 @@ if ! [[ "${SOAK_MINUTES}" =~ ^[0-9]+$ ]] || [ "${SOAK_MINUTES}" -lt 1 ] || [ "${
     echo "SOAK_MINUTES must be an integer in [1, 300]" >&2
     exit 2
 fi
+if ! lscpu | grep -Eq '(^|[[:space:]])avx512f([[:space:]]|$)'; then
+    echo "thermal characterization requires an AVX-512F-capable HIL runner" >&2
+    exit 1
+fi
 
 SOAK_SECONDS=$((SOAK_MINUTES * 60))
 # Give endpoint startup and final sampling a small margin while keeping the
@@ -37,6 +41,7 @@ METRICS_FINAL="${ARTIFACT_DIR}/metrics-final.prom"
     echo "runtime_seconds=${RUNTIME_SECONDS}"
     echo "sample_interval_seconds=${SAMPLE_INTERVAL_SECONDS}"
     echo "work_batch_iterations=${WORK_ITERS}"
+    echo "avx512_requested=true"
     echo "allowed_affinity=$(taskset -pc $$ 2>/dev/null || true)"
     echo "perf_event_paranoid=$(cat /proc/sys/kernel/perf_event_paranoid 2>/dev/null || echo unavailable)"
     echo "nmi_watchdog=$(cat /proc/sys/kernel/nmi_watchdog 2>/dev/null || echo unavailable)"
@@ -101,6 +106,7 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 "${BUILD_DIR}/thermal_simd" \
+    --allow-avx512 \
     --duration-sec="${RUNTIME_SECONDS}" \
     --work-iters="${WORK_ITERS}" \
     --metrics-bind=127.0.0.1 \
@@ -164,8 +170,11 @@ if summary.get("hardware_perf_fraction", 0.0) < 0.90:
     errors.append("hardware perf counters healthy for less than 90% of samples")
 if summary.get("temperature_sample_fraction", 0.0) < 0.90:
     errors.append("package temperature available for less than 90% of samples")
-if not summary.get("width_samples"):
+width_samples = summary.get("width_samples") or {}
+if not width_samples:
     errors.append("no SIMD-width observations")
+if width_samples.get("avx512", 0) < 1:
+    errors.append("AVX-512 was explicitly requested but never observed")
 if errors:
     for error in errors:
         print(f"HIL validation failure: {error}", file=sys.stderr)
