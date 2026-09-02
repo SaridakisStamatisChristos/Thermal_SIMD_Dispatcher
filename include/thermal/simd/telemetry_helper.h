@@ -8,11 +8,23 @@
 extern "C" {
 #endif
 
+/*
+ * Raw fields are the authoritative safety channel. They must not be delayed
+ * by EWMA/filtering before emergency and fail-closed decisions are made.
+ *
+ * Filtered fields are an optional control/forecast channel. A direct helper
+ * normally produces only raw values; the fusion bridge may populate both.
+ */
 typedef struct {
     int temp_available;
     int freq_ratio_available;
     int32_t package_temp_millic;
     uint32_t freq_ratio_milli;
+
+    int filtered_temp_available;
+    int filtered_freq_ratio_available;
+    int32_t filtered_package_temp_millic;
+    uint32_t filtered_freq_ratio_milli;
 } tsd_telemetry_sample_t;
 
 typedef struct {
