@@ -1,8 +1,6 @@
 #include "mpc_controller.h"
 
 #include <algorithm>
-#include <atomic>
-#include <csignal>
 #include <cmath>
 #include <cstdlib>
 #include <cstdint>
@@ -13,36 +11,17 @@
 
 #include <thermal/simd/logging.h>
 #include <thermal/simd/metrics.h>
+#include <thermal/simd/thermal_config.h>
 
 namespace tsd {
 namespace policy {
 
 namespace {
 constexpr double kMinImprovement = 1.0;
-constexpr double kRatioTrendWeight = 0.5;
+constexpr double kDefaultRatioTrendWeight = 0.25;
 constexpr double kTemperatureWeight = 0.001;
 constexpr double kStabilityMargin = 0.25;
 constexpr std::chrono::milliseconds kDefaultStalenessWindow{500};
-
-std::atomic<bool> &reloadRequestedFlag() {
-    static std::atomic<bool> flag{false};
-    return flag;
-}
-
-void handleSighup(int) {
-    reloadRequestedFlag().store(true, std::memory_order_relaxed);
-}
-
-struct SignalRegistrar {
-    SignalRegistrar() {
-        std::signal(SIGHUP, handleSighup);
-    }
-};
-
-SignalRegistrar &registrar() {
-    static SignalRegistrar instance;
-    return instance;
-}
 
 inline int widthIndex(simd_width_t width) {
     return static_cast<int>(width);
@@ -56,11 +35,21 @@ bool fileReadable(const char *path) {
     return stream.good();
 }
 
+double runtimeTrendWeight() {
+    double alpha = g_tsd_config.predictive_alpha;
+    if (!std::isfinite(alpha) || alpha < 0.0 || alpha > 1.0) {
+        return kDefaultRatioTrendWeight;
+    }
+    return alpha;
+}
+
 std::string resolveCoefficientPath() {
-    (void)registrar();
     const char *env = std::getenv("TSD_PREDICTIVE_COEFF_PATH");
     if (env && *env) {
         return std::string(env);
+    }
+    if (g_tsd_config.predictive_coeff_path[0] != '\0') {
+        return std::string(g_tsd_config.predictive_coeff_path);
     }
 #ifdef TSD_INSTALLED_COEFF_PATH
     if (fileReadable(TSD_INSTALLED_COEFF_PATH)) {
@@ -96,6 +85,7 @@ void MPCController::reset(const tsd_policy_config &config) {
     last_prediction_millic_ = 0.0;
     last_prediction_valid_ = false;
     history_limit_ = std::max<std::size_t>(1, config_.forecast_horizon);
+    coeff_path_ = resolveCoefficientPath();
     if (!loadCoefficients(true)) {
         tsd_log_warn("policy", "using fallback averaging forecast due to coefficient load failure");
     }
@@ -185,7 +175,7 @@ double MPCController::scoreWidth(simd_width_t candidate,
                                  double forecast_temp,
                                  double ratio_error) const {
     int step = widthIndex(current) - widthIndex(candidate);
-    double ratio_projection = forecast_ratio + ratio_trend * kRatioTrendWeight;
+    double ratio_projection = forecast_ratio + ratio_trend * runtimeTrendWeight();
     ratio_projection -= static_cast<double>(step) * ratio_error * 0.5;
     if (ratio_projection < 0.0) {
         ratio_projection = 0.0;
@@ -217,7 +207,6 @@ bool MPCController::recommend(simd_width_t current_width,
     if (history_.empty() || config_.forecast_horizon == 0) {
         return false;
     }
-    maybeReloadCoefficients();
 
     size_t horizon = std::min(history_.size(), static_cast<size_t>(config_.forecast_horizon));
     if (horizon == 0) {
@@ -323,10 +312,9 @@ bool MPCController::loadCoefficients(bool log_success) {
     return true;
 }
 
-void MPCController::maybeReloadCoefficients() {
-    if (reloadRequestedFlag().exchange(false, std::memory_order_relaxed)) {
-        loadCoefficients(false);
-    }
+bool MPCController::reloadCoefficients() {
+    coeff_path_ = resolveCoefficientPath();
+    return loadCoefficients(false);
 }
 
 size_t MPCController::historyLimit() const {
