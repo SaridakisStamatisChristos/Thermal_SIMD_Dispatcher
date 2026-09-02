@@ -5,7 +5,7 @@ After=network.target
 [Service]
 Type=simple
 ExecStartPre=/usr/local/bin/thermal_simd --interval=50 --sandbox-only
-ExecStart=/usr/local/bin/thermal_simd --interval=50 --metrics-bind=127.0.0.1 --metrics-port=9464
+ExecStart=/usr/local/bin/thermal_simd --run-forever --interval=50 --metrics-bind=127.0.0.1 --metrics-port=9464
 Environment=TSD_LOG_LEVEL=info
 Environment=TSD_PREDICTIVE_COEFF_PATH=/etc/thermal-simd/controller_coeffs.json
 CapabilityBoundingSet=CAP_PERFMON
@@ -22,6 +22,8 @@ LockPersonality=true
 RestrictSUIDSGID=true
 RestrictRealtime=true
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+KillSignal=SIGTERM
+TimeoutStopSec=10s
 Restart=on-failure
 RestartSec=5s
 StandardOutput=journal
