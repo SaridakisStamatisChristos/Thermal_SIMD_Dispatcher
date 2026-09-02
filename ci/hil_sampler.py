@@ -4,6 +4,8 @@
 The sampler deliberately depends only on the Python standard library and Linux
 sysfs. It records the runtime's own health snapshot together with CPU frequency
 and package-energy deltas so a HIL run can be audited after the workflow ends.
+Raw safety temperature and filtered control temperature are retained as separate
+channels throughout the evidence artifact.
 """
 
 from __future__ import annotations
@@ -136,8 +138,10 @@ def main() -> int:
         "pinned_cpu",
         "monitor_cpu",
         "fusion_degraded",
-        "temp_available",
-        "package_temp_c",
+        "raw_temp_available",
+        "raw_package_temp_c",
+        "filtered_temp_available",
+        "filtered_package_temp_c",
         "freq_available",
         "freq_ratio",
         "cpu_cur_khz",
@@ -151,8 +155,10 @@ def main() -> int:
     live_samples = 0
     ready_samples = 0
     hardware_perf_samples = 0
-    temp_samples = 0
-    temperatures: list[float] = []
+    raw_temp_samples = 0
+    filtered_temp_samples = 0
+    raw_temperatures: list[float] = []
+    filtered_temperatures: list[float] = []
     powers: list[float] = []
     widths: Counter[str] = Counter()
 
@@ -201,8 +207,10 @@ def main() -> int:
                 "pinned_cpu": "",
                 "monitor_cpu": "",
                 "fusion_degraded": "",
-                "temp_available": "",
-                "package_temp_c": "",
+                "raw_temp_available": "",
+                "raw_package_temp_c": "",
+                "filtered_temp_available": "",
+                "filtered_package_temp_c": "",
                 "freq_available": "",
                 "freq_ratio": "",
                 "cpu_cur_khz": "",
@@ -228,11 +236,25 @@ def main() -> int:
                 width = str(controller.get("currentWidth", ""))
                 if width:
                     widths[width] += 1
-                temp_available = bool(fusion.get("tempAvailable", False))
-                temp = finite_number(fusion.get("packageTempC")) if temp_available else None
-                if temp is not None:
-                    temp_samples += 1
-                    temperatures.append(temp)
+
+                raw_available = bool(fusion.get("rawTempAvailable", fusion.get("tempAvailable", False)))
+                raw_temp = finite_number(
+                    fusion.get("rawPackageTempC", fusion.get("packageTempC"))
+                ) if raw_available else None
+                if raw_temp is not None:
+                    raw_temp_samples += 1
+                    raw_temperatures.append(raw_temp)
+
+                filtered_available = bool(
+                    fusion.get("filteredTempAvailable", fusion.get("tempAvailable", False))
+                )
+                filtered_temp = finite_number(
+                    fusion.get("filteredPackageTempC", fusion.get("packageTempC"))
+                ) if filtered_available else None
+                if filtered_temp is not None:
+                    filtered_temp_samples += 1
+                    filtered_temperatures.append(filtered_temp)
+
                 pinned_raw = perf.get("pinnedCpu")
                 try:
                     pinned_cpu = int(pinned_raw)
@@ -251,8 +273,10 @@ def main() -> int:
                         "pinned_cpu": "" if pinned_cpu is None else pinned_cpu,
                         "monitor_cpu": perf.get("monitorCpu", ""),
                         "fusion_degraded": int(bool(fusion.get("degraded", False))),
-                        "temp_available": int(temp_available),
-                        "package_temp_c": "" if temp is None else f"{temp:.3f}",
+                        "raw_temp_available": int(raw_available),
+                        "raw_package_temp_c": "" if raw_temp is None else f"{raw_temp:.3f}",
+                        "filtered_temp_available": int(filtered_available),
+                        "filtered_package_temp_c": "" if filtered_temp is None else f"{filtered_temp:.3f}",
                         "freq_available": int(bool(fusion.get("freqAvailable", False))),
                         "freq_ratio": fusion.get("freqRatio", ""),
                         "cpu_cur_khz": "" if cur_khz is None else cur_khz,
@@ -277,9 +301,17 @@ def main() -> int:
         "live_fraction": live_samples / denominator,
         "ready_fraction": ready_samples / denominator,
         "hardware_perf_fraction": hardware_perf_samples / denominator,
-        "temperature_sample_fraction": temp_samples / denominator,
-        "max_temperature_c": max(temperatures) if temperatures else None,
-        "mean_temperature_c": sum(temperatures) / len(temperatures) if temperatures else None,
+        "temperature_sample_fraction": raw_temp_samples / denominator,
+        "raw_temperature_sample_fraction": raw_temp_samples / denominator,
+        "filtered_temperature_sample_fraction": filtered_temp_samples / denominator,
+        "max_temperature_c": max(raw_temperatures) if raw_temperatures else None,
+        "mean_temperature_c": sum(raw_temperatures) / len(raw_temperatures) if raw_temperatures else None,
+        "max_raw_temperature_c": max(raw_temperatures) if raw_temperatures else None,
+        "mean_raw_temperature_c": sum(raw_temperatures) / len(raw_temperatures) if raw_temperatures else None,
+        "max_filtered_temperature_c": max(filtered_temperatures) if filtered_temperatures else None,
+        "mean_filtered_temperature_c": (
+            sum(filtered_temperatures) / len(filtered_temperatures) if filtered_temperatures else None
+        ),
         "mean_rapl_power_w": sum(powers) / len(powers) if powers else None,
         "max_rapl_power_w": max(powers) if powers else None,
         "rapl_domain_count": len(rapl_domains),

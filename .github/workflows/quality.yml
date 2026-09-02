@@ -105,14 +105,15 @@ jobs:
           cmake --build build-tsan --target \
             test_telemetry_fusion_stress \
             test_observability_metrics \
-            test_adaptive_dispatch -j2
+            test_adaptive_dispatch \
+            test_runtime_lifecycle -j2
 
       - name: Run focused TSan suite
         env:
           TSAN_OPTIONS: halt_on_error=1:history_size=7
         run: |
           ctest --test-dir build-tsan --output-on-failure \
-            -R "^(telemetry_fusion_stress|observability_metrics|adaptive_dispatch)$"
+            -R "^(telemetry_fusion_stress|observability_metrics|adaptive_dispatch|runtime_lifecycle)$"
 
   packaging:
     name: Make + install + consumer + container
@@ -144,6 +145,7 @@ jobs:
           test -f stage/etc/thermal-simd/controller_coeffs.json
           test -f stage/include/thermal/simd/thermal_trampoline.h
           test -f stage/include/thermal/simd/adaptive_dispatch.h
+          test -f stage/include/thermal/simd/runtime.h
           test -f stage/lib/cmake/thermal_simd_dispatcher/thermal_simd_dispatcherConfig.cmake
 
       - name: Build external installed-package consumer

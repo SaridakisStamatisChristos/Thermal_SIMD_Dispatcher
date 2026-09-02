@@ -20,6 +20,8 @@ BIN := thermal_simd
 CORE_C := \
 	src/config/runtime_flags.c \
 	src/dispatch/adaptive_dispatch.c \
+	src/runtime_guard.c \
+	src/runtime_api.c \
 	src/logging.c \
 	src/config_parser.c \
 	src/third_party/jsmn.c \
@@ -29,6 +31,7 @@ CORE_C := \
 	src/telemetry_helper.c \
 	src/thermal_config.c \
 	src/thermal_cpu.c \
+	src/patcher/trampoline_guard.c \
 	src/thermal_perf.c \
 	src/thermal_signals.c \
 	src/policy/policy_config.c
@@ -68,6 +71,9 @@ check-deps:
 
 $(BIN): $(OBJ)
 	$(CXX) $(CXXFLAGS) $(ARCHFLAGS) $(LDFLAGS) -o $@ $(OBJ) $(LDLIBS)
+
+src/thermal_simd.o: CPPFLAGS += -DTSD_RUNTIME_INTERNAL_IMPL
+src/patcher/trampoline.o: CPPFLAGS += -DTSD_TRAMPOLINE_INTERNAL_IMPL
 
 %.o: %.c
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(ARCHFLAGS) -c $< -o $@

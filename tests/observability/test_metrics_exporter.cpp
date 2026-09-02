@@ -222,6 +222,13 @@ int main() {
     fusion.power_budget_w = 75.0;
     tsd_observability_update_fusion(&fusion);
 
+    tsd_temperature_channels_t channels{};
+    channels.raw_available = 1;
+    channels.raw_package_temp_c = 67.5;
+    channels.filtered_available = 1;
+    channels.filtered_package_temp_c = 63.0;
+    tsd_observability_update_temperature_channels(&channels);
+
     tsd_perf_telemetry_t perf{};
     perf.mode = 1;
     perf.counters_healthy = 1;
@@ -234,14 +241,19 @@ int main() {
 
     const std::string credentials = basic_auth_header("observer", "secret");
     HttpResponse metrics = https_request(port, "/metrics", credentials, ca_crt);
-    if (metrics.status != 200 || metrics.body.find("tsd_patch_transitions_total") == std::string::npos) {
-        fail("metrics response invalid");
+    if (metrics.status != 200 || metrics.body.find("tsd_patch_transitions_total") == std::string::npos ||
+        metrics.body.find("channel=\"raw_safety\"") == std::string::npos ||
+        metrics.body.find("channel=\"filtered_control\"") == std::string::npos) {
+        fail("metrics response invalid or missing temperature channels");
     }
 
     HttpResponse health = https_request(port, "/healthz", credentials, ca_crt);
     if (health.status != 200 || health.body.find("\"live\":true") == std::string::npos ||
-        health.body.find("\"perf\":") == std::string::npos) {
-        fail("health response missing liveness/perf state");
+        health.body.find("\"perf\":") == std::string::npos ||
+        health.body.find("\"rawTempAvailable\":true") == std::string::npos ||
+        health.body.find("\"rawPackageTempC\":67.50") == std::string::npos ||
+        health.body.find("\"filteredPackageTempC\":63.00") == std::string::npos) {
+        fail("health response missing liveness/perf/raw-filtered temperature state");
     }
     HttpResponse ready = https_request(port, "/readyz", credentials, ca_crt);
     if (ready.status != 200) fail("expected ready response");
