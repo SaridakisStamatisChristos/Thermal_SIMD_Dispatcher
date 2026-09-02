@@ -1,0 +1,9 @@
+/build*/
+/stage/
+/hil-artifacts/
+/thermal_simd
+*.o
+*.a
+*.so
+*.so.*
+compile_commands.json

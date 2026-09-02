@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.15)
-project(thermal_simd_dispatcher VERSION 0.3.1 LANGUAGES C CXX)
+project(thermal_simd_dispatcher VERSION 0.4.0 LANGUAGES C CXX)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -9,6 +9,7 @@ set(THERMAL_SIMD_DISPATCHER_CPU_FLAGS "-msse4.1" CACHE STRING "CPU-specific comp
 include(CTest)
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
+option(TSD_BUILD_BENCHMARKS "Build deterministic software-overhead benchmarks" OFF)
 
 find_package(OpenSSL REQUIRED)
 find_package(Threads REQUIRED)
@@ -132,6 +133,12 @@ target_link_libraries(tsd_policy_tuner PUBLIC thermal_simd_core)
 
 add_executable(policy_tuner src/tools/policy_tuner/main.cpp)
 target_link_libraries(policy_tuner PRIVATE tsd_policy_tuner)
+
+if(TSD_BUILD_BENCHMARKS)
+    add_executable(benchmark_dispatch benchmarks/dispatch_overhead.c)
+    target_link_libraries(benchmark_dispatch PRIVATE thermal_simd_core)
+    target_compile_options(benchmark_dispatch PRIVATE -O3 -Wall -Wextra)
+endif()
 
 if(BUILD_TESTING)
     # CMake's Release flags define NDEBUG, which would otherwise compile away

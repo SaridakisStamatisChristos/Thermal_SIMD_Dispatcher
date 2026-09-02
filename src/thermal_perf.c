@@ -476,14 +476,14 @@ static void select_runtime_cpus(perf_ctx_t *ctx) {
     if (sched_getaffinity(ctx->owner_tid, sizeof(allowed), &allowed) == 0) {
         ctx->original_affinity = allowed;
         ctx->original_affinity_valid = 1;
-        for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
+        for (size_t cpu = 0; cpu < (size_t)CPU_SETSIZE; ++cpu) {
             if (!CPU_ISSET(cpu, &allowed)) {
                 continue;
             }
             if (first < 0) {
-                first = cpu;
+                first = (int)cpu;
             } else {
-                second = cpu;
+                second = (int)cpu;
                 break;
             }
         }

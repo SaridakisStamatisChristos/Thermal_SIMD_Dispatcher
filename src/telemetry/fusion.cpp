@@ -128,10 +128,10 @@ TelemetrySnapshot TelemetryFusion::fuse(std::chrono::steady_clock::time_point no
 
     snapshot.degraded = false;
 
-    assign_value(snapshot, TelemetrySignal::kPackageTempC, snapshot.package_temp_c, snapshot.temp_available, now);
-    assign_value(snapshot, TelemetrySignal::kFrequencyRatio, snapshot.freq_ratio, snapshot.freq_available, now);
-    assign_value(snapshot, TelemetrySignal::kThermalCpi, snapshot.thermal_cpi, snapshot.cpi_available, now);
-    assign_value(snapshot, TelemetrySignal::kPowerBudgetWatts, snapshot.power_budget_w, snapshot.power_available, now);
+    assign_value(TelemetrySignal::kPackageTempC, snapshot.package_temp_c, snapshot.temp_available, now);
+    assign_value(TelemetrySignal::kFrequencyRatio, snapshot.freq_ratio, snapshot.freq_available, now);
+    assign_value(TelemetrySignal::kThermalCpi, snapshot.thermal_cpi, snapshot.cpi_available, now);
+    assign_value(TelemetrySignal::kPowerBudgetWatts, snapshot.power_budget_w, snapshot.power_available, now);
 
     /*
      * Temperature and frequency are the production fusion bridge's required
@@ -157,8 +157,7 @@ TelemetrySnapshot TelemetryFusion::fuse(std::chrono::steady_clock::time_point no
     return snapshot;
 }
 
-bool TelemetryFusion::assign_value(TelemetrySnapshot &snapshot,
-                                   TelemetrySignal signal,
+bool TelemetryFusion::assign_value(TelemetrySignal signal,
                                    double &out_value,
                                    bool &out_flag,
                                    std::chrono::steady_clock::time_point now) {

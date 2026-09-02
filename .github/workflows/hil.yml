@@ -14,7 +14,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Hardware smoke
         run: ci/hw-smoke.sh
 
@@ -24,7 +24,7 @@ jobs:
     timeout-minutes: 60
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Configure
         run: cmake -S . -B build-ci -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
       - name: Build stress targets
@@ -45,7 +45,7 @@ jobs:
       HIL_ARTIFACT_DIR: ${{ github.workspace }}/hil-artifacts
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Run thermal characterization
         run: ci/thermal-soak.sh
@@ -62,7 +62,7 @@ jobs:
 
       - name: Upload HIL evidence
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: thermal-simd-hil-${{ github.sha }}
           path: hil-artifacts/

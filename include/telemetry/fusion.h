@@ -79,8 +79,7 @@ public:
 private:
     void run();
     TelemetrySnapshot fuse(std::chrono::steady_clock::time_point now);
-    bool assign_value(TelemetrySnapshot &snapshot,
-                      TelemetrySignal signal,
+    bool assign_value(TelemetrySignal signal,
                       double &out_value,
                       bool &out_flag,
                       std::chrono::steady_clock::time_point now);
@@ -96,4 +95,3 @@ private:
 };
 
 }  // namespace telemetry
-

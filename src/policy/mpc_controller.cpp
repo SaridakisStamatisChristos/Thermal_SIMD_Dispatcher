@@ -27,6 +27,7 @@ inline int widthIndex(simd_width_t width) {
     return static_cast<int>(width);
 }
 
+#ifdef TSD_INSTALLED_COEFF_PATH
 bool fileReadable(const char *path) {
     if (!path || !*path) {
         return false;
@@ -34,6 +35,7 @@ bool fileReadable(const char *path) {
     std::ifstream stream(path);
     return stream.good();
 }
+#endif
 
 double runtimeTrendWeight() {
     double alpha = g_tsd_config.predictive_alpha;

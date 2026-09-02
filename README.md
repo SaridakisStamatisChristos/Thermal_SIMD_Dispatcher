@@ -38,9 +38,10 @@ The runtime reads the caller's allowed affinity mask instead of assuming CPU 0. 
 
 ```bash
 make
+./build-make/thermal_simd --help
 ```
 
-The compatibility Makefile builds the same production source set as CMake and links the mixed C/C++ runtime closure through the C++ final linker.
+The compatibility Makefile builds the same production source set as CMake, keeps all artifacts under `build-make/`, and links the mixed C/C++ runtime closure through the C++ final linker.
 
 ### CMake
 
@@ -52,7 +53,7 @@ ctest --test-dir build --output-on-failure
 
 ### Install / consume
 
-Version **0.3.1** installs the executable, public headers, static core library, versioned CMake package, and controller coefficient bundle.
+Version **0.4.0** installs the executable, public headers, static core library, versioned CMake package, and controller coefficient bundle.
 
 ```bash
 cmake -S . -B build-install -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF
@@ -146,6 +147,27 @@ void process(void *ctx, size_t n) {
 The variant table is copied at creation and remains immutable for the object's lifetime. Each dispatch clamps the live selected width to host ISA support and falls back conservatively to SSE4.1 when a wider registered variant is unavailable. Dispatched work contributes to software-perf accounting.
 
 The runtime remains process-global and primarily observes one workload-owner TID. Multi-package/per-thread control domains are intentionally outside the current scope.
+
+For new integrations, the v2 dispatch API adds explicit `(offset, count)` ranges
+and status-returning callbacks. Failed callbacks are propagated and are not
+counted as completed software work. The original callback API remains source
+and ABI compatible. Dispatch objects must not be destroyed while calls are in
+flight, and callers retain ownership and synchronization responsibility for the
+context pointer.
+
+## Software overhead benchmark
+
+A deterministic direct-call versus dispatch-call microbenchmark is available
+without requiring thermal hardware:
+
+```bash
+cmake -S . -B build-bench -DCMAKE_BUILD_TYPE=Release -DTSD_BUILD_BENCHMARKS=ON
+cmake --build build-bench --target benchmark_dispatch -j
+./build-bench/benchmark_dispatch 10000000
+```
+
+See [`docs/benchmarking.md`](docs/benchmarking.md) for interpretation and
+reporting requirements. It intentionally makes no thermal or energy claim.
 
 ## Run
 

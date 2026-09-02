@@ -10,6 +10,8 @@ struct counters {
     uint64_t avx2;
     uint64_t avx512;
     size_t calls;
+    size_t next_offset;
+    size_t fail_offset;
 };
 
 static void run_sse(void *context, size_t work_items) {
@@ -28,6 +30,18 @@ static void run_avx512(void *context, size_t work_items) {
     struct counters *state = (struct counters *)context;
     state->avx512 += work_items;
     state->calls++;
+}
+
+static int run_v2(void *context, size_t offset, size_t work_items) {
+    struct counters *state = (struct counters *)context;
+    assert(offset == state->next_offset);
+    if (offset == state->fail_offset) {
+        return 73;
+    }
+    state->next_offset += work_items;
+    state->sse += work_items;
+    state->calls++;
+    return 0;
 }
 
 int main(void) {
@@ -92,5 +106,25 @@ int main(void) {
 
     variants.sse41 = NULL;
     assert(tsd_kernel_dispatch_create(&variants, &dispatch) != 0);
+
+    /* v2 passes exact offsets and propagates callback failures. */
+    counters = (struct counters){.next_offset = 100, .fail_offset = SIZE_MAX};
+    tsd_kernel_variants_v2_t variants_v2 = {
+        .sse41 = run_v2,
+        .context = &counters,
+    };
+    tsd_kernel_dispatch_v2_t *dispatch_v2 = NULL;
+    assert(tsd_kernel_dispatch_v2_create(&variants_v2, &dispatch_v2) == 0);
+    assert(tsd_kernel_dispatch_v2_execute_chunked(dispatch_v2, 100, 10, 3, &used) == 0);
+    assert(counters.next_offset == 110);
+    assert(counters.sse == 10);
+    assert(counters.calls == 4);
+
+    counters.fail_offset = 110;
+    assert(tsd_kernel_dispatch_v2_execute(dispatch_v2, 110, 2, &used) == 73);
+    assert(counters.sse == 10);
+    assert(counters.calls == 4);
+    assert(tsd_kernel_dispatch_v2_execute_chunked(dispatch_v2, SIZE_MAX, 1, 1, &used) != 0);
+    tsd_kernel_dispatch_v2_destroy(dispatch_v2);
     return 0;
 }
