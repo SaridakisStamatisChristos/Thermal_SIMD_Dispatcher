@@ -1,6 +1,5 @@
 #include <cassert>
 #include <chrono>
-#include <csignal>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
@@ -128,7 +127,7 @@ void test_mpc_staleness_guard() {
     assert(stale_delta == 1);
 }
 
-void test_mpc_reload_on_sighup() {
+void test_mpc_explicit_reload() {
     auto base_path = writeCoefficients(
         "coeff_reload.json",
         R"JSON({
@@ -157,7 +156,6 @@ void test_mpc_reload_on_sighup() {
     controller.recommend(SIMD_AVX2, SIMD_AVX512, target);
     double initial_prediction = controller.debugLastPrediction();
 
-    // Overwrite coefficients with a different bias and stronger gain.
     std::ofstream stream(base_path);
     stream << R"JSON({
   "bias": 5000.0,
@@ -169,7 +167,7 @@ void test_mpc_reload_on_sighup() {
 })JSON";
     stream.close();
 
-    std::raise(SIGHUP);
+    assert(controller.reloadCoefficients());
 
     populateSample(sample, 1650, 81000);
     controller.pushSample(sample, SIMD_AVX2);
@@ -185,7 +183,7 @@ void test_mpc_reload_on_sighup() {
 int main() {
     test_arx_prediction_basic();
     test_mpc_staleness_guard();
-    test_mpc_reload_on_sighup();
+    test_mpc_explicit_reload();
     std::printf("policy ARX model tests passed\n");
     return 0;
 }

@@ -43,6 +43,13 @@ int tsd_perf_get_pinned_cpu(const perf_ctx_t *ctx);
 int tsd_perf_get_monitor_cpu(const perf_ctx_t *ctx);
 int tsd_perf_check_software_timeout(perf_ctx_t *ctx, int timeout_sec);
 
+/*
+ * Wider SIMD authorization must be checked continuously, not only when the
+ * runtime first falls back. Hardware mode is always eligible; software mode
+ * is eligible only under the explicit TSD_ALLOW_SOFTWARE_UPGRADES override.
+ */
+int tsd_perf_upgrades_allowed(const perf_ctx_t *ctx);
+
 #ifdef TSD_ENABLE_TESTS
 typedef enum {
     TSD_PERF_TEST_STEP_EINTR = 0,

@@ -10,6 +10,8 @@
 #include <telemetry/bus.h>
 #include <telemetry/collector.h>
 #include <telemetry/fusion.h>
+#include <thermal/simd/logging.h>
+#include <thermal/simd/thermal_config.h>
 #include <thermal/simd/thermal_trampoline.h>
 
 namespace {
@@ -20,15 +22,45 @@ std::shared_ptr<telemetry::TelemetryBusManager> g_manager;
 tsd_telemetry_helper_t g_direct_helper{};
 bool g_direct_helper_ready = false;
 unsigned int g_fusion_users = 0;
+int g_fusion_cpu = -1;
+std::optional<double> g_smoothed_temp_c;
+std::optional<double> g_smoothed_freq_ratio;
 std::atomic<bool> g_fusion_running{false};
 std::atomic<bool> g_temperature_upgrade_allowed{true};
 
+bool runtime_config_initialized() {
+    return g_tsd_config.check_interval_us > 0;
+}
+
 telemetry::TelemetryFusionConfig default_config() {
     telemetry::TelemetryFusionConfig config;
-    config.poll_interval = std::chrono::milliseconds(50);
-    config.freshness_window = std::chrono::milliseconds(150);
+    const bool initialized = runtime_config_initialized();
+    int interval_ms = initialized && g_tsd_config.telemetry_interval_ms > 0
+                          ? g_tsd_config.telemetry_interval_ms
+                          : 50;
+    int freshness_ms = initialized
+                           ? g_tsd_config.telemetry_max_skew_ms
+                           : 150;
+    if (freshness_ms < 0) {
+        freshness_ms = 150;
+    }
+    config.poll_interval = std::chrono::milliseconds(interval_ms);
+    config.freshness_window = std::chrono::milliseconds(freshness_ms);
     config.ring_size = 128;
     return config;
+}
+
+double smooth_value(double raw, std::optional<double> &state) {
+    double alpha = runtime_config_initialized() ? g_tsd_config.telemetry_ewma_alpha : 1.0;
+    if (!std::isfinite(alpha) || alpha < 0.0 || alpha > 1.0) {
+        alpha = 1.0;
+    }
+    if (!state.has_value()) {
+        state = raw;
+        return raw;
+    }
+    state = alpha * raw + (1.0 - alpha) * *state;
+    return *state;
 }
 
 bool publish_sample_unlocked(const tsd_telemetry_sample_t &sample) {
@@ -44,7 +76,8 @@ bool publish_sample_unlocked(const tsd_telemetry_sample_t &sample) {
     const auto now = std::chrono::steady_clock::now();
     if (sample.temp_available) {
         telemetry::TelemetryReading reading;
-        reading.value = static_cast<double>(sample.package_temp_millic) / 1000.0;
+        double raw_c = static_cast<double>(sample.package_temp_millic) / 1000.0;
+        reading.value = smooth_value(raw_c, g_smoothed_temp_c);
         reading.valid = true;
         reading.quality = 100;
         reading.timestamp = now;
@@ -53,7 +86,8 @@ bool publish_sample_unlocked(const tsd_telemetry_sample_t &sample) {
     }
     if (sample.freq_ratio_available) {
         telemetry::TelemetryReading reading;
-        reading.value = static_cast<double>(sample.freq_ratio_milli);
+        double raw_ratio = static_cast<double>(sample.freq_ratio_milli);
+        reading.value = smooth_value(raw_ratio, g_smoothed_freq_ratio);
         reading.valid = true;
         reading.quality = 100;
         reading.timestamp = now;
@@ -106,7 +140,27 @@ int start_unlocked(int cpu) {
         return -1;
     }
 
+    /*
+     * A profile-manifest parser has never existed in the production path.
+     * Reject a configured profile explicitly rather than accepting a knob
+     * that has no effect. The caller will retain its CPU-local direct helper.
+     */
+    if (runtime_config_initialized() && g_tsd_config.telemetry_profile_path[0] != '\0') {
+        tsd_log_error("telemetry",
+                      "telemetry profile manifests are not implemented; refusing fusion startup for profile=%s",
+                      g_tsd_config.telemetry_profile_path);
+        return -1;
+    }
+
     if (g_fusion && g_fusion->running()) {
+        /*
+         * The service is intentionally process-wide and owns one direct CPU
+         * helper. A second caller targeting another CPU must not silently
+         * receive measurements from the first caller's CPU.
+         */
+        if (cpu != g_fusion_cpu) {
+            return -1;
+        }
         ++g_fusion_users;
         return 0;
     }
@@ -115,7 +169,10 @@ int start_unlocked(int cpu) {
     telemetry::TelemetryFusionConfig config = default_config();
     g_fusion = std::make_unique<telemetry::TelemetryFusion>(config, g_manager);
 
+    g_smoothed_temp_c.reset();
+    g_smoothed_freq_ratio.reset();
     g_direct_helper_ready = tsd_telemetry_helper_init(&g_direct_helper, cpu) == 0;
+    g_fusion_cpu = cpu;
     g_fusion->start();
     g_fusion_users = 1;
     g_fusion_running.store(true, std::memory_order_release);
@@ -160,6 +217,9 @@ extern "C" void tsd_telemetry_fusion_stop(void) {
         tsd_telemetry_helper_destroy(&g_direct_helper);
         g_direct_helper_ready = false;
     }
+    g_fusion_cpu = -1;
+    g_smoothed_temp_c.reset();
+    g_smoothed_freq_ratio.reset();
     g_fusion_running.store(false, std::memory_order_release);
     g_temperature_upgrade_allowed.store(true, std::memory_order_release);
 }

@@ -13,6 +13,9 @@ int tsd_telemetry_fusion_start(void);
 /*
  * Starts (or acquires a reference to) the process-wide fusion service using
  * the supplied workload CPU for direct APERF/MPERF/cpufreq telemetry.
+ * Re-acquiring for the same CPU increments the reference count. A concurrent
+ * request for a different CPU fails with -1 rather than returning telemetry
+ * from the wrong CPU; that caller should use its CPU-local direct helper.
  */
 int tsd_telemetry_fusion_start_for_cpu(int cpu);
 

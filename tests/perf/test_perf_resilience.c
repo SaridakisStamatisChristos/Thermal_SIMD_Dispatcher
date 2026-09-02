@@ -38,6 +38,24 @@ static void test_runtime_group_failure_fails_closed(void) {
     tsd_perf_test_destroy_dummy_context(ctx);
 }
 
+static void test_software_upgrade_gate_is_continuous(void) {
+    perf_ctx_t *ctx = tsd_perf_test_create_dummy_context();
+    assert(ctx != NULL);
+
+    unsetenv("TSD_ALLOW_SOFTWARE_UPGRADES");
+    tsd_perf_test_set_mode(ctx, TSD_PERF_MODE_SOFTWARE);
+    assert(tsd_perf_upgrades_allowed(ctx) == 0);
+
+    assert(setenv("TSD_ALLOW_SOFTWARE_UPGRADES", "1", 1) == 0);
+    assert(tsd_perf_upgrades_allowed(ctx) == 1);
+    unsetenv("TSD_ALLOW_SOFTWARE_UPGRADES");
+    assert(tsd_perf_upgrades_allowed(ctx) == 0);
+
+    tsd_perf_test_set_mode(ctx, TSD_PERF_MODE_HARDWARE);
+    assert(tsd_perf_upgrades_allowed(ctx) == 1);
+    tsd_perf_test_destroy_dummy_context(ctx);
+}
+
 static void test_selected_cpu_is_in_allowed_cpuset(void) {
     assert(setenv("TSD_FAKE_PERF", "1", 1) == 0);
     perf_ctx_t *ctx = tsd_perf_init(NULL);
@@ -54,9 +72,10 @@ static void test_selected_cpu_is_in_allowed_cpuset(void) {
     unsetenv("TSD_FAKE_PERF");
 }
 
-static void test_fusion_is_reference_counted(void) {
+static void test_fusion_is_reference_counted_and_cpu_coherent(void) {
     assert(tsd_telemetry_fusion_start_for_cpu(0) == 0);
     assert(tsd_telemetry_fusion_start_for_cpu(0) == 0);
+    assert(tsd_telemetry_fusion_start_for_cpu(1) != 0);
 
     tsd_telemetry_sample_t sample = {0};
     sample.temp_available = 1;
@@ -75,7 +94,8 @@ static void test_fusion_is_reference_counted(void) {
 
 int main(void) {
     test_runtime_group_failure_fails_closed();
+    test_software_upgrade_gate_is_continuous();
     test_selected_cpu_is_in_allowed_cpuset();
-    test_fusion_is_reference_counted();
+    test_fusion_is_reference_counted_and_cpu_coherent();
     return 0;
 }

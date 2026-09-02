@@ -65,10 +65,13 @@ struct perf_ctx {
     uint64_t sw_last_iterations;
     tsd_workload_fn workload;
     tsd_telemetry_helper_t telemetry;
+    int fusion_acquired;
     struct timespec mode_entered_at;
     int timeout_notified;
     time_t perf_retry_deadline;
     int perf_retry_backoff_seconds;
+    time_t llc_retry_deadline;
+    int llc_retry_backoff_seconds;
     int force_software;
 };
 
@@ -81,13 +84,8 @@ static uint64_t timespec_diff_ns(const struct timespec *start, const struct time
 static void perf_fail_closed(perf_ctx_t *ctx, const char *reason);
 
 static int allow_software_upgrades(void) {
-    static int cached = -1;
-    if (cached >= 0) {
-        return cached;
-    }
     const char *env = getenv("TSD_ALLOW_SOFTWARE_UPGRADES");
-    cached = (env && env[0] != '\0' && strcmp(env, "0") != 0) ? 1 : 0;
-    return cached;
+    return (env && env[0] != '\0' && strcmp(env, "0") != 0) ? 1 : 0;
 }
 
 static void publish_perf_state(const perf_ctx_t *ctx, int healthy) {
@@ -138,6 +136,39 @@ static int perf_retry_due(const perf_ctx_t *ctx) {
         return 0;
     }
     return ctx->perf_retry_deadline == 0 || now_seconds() >= ctx->perf_retry_deadline;
+}
+
+static void reset_llc_retry(perf_ctx_t *ctx) {
+    if (!ctx) {
+        return;
+    }
+    ctx->llc_retry_deadline = 0;
+    ctx->llc_retry_backoff_seconds = PERF_INITIAL_BACKOFF_SEC;
+}
+
+static void schedule_llc_retry(perf_ctx_t *ctx) {
+    if (!ctx || ctx->force_software) {
+        return;
+    }
+    if (ctx->llc_retry_backoff_seconds <= 0) {
+        ctx->llc_retry_backoff_seconds = PERF_INITIAL_BACKOFF_SEC;
+    }
+    int delay = ctx->llc_retry_backoff_seconds;
+    if (delay > PERF_MAX_BACKOFF_SEC) {
+        delay = PERF_MAX_BACKOFF_SEC;
+    }
+    ctx->llc_retry_deadline = now_seconds() + (time_t)delay;
+    if (ctx->llc_retry_backoff_seconds < PERF_MAX_BACKOFF_SEC) {
+        int next = ctx->llc_retry_backoff_seconds * 2;
+        ctx->llc_retry_backoff_seconds = next > PERF_MAX_BACKOFF_SEC ? PERF_MAX_BACKOFF_SEC : next;
+    }
+}
+
+static int llc_retry_due(const perf_ctx_t *ctx) {
+    if (!ctx || ctx->force_software || ctx->mode != TSD_PERF_MODE_HARDWARE) {
+        return 0;
+    }
+    return ctx->llc_retry_deadline == 0 || now_seconds() >= ctx->llc_retry_deadline;
 }
 
 static void perf_set_mode(perf_ctx_t *ctx, tsd_perf_mode_t mode, const char *reason) {
@@ -305,6 +336,7 @@ perf_ctx_t* tsd_perf_test_create_dummy_context(void) {
     ctx->monitor_cpu = 0;
     ctx->force_software = 1;
     reset_perf_retry(ctx);
+    reset_llc_retry(ctx);
     return ctx;
 }
 
@@ -385,7 +417,7 @@ static void fetch_fused_telemetry(perf_ctx_t *ctx, tsd_telemetry_sample_t *out) 
     if (!ctx || !out) {
         return;
     }
-    if (tsd_telemetry_fusion_sample(out) == 0) {
+    if (ctx->fusion_acquired && tsd_telemetry_fusion_sample(out) == 0) {
         return;
     }
     (void)tsd_telemetry_helper_sample(&ctx->telemetry, out);
@@ -493,6 +525,32 @@ static void select_runtime_cpus(perf_ctx_t *ctx) {
     }
 }
 
+static int open_llc_event(perf_ctx_t *ctx) {
+    if (!ctx) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (ctx->fd_llc_misses >= 0) {
+        close(ctx->fd_llc_misses);
+        ctx->fd_llc_misses = -1;
+    }
+    struct perf_event_attr pe = {0};
+    pe.type = PERF_TYPE_HARDWARE;
+    pe.size = sizeof(pe);
+    pe.disabled = 1;
+    pe.exclude_kernel = 1;
+    pe.exclude_hv = 1;
+    pe.config = PERF_COUNT_HW_CACHE_MISSES;
+    long fd_llc = perf_event_open_sys(&pe, 0, ctx->pinned_cpu, -1, 0);
+    if (fd_llc < 0) {
+        schedule_llc_retry(ctx);
+        return -1;
+    }
+    ctx->fd_llc_misses = (int)fd_llc;
+    reset_llc_retry(ctx);
+    return 0;
+}
+
 static int open_perf_events(perf_ctx_t *ctx) {
     if (!ctx) {
         errno = EINVAL;
@@ -525,24 +583,28 @@ static int open_perf_events(perf_ctx_t *ctx) {
     }
     ctx->fd_insns = (int)fd_insns;
 
-    pe.read_format = 0;
-    pe.config = PERF_COUNT_HW_CACHE_MISSES;
-    long fd_llc = perf_event_open_sys(&pe, 0, ctx->pinned_cpu, -1, 0);
-    if (fd_llc < 0) {
+    if (open_llc_event(ctx) != 0 && !warned_llc_unavailable) {
         int err = errno;
-        ctx->fd_llc_misses = -1;
-        if (!warned_llc_unavailable) {
-            char errbuf[128];
-            tsd_log_warn(LOG_COMPONENT,
-                         "LLC miss counter unavailable (perf_event_open: %s); memory-bound guard disabled",
-                         tsd_log_strerror(err, errbuf, sizeof(errbuf)));
-            warned_llc_unavailable = 1;
-        }
-    } else {
-        ctx->fd_llc_misses = (int)fd_llc;
+        char errbuf[128];
+        tsd_log_warn(LOG_COMPONENT,
+                     "LLC miss counter unavailable (perf_event_open: %s); memory-bound guard will retry independently",
+                     tsd_log_strerror(err, errbuf, sizeof(errbuf)));
+        warned_llc_unavailable = 1;
     }
     reset_perf_retry(ctx);
     return 0;
+}
+
+static void enable_perf_events_raw(perf_ctx_t *ctx) {
+    if (!ctx) {
+        return;
+    }
+    try_perf_ioctl(ctx->fd_cycles, PERF_EVENT_IOC_RESET, "perf ioctl reset(cycles)");
+    try_perf_ioctl(ctx->fd_cycles, PERF_EVENT_IOC_ENABLE, "perf ioctl enable(cycles)");
+    try_perf_ioctl(ctx->fd_insns, PERF_EVENT_IOC_RESET, "perf ioctl reset(insns)");
+    try_perf_ioctl(ctx->fd_insns, PERF_EVENT_IOC_ENABLE, "perf ioctl enable(insns)");
+    try_perf_ioctl(ctx->fd_llc_misses, PERF_EVENT_IOC_RESET, "perf ioctl reset(llc)");
+    try_perf_ioctl(ctx->fd_llc_misses, PERF_EVENT_IOC_ENABLE, "perf ioctl enable(llc)");
 }
 
 static void perf_fail_closed(perf_ctx_t *ctx, const char *reason) {
@@ -566,12 +628,18 @@ perf_ctx_t* tsd_perf_init(tsd_workload_fn workload_cb) {
     ctx->mode = TSD_PERF_MODE_NONE;
     ctx->workload = workload_cb;
     reset_perf_retry(ctx);
+    reset_llc_retry(ctx);
     clock_gettime(CLOCK_MONOTONIC, &ctx->mode_entered_at);
     select_runtime_cpus(ctx);
     publish_perf_state(ctx, 0);
 
     (void)tsd_telemetry_helper_init(&ctx->telemetry, ctx->pinned_cpu);
-    (void)tsd_telemetry_fusion_start_for_cpu(ctx->pinned_cpu);
+    ctx->fusion_acquired = tsd_telemetry_fusion_start_for_cpu(ctx->pinned_cpu) == 0;
+    if (!ctx->fusion_acquired) {
+        tsd_log_warn(LOG_COMPONENT,
+                     "process-wide fusion already targets another CPU; using cpu-local direct telemetry for cpu=%d",
+                     ctx->pinned_cpu);
+    }
 
     const char *force_sw_env = getenv("TSD_FAKE_PERF");
     ctx->force_software = force_sw_env && force_sw_env[0] != '\0' && strcmp(force_sw_env, "0") != 0;
@@ -603,12 +671,7 @@ void tsd_perf_enable(perf_ctx_t *ctx) {
     if (!ctx || ctx->mode != TSD_PERF_MODE_HARDWARE) {
         return;
     }
-    try_perf_ioctl(ctx->fd_cycles, PERF_EVENT_IOC_RESET, "perf ioctl reset(cycles)");
-    try_perf_ioctl(ctx->fd_cycles, PERF_EVENT_IOC_ENABLE, "perf ioctl enable(cycles)");
-    try_perf_ioctl(ctx->fd_insns, PERF_EVENT_IOC_RESET, "perf ioctl reset(insns)");
-    try_perf_ioctl(ctx->fd_insns, PERF_EVENT_IOC_ENABLE, "perf ioctl enable(insns)");
-    try_perf_ioctl(ctx->fd_llc_misses, PERF_EVENT_IOC_RESET, "perf ioctl reset(llc)");
-    try_perf_ioctl(ctx->fd_llc_misses, PERF_EVENT_IOC_ENABLE, "perf ioctl enable(llc)");
+    enable_perf_events_raw(ctx);
 }
 
 static void tsd_perf_disable(perf_ctx_t *ctx) {
@@ -627,10 +690,61 @@ void tsd_perf_cleanup(perf_ctx_t *ctx) {
     tsd_perf_disable(ctx);
     close_perf_events(ctx);
     tsd_telemetry_helper_destroy(&ctx->telemetry);
-    tsd_telemetry_fusion_stop();
+    if (ctx->fusion_acquired) {
+        tsd_telemetry_fusion_stop();
+    }
     ctx->mode = TSD_PERF_MODE_NONE;
     publish_perf_state(ctx, 0);
     free(ctx);
+}
+
+static int measure_hardware_baseline(perf_ctx_t *ctx, const tsd_runtime_config *cfg) {
+    perf_group_read_t rd_before = {0}, rd_after = {0};
+    uint64_t llc_before = 0, llc_after = 0;
+    if (tsd_perf_read_exact(ctx->fd_cycles, &rd_before, sizeof(rd_before)) != 0 || rd_before.nr != 2) {
+        return -1;
+    }
+    if (ctx->fd_llc_misses >= 0 && tsd_perf_read_exact(ctx->fd_llc_misses, &llc_before, sizeof(llc_before)) != 0) {
+        llc_before = 0;
+    }
+    if (ctx->workload) {
+        for (int i = 0; i < 100000; i++) {
+            ctx->workload();
+        }
+    }
+    if (tsd_perf_read_exact(ctx->fd_cycles, &rd_after, sizeof(rd_after)) != 0 || rd_after.nr != 2) {
+        return -1;
+    }
+    if (ctx->fd_llc_misses >= 0 && tsd_perf_read_exact(ctx->fd_llc_misses, &llc_after, sizeof(llc_after)) != 0) {
+        llc_after = llc_before;
+    }
+    uint64_t delta_cycles = scale_counter(rd_after.values[0] - rd_before.values[0],
+                                          rd_after.time_enabled - rd_before.time_enabled,
+                                          rd_after.time_running - rd_before.time_running);
+    uint64_t delta_insns = scale_counter(rd_after.values[1] - rd_before.values[1],
+                                         rd_after.time_enabled - rd_before.time_enabled,
+                                         rd_after.time_running - rd_before.time_running);
+    ctx->baseline_cpi = (delta_cycles * 1000) / (delta_insns ? delta_insns : 1);
+    uint64_t delta_llc = (ctx->fd_llc_misses >= 0 && llc_after >= llc_before) ? (llc_after - llc_before) : 0;
+    ctx->baseline_llc_mpki_milli = delta_insns ? (delta_llc * MPKI_SCALE) / delta_insns : 0;
+    if (ctx->baseline_llc_mpki_milli == 0) {
+        ctx->baseline_llc_mpki_milli = 1000;
+    }
+    ctx->slow_cpi = ctx->fast_cpi = ctx->baseline_cpi ? ctx->baseline_cpi : 1000;
+    ctx->slow_llc_mpki = ctx->fast_llc_mpki = ctx->baseline_llc_mpki_milli;
+    ctx->ratio_history_count = 0;
+    ctx->ratio_history_cursor = 0;
+    ctx->ratio_trimmed_milli = cfg ? (uint32_t)cfg->down_ratio_milli : 1500;
+    ctx->last_group_read = rd_after;
+    ctx->last_group_valid = 1;
+    ctx->last_llc_value = llc_after;
+    tsd_log_info(LOG_COMPONENT, "Baseline CPI: %lu.%03lu",
+                 ctx->baseline_cpi / 1000, ctx->baseline_cpi % 1000);
+    tsd_log_info(LOG_COMPONENT, "Baseline MPKI: %lu.%03lu",
+                 ctx->baseline_llc_mpki_milli / 1000, ctx->baseline_llc_mpki_milli % 1000);
+    tsd_telemetry_sample_t baseline_sample = {0};
+    fetch_fused_telemetry(ctx, &baseline_sample);
+    return 0;
 }
 
 void tsd_perf_measure_baseline(perf_ctx_t *ctx, const tsd_runtime_config *cfg) {
@@ -675,53 +789,9 @@ void tsd_perf_measure_baseline(perf_ctx_t *ctx, const tsd_runtime_config *cfg) {
         return;
     }
 
-    perf_group_read_t rd_before = {0}, rd_after = {0};
-    uint64_t llc_before = 0, llc_after = 0;
-    if (tsd_perf_read_exact(ctx->fd_cycles, &rd_before, sizeof(rd_before)) != 0 || rd_before.nr != 2) {
-        perf_fail_closed(ctx, "baseline-read-before");
-        return;
+    if (measure_hardware_baseline(ctx, cfg) != 0) {
+        perf_fail_closed(ctx, "baseline-read");
     }
-    if (ctx->fd_llc_misses >= 0 && tsd_perf_read_exact(ctx->fd_llc_misses, &llc_before, sizeof(llc_before)) != 0) {
-        llc_before = 0;
-    }
-    if (ctx->workload) {
-        for (int i = 0; i < 100000; i++) {
-            ctx->workload();
-        }
-    }
-    if (tsd_perf_read_exact(ctx->fd_cycles, &rd_after, sizeof(rd_after)) != 0 || rd_after.nr != 2) {
-        perf_fail_closed(ctx, "baseline-read-after");
-        return;
-    }
-    if (ctx->fd_llc_misses >= 0 && tsd_perf_read_exact(ctx->fd_llc_misses, &llc_after, sizeof(llc_after)) != 0) {
-        llc_after = llc_before;
-    }
-    uint64_t delta_cycles = scale_counter(rd_after.values[0] - rd_before.values[0],
-                                          rd_after.time_enabled - rd_before.time_enabled,
-                                          rd_after.time_running - rd_before.time_running);
-    uint64_t delta_insns = scale_counter(rd_after.values[1] - rd_before.values[1],
-                                         rd_after.time_enabled - rd_before.time_enabled,
-                                         rd_after.time_running - rd_before.time_running);
-    ctx->baseline_cpi = (delta_cycles * 1000) / (delta_insns ? delta_insns : 1);
-    uint64_t delta_llc = (ctx->fd_llc_misses >= 0 && llc_after >= llc_before) ? (llc_after - llc_before) : 0;
-    ctx->baseline_llc_mpki_milli = delta_insns ? (delta_llc * MPKI_SCALE) / delta_insns : 0;
-    if (ctx->baseline_llc_mpki_milli == 0) {
-        ctx->baseline_llc_mpki_milli = 1000;
-    }
-    ctx->slow_cpi = ctx->fast_cpi = ctx->baseline_cpi ? ctx->baseline_cpi : 1000;
-    ctx->slow_llc_mpki = ctx->fast_llc_mpki = ctx->baseline_llc_mpki_milli;
-    ctx->ratio_history_count = 0;
-    ctx->ratio_history_cursor = 0;
-    ctx->ratio_trimmed_milli = cfg ? (uint32_t)cfg->down_ratio_milli : 1500;
-    ctx->last_group_read = rd_after;
-    ctx->last_group_valid = 1;
-    ctx->last_llc_value = llc_after;
-    tsd_log_info(LOG_COMPONENT, "Baseline CPI: %lu.%03lu",
-                 ctx->baseline_cpi / 1000, ctx->baseline_cpi % 1000);
-    tsd_log_info(LOG_COMPONENT, "Baseline MPKI: %lu.%03lu",
-                 ctx->baseline_llc_mpki_milli / 1000, ctx->baseline_llc_mpki_milli % 1000);
-    tsd_telemetry_sample_t baseline_sample = {0};
-    fetch_fused_telemetry(ctx, &baseline_sample);
 }
 
 static int try_recover_hardware(perf_ctx_t *ctx) {
@@ -738,16 +808,40 @@ static int try_recover_hardware(perf_ctx_t *ctx) {
         return 0;
     }
 
-    perf_set_mode(ctx, TSD_PERF_MODE_HARDWARE, "reprobe");
-    tsd_perf_enable(ctx);
-    tsd_perf_measure_baseline(ctx, &g_tsd_config);
-    if (ctx->mode != TSD_PERF_MODE_HARDWARE) {
+    enable_perf_events_raw(ctx);
+    if (measure_hardware_baseline(ctx, &g_tsd_config) != 0) {
+        tsd_log_warn(LOG_COMPONENT, "event=perf_reprobe state=rejected reason=baseline-validation");
+        close_perf_events(ctx);
+        schedule_perf_retry(ctx);
+        publish_perf_state(ctx, 0);
         return 0;
     }
+
     ctx->software_adaptation = 0;
     reset_perf_retry(ctx);
-    publish_perf_state(ctx, 1);
+    perf_set_mode(ctx, TSD_PERF_MODE_HARDWARE, "reprobe");
     return 1;
+}
+
+static void try_recover_llc(perf_ctx_t *ctx) {
+    if (!ctx || ctx->mode != TSD_PERF_MODE_HARDWARE || ctx->fd_llc_misses >= 0 || !llc_retry_due(ctx)) {
+        return;
+    }
+    if (open_llc_event(ctx) != 0) {
+        return;
+    }
+    try_perf_ioctl(ctx->fd_llc_misses, PERF_EVENT_IOC_RESET, "perf ioctl reset(llc reprobe)");
+    try_perf_ioctl(ctx->fd_llc_misses, PERF_EVENT_IOC_ENABLE, "perf ioctl enable(llc reprobe)");
+    uint64_t seed = 0;
+    if (tsd_perf_read_exact(ctx->fd_llc_misses, &seed, sizeof(seed)) != 0) {
+        close(ctx->fd_llc_misses);
+        ctx->fd_llc_misses = -1;
+        schedule_llc_retry(ctx);
+        return;
+    }
+    ctx->last_llc_value = seed;
+    reset_llc_retry(ctx);
+    tsd_log_info(LOG_COMPONENT, "event=llc_counter state=recovered cpu=%d", ctx->pinned_cpu);
 }
 
 static int process_measurement(perf_ctx_t *ctx, tsd_thermal_eval_t *out, uint64_t current_cpi,
@@ -896,6 +990,8 @@ int tsd_perf_evaluate(perf_ctx_t *ctx, tsd_thermal_eval_t *out, const tsd_runtim
         return process_measurement(ctx, out, current_cpi, 0, cfg, &telemetry);
     }
 
+    try_recover_llc(ctx);
+
     perf_group_read_t rd_now = {0};
     uint64_t llc_now = 0;
     if (tsd_perf_read_exact(ctx->fd_cycles, &rd_now, sizeof(rd_now)) != 0) {
@@ -920,9 +1016,10 @@ int tsd_perf_evaluate(perf_ctx_t *ctx, tsd_thermal_eval_t *out, const tsd_runtim
         return 1;
     }
     if (ctx->fd_llc_misses >= 0 && tsd_perf_read_exact(ctx->fd_llc_misses, &llc_now, sizeof(llc_now)) != 0) {
-        tsd_log_warn(LOG_COMPONENT, "LLC counter read failed; disabling memory-bound guard until reprobe");
+        tsd_log_warn(LOG_COMPONENT, "LLC counter read failed; disabling memory-bound guard and scheduling independent reprobe");
         close(ctx->fd_llc_misses);
         ctx->fd_llc_misses = -1;
+        schedule_llc_retry(ctx);
         llc_now = 0;
     }
     if (!ctx->last_group_valid) {
@@ -964,6 +1061,13 @@ int tsd_perf_get_pinned_cpu(const perf_ctx_t *ctx) {
 
 int tsd_perf_get_monitor_cpu(const perf_ctx_t *ctx) {
     return ctx ? ctx->monitor_cpu : -1;
+}
+
+int tsd_perf_upgrades_allowed(const perf_ctx_t *ctx) {
+    if (!ctx) {
+        return 0;
+    }
+    return ctx->mode == TSD_PERF_MODE_HARDWARE || allow_software_upgrades();
 }
 
 int tsd_perf_check_software_timeout(perf_ctx_t *ctx, int timeout_sec) {
