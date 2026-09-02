@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.15)
-project(thermal_simd_dispatcher VERSION 0.1.0 LANGUAGES C CXX)
+project(thermal_simd_dispatcher VERSION 0.2.0 LANGUAGES C CXX)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -8,8 +8,10 @@ set(THERMAL_SIMD_DISPATCHER_CPU_FLAGS "-msse4.1" CACHE STRING "CPU-specific comp
 
 include(CTest)
 include(GNUInstallDirs)
+include(CMakePackageConfigHelpers)
 
 find_package(OpenSSL REQUIRED)
+find_package(Threads REQUIRED)
 
 file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/include/thermal/simd)
 configure_file(
@@ -20,6 +22,7 @@ configure_file(
 
 set(THERMAL_SIMD_CORE_SOURCES
     src/config/runtime_flags.c
+    src/dispatch/adaptive_dispatch.c
     src/logging.c
     src/config_parser.c
     src/third_party/jsmn.c
@@ -63,12 +66,11 @@ target_compile_definitions(thermal_simd_core
         TSD_DEFAULT_COEFF_PATH="${CMAKE_CURRENT_SOURCE_DIR}/config/controller_coeffs.json"
         TSD_INSTALLED_COEFF_PATH="${CMAKE_INSTALL_FULL_SYSCONFDIR}/thermal-simd/controller_coeffs.json"
 )
-
-target_link_libraries(thermal_simd_core PRIVATE pthread OpenSSL::SSL OpenSSL::Crypto)
+target_link_libraries(thermal_simd_core PRIVATE Threads::Threads OpenSSL::SSL OpenSSL::Crypto)
 
 add_executable(thermal_simd src/main.cpp src/thermal_simd.c)
 target_compile_options(thermal_simd PRIVATE -O2 -pthread -fPIC -mno-avx ${THERMAL_SIMD_DISPATCHER_CPU_FLAGS})
-target_link_libraries(thermal_simd PRIVATE thermal_simd_core pthread)
+target_link_libraries(thermal_simd PRIVATE thermal_simd_core Threads::Threads)
 
 add_library(tsd_policy_tuner STATIC src/tools/policy_tuner/tuner.cpp)
 target_include_directories(tsd_policy_tuner
@@ -77,17 +79,15 @@ target_include_directories(tsd_policy_tuner
         $<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/include>
         $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )
-target_link_libraries(tsd_policy_tuner
-    PUBLIC
-        thermal_simd_core)
+target_link_libraries(tsd_policy_tuner PUBLIC thermal_simd_core)
 
 add_executable(policy_tuner src/tools/policy_tuner/main.cpp)
 target_link_libraries(policy_tuner PRIVATE tsd_policy_tuner)
 
 if(BUILD_TESTING)
     # CMake's Release flags define NDEBUG, which would otherwise compile away
-    # the many assert()-based regression checks. Tests must validate the same
-    # invariants in every configuration, including the normal Release CI job.
+    # assert()-based regression checks. Tests must validate the same invariants
+    # in every configuration, including the normal Release CI job.
     add_compile_options(-UNDEBUG)
 
     add_library(thermal_simd_core_tests STATIC ${THERMAL_SIMD_CORE_SOURCES})
@@ -104,7 +104,7 @@ if(BUILD_TESTING)
             TSD_DEFAULT_COEFF_PATH="${CMAKE_CURRENT_SOURCE_DIR}/config/controller_coeffs.json"
             TSD_INSTALLED_COEFF_PATH="${CMAKE_INSTALL_FULL_SYSCONFDIR}/thermal-simd/controller_coeffs.json"
     )
-    target_link_libraries(thermal_simd_core_tests PUBLIC OpenSSL::SSL OpenSSL::Crypto)
+    target_link_libraries(thermal_simd_core_tests PUBLIC OpenSSL::SSL OpenSSL::Crypto Threads::Threads)
 
     add_executable(test_config_parser tests/test_config_parser.c)
     target_link_libraries(test_config_parser PRIVATE thermal_simd_core_tests)
@@ -117,7 +117,7 @@ if(BUILD_TESTING)
     add_test(NAME statistics COMMAND test_statistics)
 
     add_executable(test_logging_metrics tests/test_logging_metrics.c)
-    target_link_libraries(test_logging_metrics PRIVATE thermal_simd_core_tests pthread)
+    target_link_libraries(test_logging_metrics PRIVATE thermal_simd_core_tests Threads::Threads)
     target_compile_options(test_logging_metrics PRIVATE -Wall -Wextra -pthread)
     add_test(NAME logging_metrics COMMAND test_logging_metrics)
 
@@ -126,20 +126,23 @@ if(BUILD_TESTING)
     target_compile_options(test_runtime_config_cli PRIVATE -Wall -Wextra)
     add_test(NAME runtime_config_cli COMMAND test_runtime_config_cli)
 
-    add_executable(test_thermal_simd
-        tests/test_thermal_simd.c
-        src/thermal_simd.c)
+    add_executable(test_thermal_simd tests/test_thermal_simd.c src/thermal_simd.c)
     target_compile_definitions(test_thermal_simd PRIVATE TSD_ENABLE_TESTS)
-    target_link_libraries(test_thermal_simd PRIVATE thermal_simd_core_tests pthread)
+    target_link_libraries(test_thermal_simd PRIVATE thermal_simd_core_tests Threads::Threads)
     target_compile_options(test_thermal_simd PRIVATE -Wall -Wextra -O1 -pthread -fPIC)
     target_include_directories(test_thermal_simd PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME thermal_simd COMMAND test_thermal_simd)
 
     add_executable(test_perf_resilience tests/perf/test_perf_resilience.c)
-    target_link_libraries(test_perf_resilience PRIVATE thermal_simd_core_tests pthread)
+    target_link_libraries(test_perf_resilience PRIVATE thermal_simd_core_tests Threads::Threads)
     target_compile_definitions(test_perf_resilience PRIVATE TSD_ENABLE_TESTS)
     target_compile_options(test_perf_resilience PRIVATE -Wall -Wextra -pthread)
     add_test(NAME perf_resilience COMMAND test_perf_resilience)
+
+    add_executable(test_adaptive_dispatch tests/dispatch/test_adaptive_dispatch.c)
+    target_link_libraries(test_adaptive_dispatch PRIVATE thermal_simd_core_tests Threads::Threads)
+    target_compile_options(test_adaptive_dispatch PRIVATE -Wall -Wextra)
+    add_test(NAME adaptive_dispatch COMMAND test_adaptive_dispatch)
 
     add_executable(test_policy_controller tests/policy/test_policy_controller.c)
     target_link_libraries(test_policy_controller PRIVATE thermal_simd_core_tests)
@@ -164,39 +167,35 @@ if(BUILD_TESTING)
     add_test(NAME telemetry_adapters COMMAND test_telemetry)
 
     add_executable(test_telemetry_fusion tests/telemetry/test_fusion_thread.cpp)
-    target_link_libraries(test_telemetry_fusion PRIVATE thermal_simd_core_tests pthread)
+    target_link_libraries(test_telemetry_fusion PRIVATE thermal_simd_core_tests Threads::Threads)
+    target_compile_definitions(test_telemetry_fusion PRIVATE TSD_ENABLE_TESTS)
     target_compile_options(test_telemetry_fusion PRIVATE -Wall -Wextra -pthread)
     add_test(NAME telemetry_fusion_thread COMMAND test_telemetry_fusion)
 
     add_executable(test_telemetry_fusion_stress tests/telemetry/test_fusion_stress.cpp)
-    target_link_libraries(test_telemetry_fusion_stress PRIVATE thermal_simd_core_tests pthread)
+    target_link_libraries(test_telemetry_fusion_stress PRIVATE thermal_simd_core_tests Threads::Threads)
     target_compile_options(test_telemetry_fusion_stress PRIVATE -Wall -Wextra -pthread)
     add_test(NAME telemetry_fusion_stress COMMAND test_telemetry_fusion_stress)
 
     add_executable(test_trampoline_security tests/patcher/test_trampoline_security.cpp)
-    target_link_libraries(test_trampoline_security PRIVATE thermal_simd_core_tests pthread)
+    target_link_libraries(test_trampoline_security PRIVATE thermal_simd_core_tests Threads::Threads)
     target_compile_definitions(test_trampoline_security PRIVATE TSD_ENABLE_TESTS)
     target_compile_options(test_trampoline_security PRIVATE -Wall -Wextra -pthread)
     target_include_directories(test_trampoline_security PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME trampoline_security COMMAND test_trampoline_security)
 
     add_executable(test_integration_metrics_tuner tests/integration/metrics_tuner.cpp)
-    target_link_libraries(test_integration_metrics_tuner PRIVATE tsd_policy_tuner pthread)
+    target_link_libraries(test_integration_metrics_tuner PRIVATE tsd_policy_tuner Threads::Threads)
     target_compile_options(test_integration_metrics_tuner PRIVATE -Wall -Wextra)
     add_test(NAME integration_metrics_tuner COMMAND test_integration_metrics_tuner)
 
     add_executable(test_observability_metrics tests/observability/test_metrics_exporter.cpp)
-    target_link_libraries(test_observability_metrics PRIVATE thermal_simd_core_tests pthread OpenSSL::SSL OpenSSL::Crypto)
+    target_link_libraries(test_observability_metrics PRIVATE thermal_simd_core_tests Threads::Threads OpenSSL::SSL OpenSSL::Crypto)
     target_compile_options(test_observability_metrics PRIVATE -Wall -Wextra -pthread)
     add_test(NAME observability_metrics COMMAND test_observability_metrics)
 
-    add_library(tsd_stress_common STATIC
-        tests/stress/stress_common.c
-        src/thermal_simd.c)
-    target_link_libraries(tsd_stress_common
-        PUBLIC
-            thermal_simd_core_tests
-            pthread)
+    add_library(tsd_stress_common STATIC tests/stress/stress_common.c src/thermal_simd.c)
+    target_link_libraries(tsd_stress_common PUBLIC thermal_simd_core_tests Threads::Threads)
     target_compile_definitions(tsd_stress_common PUBLIC TSD_ENABLE_TESTS)
     target_include_directories(tsd_stress_common
         PUBLIC
@@ -210,23 +209,32 @@ if(BUILD_TESTING)
     target_link_libraries(stress_patch_request PRIVATE tsd_stress_common)
     target_compile_definitions(stress_patch_request PRIVATE TSD_ENABLE_TESTS)
     target_compile_options(stress_patch_request PRIVATE -Wall -Wextra -pthread)
-    add_test(NAME stress_patch_request_smoke
-             COMMAND stress_patch_request --threads=2 --iterations=250)
+    add_test(NAME stress_patch_request_smoke COMMAND stress_patch_request --threads=2 --iterations=250)
 
     add_executable(stress_signal_storm tests/stress/signal_storm.c)
-    target_link_libraries(stress_signal_storm PRIVATE tsd_stress_common pthread)
+    target_link_libraries(stress_signal_storm PRIVATE tsd_stress_common Threads::Threads)
     target_compile_definitions(stress_signal_storm PRIVATE TSD_ENABLE_TESTS)
     target_compile_options(stress_signal_storm PRIVATE -Wall -Wextra -pthread)
-    add_test(NAME stress_signal_storm_smoke
-             COMMAND stress_signal_storm --duration-seconds=2 --signal-rate=50)
+    add_test(NAME stress_signal_storm_smoke COMMAND stress_signal_storm --duration-seconds=2 --signal-rate=50)
 
     add_executable(stress_telemetry_faults tests/stress/telemetry_faults.c)
-    target_link_libraries(stress_telemetry_faults PRIVATE tsd_stress_common pthread)
+    target_link_libraries(stress_telemetry_faults PRIVATE tsd_stress_common Threads::Threads)
     target_compile_definitions(stress_telemetry_faults PRIVATE TSD_ENABLE_TESTS)
     target_compile_options(stress_telemetry_faults PRIVATE -Wall -Wextra -pthread)
-    add_test(NAME stress_telemetry_faults_smoke
-             COMMAND stress_telemetry_faults --cycles=2)
+    add_test(NAME stress_telemetry_faults_smoke COMMAND stress_telemetry_faults --cycles=2)
 endif()
+
+set(TSD_CMAKE_INSTALL_DIR "${CMAKE_INSTALL_LIBDIR}/cmake/thermal_simd_dispatcher")
+configure_package_config_file(
+    ${CMAKE_CURRENT_SOURCE_DIR}/cmake/thermal_simd_dispatcherConfig.cmake.in
+    ${CMAKE_CURRENT_BINARY_DIR}/thermal_simd_dispatcherConfig.cmake
+    INSTALL_DESTINATION ${TSD_CMAKE_INSTALL_DIR}
+)
+write_basic_package_version_file(
+    ${CMAKE_CURRENT_BINARY_DIR}/thermal_simd_dispatcherConfigVersion.cmake
+    VERSION ${PROJECT_VERSION}
+    COMPATIBILITY SameMajorVersion
+)
 
 install(TARGETS thermal_simd_core thermal_simd
         EXPORT thermal_simd_dispatcherTargets
@@ -247,4 +255,8 @@ install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/config/controller_coeffs.json
 
 install(EXPORT thermal_simd_dispatcherTargets
         NAMESPACE thermal::
-        DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/thermal_simd_dispatcher)
+        DESTINATION ${TSD_CMAKE_INSTALL_DIR})
+install(FILES
+        ${CMAKE_CURRENT_BINARY_DIR}/thermal_simd_dispatcherConfig.cmake
+        ${CMAKE_CURRENT_BINARY_DIR}/thermal_simd_dispatcherConfigVersion.cmake
+        DESTINATION ${TSD_CMAKE_INSTALL_DIR})
