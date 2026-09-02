@@ -332,4 +332,14 @@ Default deployment examples intentionally do **not** mount `/dev/cpu` or grant `
 
 ## License
 
-This project is distributed under a proprietary commercial license. See [LICENSE](LICENSE) for full terms.
+Copyright (c) 2025-2026 Stamatis-Christos Saridakis. All rights reserved.
+
+Except for the identified third-party component, this project is
+**source-available, not open source**. The published code may be evaluated for
+up to 32 consecutive calendar days under the
+[PolyForm Free Trial License 1.0.0](LICENSE). Any production use,
+non-evaluation commercial use, use after the evaluation period, redistribution,
+sublicensing, and broader rights require a separate written commercial
+agreement with the copyright holder. See [NOTICE](NOTICE) for the ownership
+notice, [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for third-party terms,
+and [CONTRIBUTING.md](CONTRIBUTING.md) before proposing changes.

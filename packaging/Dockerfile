@@ -13,9 +13,10 @@ LABEL org.opencontainers.image.source="https://github.com/SaridakisStamatisChris
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libgcc-s1 libstdc++6 libssl3 ca-certificates && \
     rm -rf /var/lib/apt/lists/* \
-    && mkdir -p /etc/thermal-simd
+    && mkdir -p /etc/thermal-simd /usr/share/doc/thermal-simd-dispatcher
 COPY --from=build /src/build/thermal_simd /usr/local/bin/thermal_simd
 COPY config/controller_coeffs.json /etc/thermal-simd/controller_coeffs.json
+COPY LICENSE NOTICE THIRD_PARTY_NOTICES.md /usr/share/doc/thermal-simd-dispatcher/
 ENV TSD_LOG_LEVEL=info \
     TSD_PREDICTIVE_COEFF_PATH=/etc/thermal-simd/controller_coeffs.json
 

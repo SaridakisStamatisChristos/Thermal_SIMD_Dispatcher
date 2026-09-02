@@ -315,6 +315,12 @@ install(FILES ${CMAKE_CURRENT_BINARY_DIR}/include/thermal/simd/version.h
 install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/config/controller_coeffs.json
         DESTINATION ${CMAKE_INSTALL_SYSCONFDIR}/thermal-simd)
 
+install(FILES
+        ${CMAKE_CURRENT_SOURCE_DIR}/LICENSE
+        ${CMAKE_CURRENT_SOURCE_DIR}/NOTICE
+        ${CMAKE_CURRENT_SOURCE_DIR}/THIRD_PARTY_NOTICES.md
+        DESTINATION ${CMAKE_INSTALL_DOCDIR})
+
 install(EXPORT thermal_simd_dispatcherTargets
         NAMESPACE thermal::
         DESTINATION ${TSD_CMAKE_INSTALL_DIR})
