@@ -6,6 +6,7 @@
 #include <string.h>
 #include <unistd.h>
 
+#include <thermal/simd/telemetry_fusion.h>
 #include <thermal/simd/thermal_config.h>
 
 #include "thermal_simd_test.h"
@@ -64,6 +65,26 @@ static int run_monitor_thread_scenario(void) {
     tsd_runtime_config_exit_degraded_mode(&g_tsd_config, "tests");
     g_tsd_config.degraded_policy_active = 0;
     tsd_test_measure_baseline(ctx);
+
+    /*
+     * The production runtime now treats package temperature as explicit
+     * authorization for wider SIMD. Keep this monitor scenario deterministic
+     * on CI hosts that expose no thermal zone by providing a valid cool sample
+     * to both the policy script and the fusion safety gate.
+     */
+    const tsd_telemetry_sample_t cool_telemetry = {
+        .temp_available = 1,
+        .freq_ratio_available = 1,
+        .package_temp_millic = 70000,
+        .freq_ratio_milli = 1000,
+    };
+    tsd_test_set_fake_telemetry(&cool_telemetry, 1);
+    if (tsd_telemetry_fusion_publish_sample(&cool_telemetry) != 0) {
+        fprintf(stderr, "failed to publish cool telemetry authorization\n");
+        rc = 1;
+        goto out;
+    }
+
     tsd_test_set_fake_perf_script((const uint32_t[]){2100, 900, 900, 900, 900, 900}, 6, 0);
     if (tsd_test_patch(SIMD_AVX2) != 0) {
         fprintf(stderr, "failed to patch AVX2 baseline\n");
@@ -120,6 +141,7 @@ out:
     }
     tsd_test_clear_detect_override();
     tsd_test_clear_fake_perf_script();
+    tsd_test_set_fake_telemetry(NULL, 0);
     tsd_test_clear_patch_overrides();
     unsetenv("TSD_FAKE_PERF");
     unsetenv("TSD_ALLOW_SOFTWARE_UPGRADES");
