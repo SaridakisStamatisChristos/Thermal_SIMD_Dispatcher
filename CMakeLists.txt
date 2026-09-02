@@ -126,7 +126,14 @@ if(BUILD_TESTING)
     target_compile_options(test_runtime_config_cli PRIVATE -Wall -Wextra)
     add_test(NAME runtime_config_cli COMMAND test_runtime_config_cli)
 
-    add_executable(test_thermal_simd tests/test_thermal_simd.c src/thermal_simd.c)
+    # test_thermal_simd deliberately uses synthetic perf descriptors 100/101 to
+    # isolate EINTR/partial-read handling. Production requires RESET/ENABLE
+    # ioctls to succeed, so link an executable-local interposer for only those
+    # synthetic descriptors; all real descriptors still reach the kernel.
+    add_executable(test_thermal_simd
+        tests/test_thermal_simd.c
+        tests/perf/ioctl_test_stub.c
+        src/thermal_simd.c)
     target_compile_definitions(test_thermal_simd PRIVATE TSD_ENABLE_TESTS)
     target_link_libraries(test_thermal_simd PRIVATE thermal_simd_core_tests Threads::Threads)
     target_compile_options(test_thermal_simd PRIVATE -Wall -Wextra -O1 -pthread -fPIC)
