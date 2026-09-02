@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.15)
-project(thermal_simd_dispatcher VERSION 0.2.0 LANGUAGES C CXX)
+project(thermal_simd_dispatcher VERSION 0.3.0 LANGUAGES C CXX)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -46,6 +46,9 @@ configure_file(
     @ONLY
 )
 
+# Sources shared with the white-box test archive. The production core adds the
+# runtime/orchestration source below; tests compile that source separately with
+# TSD_ENABLE_TESTS so test-only hooks never leak into the installed library.
 set(THERMAL_SIMD_CORE_SOURCES
     src/config/runtime_flags.c
     src/dispatch/adaptive_dispatch.c
@@ -78,7 +81,7 @@ set(THERMAL_SIMD_CORE_SOURCES
     src/policy/mpc_controller.cpp
 )
 
-add_library(thermal_simd_core STATIC ${THERMAL_SIMD_CORE_SOURCES})
+add_library(thermal_simd_core STATIC ${THERMAL_SIMD_CORE_SOURCES} src/thermal_simd.c)
 set_target_properties(thermal_simd_core PROPERTIES EXPORT_NAME simd)
 target_include_directories(thermal_simd_core
     PUBLIC
@@ -93,6 +96,9 @@ target_compile_definitions(thermal_simd_core
         TSD_DEFAULT_COEFF_PATH="${CMAKE_CURRENT_SOURCE_DIR}/config/controller_coeffs.json"
         TSD_INSTALLED_COEFF_PATH="${CMAKE_INSTALL_FULL_SYSCONFDIR}/thermal-simd/controller_coeffs.json"
 )
+# SSE4.1 is the documented minimum ISA. Keep ordinary compiler-generated core
+# code out of AVX so the dispatch layer alone controls wider-vector execution.
+target_compile_options(thermal_simd_core PRIVATE -fPIC -mno-avx ${THERMAL_SIMD_DISPATCHER_CPU_FLAGS})
 target_link_libraries(thermal_simd_core
     PUBLIC
         Threads::Threads
@@ -102,7 +108,7 @@ target_link_libraries(thermal_simd_core
         ${TSD_CXX_RUNTIME_LIBRARIES}
 )
 
-add_executable(thermal_simd src/main.cpp src/thermal_simd.c)
+add_executable(thermal_simd src/main.cpp)
 target_compile_options(thermal_simd PRIVATE -O2 -pthread -fPIC -mno-avx ${THERMAL_SIMD_DISPATCHER_CPU_FLAGS})
 target_link_libraries(thermal_simd PRIVATE thermal_simd_core Threads::Threads)
 
@@ -159,6 +165,12 @@ if(BUILD_TESTING)
     target_link_libraries(test_runtime_config_cli PRIVATE thermal_simd_core_tests m)
     target_compile_options(test_runtime_config_cli PRIVATE -Wall -Wextra)
     add_test(NAME runtime_config_cli COMMAND test_runtime_config_cli)
+
+    add_executable(test_runtime_lifecycle tests/runtime/test_runtime_lifecycle.c)
+    target_link_libraries(test_runtime_lifecycle PRIVATE thermal_simd_core Threads::Threads)
+    target_compile_options(test_runtime_lifecycle PRIVATE -Wall -Wextra -pthread)
+    target_include_directories(test_runtime_lifecycle PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME runtime_lifecycle COMMAND test_runtime_lifecycle)
 
     add_executable(test_thermal_simd tests/test_thermal_simd.c src/thermal_simd.c)
     target_compile_definitions(test_thermal_simd PRIVATE TSD_ENABLE_TESTS)
