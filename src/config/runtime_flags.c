@@ -4,6 +4,8 @@
 #include <stdio.h>
 #include <string.h>
 
+#include <thermal/simd/telemetry_fusion.h>
+
 static atomic_int g_sandbox_complete = 0;
 static atomic_int g_sandbox_success = 0;
 static atomic_int g_sandbox_only = 0;
@@ -35,7 +37,16 @@ void tsd_runtime_flags_record_sandbox_failure(const char *message) {
 int tsd_runtime_flags_allow_transitions(void) {
     int complete = atomic_load_explicit(&g_sandbox_complete, memory_order_acquire);
     int success = atomic_load_explicit(&g_sandbox_success, memory_order_acquire);
-    return complete && success;
+    if (!complete || !success) {
+        return 0;
+    }
+    /*
+     * The sandbox establishes executable-memory safety. Once telemetry fusion
+     * is active, package-temperature availability is a second safety gate:
+     * callers may still select/fall back to SSE4.1, but cannot authorize a
+     * wider target while the thermal signal is absent.
+     */
+    return tsd_telemetry_temperature_upgrade_allowed();
 }
 
 int tsd_runtime_flags_sandbox_complete(void) {
