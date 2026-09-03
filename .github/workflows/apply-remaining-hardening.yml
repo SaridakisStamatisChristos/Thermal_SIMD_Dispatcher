@@ -6,6 +6,7 @@ on:
     paths:
       - 'ci/apply_remaining_hardening.py'
       - 'ci/apply_counter_abi.py'
+      - 'ci/fix_guarded_regressions.py'
       - '.github/workflows/apply-remaining-hardening.yml'
 
 permissions:
@@ -27,6 +28,7 @@ jobs:
         run: |
           python3 ci/apply_counter_abi.py
           python3 ci/apply_remaining_hardening.py
+          python3 ci/fix_guarded_regressions.py
       - name: Validate diff
         run: |
           git diff --check
@@ -55,7 +57,7 @@ jobs:
         run: make clean all
       - name: Commit validated hardening only
         run: |
-          rm -f ci/apply_remaining_hardening.py ci/apply_counter_abi.py .github/workflows/apply-remaining-hardening.yml
+          rm -f ci/apply_remaining_hardening.py ci/apply_counter_abi.py ci/fix_guarded_regressions.py .github/workflows/apply-remaining-hardening.yml
           git add -A
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
