@@ -1,0 +1,45 @@
+name: Apply Runtime Hardening
+
+on:
+  push:
+    branches:
+      - fix/runtime-safety-hardening
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: contains(github.event.head_commit.message, 'Install one-shot runtime hardening')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout branch
+        uses: actions/checkout@v4
+        with:
+          ref: fix/runtime-safety-hardening
+          fetch-depth: 0
+
+      - name: Apply guarded source transforms
+        run: python3 ci/apply_runtime_hardening.py
+
+      - name: Validate patch formatting
+        run: git diff --check
+
+      - name: Configure
+        run: cmake -S . -B build-hardening -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTING=ON
+
+      - name: Build
+        run: cmake --build build-hardening -j2
+
+      - name: Test
+        run: ctest --test-dir build-hardening --output-on-failure
+
+      - name: Commit validated hardening
+        run: |
+          rm -rf build-hardening
+          git rm ci/apply_runtime_hardening.py .github/workflows/apply-runtime-hardening.yml
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src/thermal_perf.c src/thermal_simd.c
+          git commit -m "Use monotonic timing and isolate software perf domain"
+          git push origin HEAD:fix/runtime-safety-hardening
