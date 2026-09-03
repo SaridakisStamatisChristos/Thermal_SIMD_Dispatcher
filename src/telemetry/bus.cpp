@@ -11,7 +11,21 @@ TelemetryBus::TelemetryBus() = default;
 void TelemetryBus::publish(TelemetrySignal signal, const TelemetryReading &reading) {
     std::lock_guard<std::mutex> lock(mutex_);
     auto &slot = readings_[signal];
-    if (!slot.valid || reading.quality >= slot.quality || reading.timestamp > slot.timestamp) {
+
+    /*
+     * Arbitration is freshness-first among valid samples and quality is the
+     * deterministic tie-breaker. An invalid sample never evicts a valid one.
+     * This avoids the previous OR rule where an older equal-quality reading
+     * could replace a newer sample, while still allowing a fresh lower-quality
+     * fallback source to keep the signal alive when a preferred source stalls.
+     */
+    if (reading.valid) {
+        if (!slot.valid || reading.timestamp > slot.timestamp ||
+            (reading.timestamp == slot.timestamp && reading.quality > slot.quality)) {
+            slot = reading;
+        }
+    } else if (!slot.valid &&
+               (slot.timestamp.time_since_epoch().count() == 0 || reading.timestamp > slot.timestamp)) {
         slot = reading;
     }
 }
