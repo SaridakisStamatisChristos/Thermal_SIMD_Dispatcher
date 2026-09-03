@@ -7,12 +7,8 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-#if defined(__cplusplus)
-#include <atomic>
-#define TSD_ATOMIC_TYPE(T) std::atomic<T>
-#else
+#ifndef __cplusplus
 #include <stdatomic.h>
-#define TSD_ATOMIC_TYPE(T) _Atomic(T)
 #endif
 
 #include <thermal/simd/simd_width.h>
@@ -63,14 +59,41 @@ extern "C" {
 
 extern tsd_trampoline_ctx_t g_tsd_trampoline_ctx;
 extern pthread_mutex_t g_tsd_patch_lock;
-extern TSD_ATOMIC_TYPE(simd_width_t) g_tsd_current_width;
-extern TSD_ATOMIC_TYPE(unsigned char) g_tsd_current_width_byte;
-extern TSD_ATOMIC_TYPE(int) g_tsd_trampoline_initialized;
-extern TSD_ATOMIC_TYPE(tsd_patch_slot_t*) g_tsd_active_trampoline;
-extern TSD_ATOMIC_TYPE(unsigned char) g_tsd_last_patch_attempt;
-extern TSD_ATOMIC_TYPE(unsigned char) g_tsd_last_patched_width;
-extern TSD_ATOMIC_TYPE(bool) g_tsd_page_a_effective_writable;
-extern TSD_ATOMIC_TYPE(bool) g_tsd_page_b_effective_writable;
+
+/*
+ * The raw atomic objects are owned and defined by a C translation unit so their
+ * representation is governed exclusively by C11. C++ code must use the C ABI
+ * accessors below and never redeclare these objects as std::atomic<T>.
+ *
+ * g_tsd_current_width_byte and g_tsd_active_trampoline intentionally retain
+ * stable C symbols because the naked assembly shim addresses them directly.
+ */
+#ifndef __cplusplus
+extern _Atomic(simd_width_t) g_tsd_current_width;
+extern _Atomic(unsigned char) g_tsd_current_width_byte;
+extern _Atomic(int) g_tsd_trampoline_initialized;
+extern _Atomic(tsd_patch_slot_t*) g_tsd_active_trampoline;
+extern _Atomic(unsigned char) g_tsd_last_patch_attempt;
+extern _Atomic(unsigned char) g_tsd_last_patched_width;
+extern _Atomic(bool) g_tsd_page_a_effective_writable;
+extern _Atomic(bool) g_tsd_page_b_effective_writable;
+#endif
+
+simd_width_t tsd_trampoline_state_current_width(void);
+unsigned char tsd_trampoline_state_current_width_byte(void);
+int tsd_trampoline_state_initialized(void);
+tsd_patch_slot_t *tsd_trampoline_state_active(void);
+unsigned char tsd_trampoline_state_last_patch_attempt(void);
+unsigned char tsd_trampoline_state_last_patched_width(void);
+int tsd_trampoline_state_page_a_writable(void);
+int tsd_trampoline_state_page_b_writable(void);
+
+void tsd_trampoline_state_reset(tsd_patch_slot_t *active);
+void tsd_trampoline_state_set_initialized(int initialized);
+void tsd_trampoline_state_set_last_patch_attempt(simd_width_t width);
+void tsd_trampoline_state_publish_selection(simd_width_t width, tsd_patch_slot_t *active);
+void tsd_trampoline_state_set_page_a_writable(int writable);
+void tsd_trampoline_state_set_page_b_writable(int writable);
 
 int tsd_trampoline_init(void);
 
@@ -100,7 +123,5 @@ int tsd_trampoline_test_last_window_used_pku(void);
 #ifdef __cplusplus
 }
 #endif
-
-#undef TSD_ATOMIC_TYPE
 
 #endif /* TSD_THERMAL_TRAMPOLINE_H */
