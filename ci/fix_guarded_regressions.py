@@ -33,9 +33,8 @@ insert_marker = """    if (out) {
 pos = s.find(insert_marker)
 if pos < 0:
     raise SystemExit("perf evaluate insertion point not found")
-# normalize indentation from the former software-only nesting
+# Normalize indentation from the former software-only nesting.
 block = block.replace("\n        ", "\n    ")
-block = block.replace("#ifdef TSD_ENABLE_TESTS\n    if", "#ifdef TSD_ENABLE_TESTS\n    if")
 s = s[:pos + len(insert_marker)] + block + s[pos + len(insert_marker):]
 p.write_text(s)
 
