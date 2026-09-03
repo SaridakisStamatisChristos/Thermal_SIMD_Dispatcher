@@ -1,9 +1,7 @@
 #ifndef TSD_THERMAL_PERF_H
 #define TSD_THERMAL_PERF_H
 
-#ifdef __cplusplus
-#include <atomic>
-#else
+#ifndef __cplusplus
 #include <stdatomic.h>
 #endif
 #include <stddef.h>
@@ -27,11 +25,17 @@ typedef enum {
 
 typedef void (*tsd_workload_fn)(void);
 
-#ifdef __cplusplus
-extern std::atomic<uint64_t> g_tsd_workload_iterations;
-#else
+/*
+ * The raw counter is C11-owned. Keep the raw declaration C-only so C++ never
+ * aliases a C _Atomic object as std::atomic. Cross-language callers use the C
+ * ABI functions below.
+ */
+#ifndef __cplusplus
 extern _Atomic(uint64_t) g_tsd_workload_iterations;
 #endif
+uint64_t tsd_workload_iterations_load(void);
+void tsd_workload_iterations_add(uint64_t count);
+void tsd_workload_iterations_reset(void);
 
 perf_ctx_t* tsd_perf_init(tsd_workload_fn workload_cb);
 void tsd_perf_enable(perf_ctx_t *ctx);
