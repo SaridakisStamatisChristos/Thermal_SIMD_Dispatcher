@@ -7,7 +7,16 @@
 static simd_width_t (*g_detect_override)(void) = NULL;
 #endif
 
+/*
+ * Kept as a byte because the naked assembly shim addresses this symbol
+ * directly. C-side accesses use GCC/Clang atomic builtins so concurrent host
+ * capability probes cannot introduce a language-level write/write race.
+ */
 uint8_t g_tsd_avx_available = 0;
+
+int tsd_cpu_avx_available(void) {
+    return __atomic_load_n(&g_tsd_avx_available, __ATOMIC_ACQUIRE) != 0;
+}
 
 int tsd_cpu_has_sse41(void) {
     unsigned int eax, ebx, ecx, edx;
@@ -47,7 +56,7 @@ static simd_width_t detect_impl(const tsd_runtime_config *cfg) {
         return SIMD_SSE41;
     }
     if (cpu_has_avx_bit()) {
-        g_tsd_avx_available = 1;
+        __atomic_store_n(&g_tsd_avx_available, 1, __ATOMIC_RELEASE);
     }
     unsigned int eax, ebx, ecx, edx;
     if (cfg && cfg->allow_avx512 && __get_cpuid_count(7, 0, &eax, &ebx, &ecx, &edx)) {
