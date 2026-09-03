@@ -1,0 +1,63 @@
+name: Final Audit Cleanup
+
+on:
+  push:
+    branches: [deep-runtime-hardening-v0.4]
+    paths:
+      - 'ci/final_audit_cleanup.py'
+      - '.github/workflows/final-audit-cleanup.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  validate-final-cleanup:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: deep-runtime-hardening-v0.4
+          fetch-depth: 0
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake ninja-build clang
+      - name: Apply final cleanup
+        run: python3 ci/final_audit_cleanup.py
+      - name: Static contract checks
+        run: |
+          git diff --check
+          if git grep -n 'TSD_ALLOW_SOFTWARE_UPGRADES' -- src include docs tests \
+             | grep -v 'tests/perf/test_perf_resilience.c'; then
+            echo 'stale software-upgrade override contract remains' >&2
+            exit 1
+          fi
+          if git grep -n 'extern std::atomic' -- include; then
+            echo 'foreign atomic ABI declaration remains' >&2
+            exit 1
+          fi
+          if git grep -n 'time(NULL)' -- src/thermal_perf.c src/telemetry_helper.c; then
+            echo 'wall-clock safety retry remains' >&2
+            exit 1
+          fi
+      - name: GCC full build and tests
+        run: |
+          cmake -S . -B build-gcc -G Ninja -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTING=ON -DTSD_BUILD_BENCHMARKS=ON
+          cmake --build build-gcc
+          ctest --test-dir build-gcc --output-on-failure
+      - name: Clang full build and tests
+        env:
+          CC: clang
+          CXX: clang++
+        run: |
+          cmake -S . -B build-clang -G Ninja -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTING=ON
+          cmake --build build-clang
+          ctest --test-dir build-clang --output-on-failure
+      - name: Commit only validated cleanup
+        run: |
+          rm -f ci/final_audit_cleanup.py .github/workflows/final-audit-cleanup.yml
+          git add -A
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'Close remaining deep-audit findings'
+          git push origin HEAD:deep-runtime-hardening-v0.4
