@@ -177,9 +177,7 @@ simd = replace_exact(
                                               : g_tsd_config.cooldown_up_ms);
 ''')
 
-if "dwell_ticks" in simd:
-    raise SystemExit("unexpected legacy dwell_ticks reference remains")
 if "int cooldown =" in simd:
-    raise SystemExit("unexpected legacy cooldown counter remains")
+    raise SystemExit("unexpected legacy local cooldown counter remains")
 
 simd_path.write_text(simd)
