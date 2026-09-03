@@ -60,16 +60,19 @@ static inline void workload_once(void) {
     atomic_fetch_add_explicit(&g_tsd_workload_iterations, 1, memory_order_relaxed);
 }
 
-static uint64_t compute_dwell_ms_from_ticks(int dwell_ticks) {
-    if (dwell_ticks <= 0) {
+static uint64_t monotonic_now_ms(void) {
+    struct timespec now = {0};
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
         return 0;
     }
-    uint64_t interval_us = (uint64_t)g_tsd_config.check_interval_us;
-    return (interval_us * (uint64_t)dwell_ticks) / 1000ULL;
+    return (uint64_t)now.tv_sec * UINT64_C(1000) + (uint64_t)now.tv_nsec / UINT64_C(1000000);
 }
 
-static void record_dwell_metric(simd_width_t width, int dwell_ticks) {
-    uint64_t dwell_ms = compute_dwell_ms_from_ticks(dwell_ticks);
+static uint64_t nonnegative_ms(int value) {
+    return value > 0 ? (uint64_t)value : 0;
+}
+
+static void record_dwell_metric(simd_width_t width, uint64_t dwell_ms) {
     if (dwell_ms > 0) {
         tsd_metrics_exporter_observe_dwell(width, dwell_ms);
     }
@@ -269,8 +272,8 @@ void* thermal_monitor_thread(void *arg) {
     simd_width_t max_width_cached = tsd_detect_max_simd(&g_tsd_config);
     int throttle_count = 0;
     int stable_count = 0;
-    int cooldown = 0;
-    int dwell_ticks = 0;
+    uint64_t width_since_ms = monotonic_now_ms();
+    uint64_t cooldown_until_ms = 0;
     tsd_dispatcher_policy_state *policy_state = tsd_dispatcher_policy_create(&g_tsd_config.policy);
     cpu_set_t cpuset;
     CPU_ZERO(&cpuset);
@@ -286,7 +289,8 @@ void* thermal_monitor_thread(void *arg) {
             if (g_tsd_stop_requested) break;
         }
         if (g_tsd_stop_requested || !atomic_load_explicit(&g_tsd_running, memory_order_acquire)) break;
-        dwell_ticks++;
+        uint64_t now_ms = monotonic_now_ms();
+        uint64_t dwell_ms = now_ms >= width_since_ms ? now_ms - width_since_ms : 0;
 
         /* Fail-closed selections can originate inside telemetry evaluation. */
         width = atomic_load_explicit(&g_tsd_current_width, memory_order_acquire);
@@ -303,16 +307,15 @@ void* thermal_monitor_thread(void *arg) {
             }
         }
 
-        if (cooldown > 0) {
-            cooldown--;
+        if (now_ms < cooldown_until_ms) {
             continue;
         }
-        if (dwell_ticks < g_tsd_config.min_dwell_ticks) {
+        if (dwell_ms < nonnegative_ms(g_tsd_config.min_dwell_ms)) {
             continue;
         }
         if (tsd_perf_check_software_timeout(ctx, g_tsd_config.degraded_timeout_sec)) {
             simd_width_t current_width = atomic_load_explicit(&g_tsd_current_width, memory_order_acquire);
-            record_dwell_metric(current_width, dwell_ticks);
+            record_dwell_metric(current_width, dwell_ms);
             if (current_width != SIMD_SSE41) {
                 if (tsd_trampoline_patch(SIMD_SSE41) == 0) {
                     width = SIMD_SSE41;
@@ -325,8 +328,8 @@ void* thermal_monitor_thread(void *arg) {
             } else {
                 width = current_width;
             }
-            cooldown = g_tsd_config.cooldown_down_ticks;
-            dwell_ticks = 0;
+            cooldown_until_ms = now_ms + nonnegative_ms(g_tsd_config.cooldown_down_ms);
+            width_since_ms = now_ms;
             continue;
         }
         tsd_thermal_eval_t eval = {0};
@@ -343,7 +346,7 @@ void* thermal_monitor_thread(void *arg) {
             tsd_dispatcher_policy_record(policy_state, &eval, width);
         }
 
-        if (cooldown <= 0 && dwell_ticks >= g_tsd_config.min_dwell_ticks && policy_state) {
+        if (policy_state) {
             simd_width_t target = width;
             int used_predictive = tsd_dispatcher_policy_recommend(policy_state, width, max_width_cached,
                                                                   &target, &predictive_fallback);
@@ -360,15 +363,16 @@ void* thermal_monitor_thread(void *arg) {
                     target = SIMD_SSE41;
                 }
                 if (target != previous) {
-                    record_dwell_metric(previous, dwell_ticks);
+                    record_dwell_metric(previous, dwell_ms);
                     int patch_rc = tsd_trampoline_patch(target);
                     if (patch_rc == 0) {
                         width = target;
                         throttle_count = 0;
                         stable_count = 0;
-                        dwell_ticks = 0;
-                        cooldown = (target < previous) ? g_tsd_config.cooldown_down_ticks
-                                                       : g_tsd_config.cooldown_up_ticks;
+                        width_since_ms = now_ms;
+                        cooldown_until_ms = now_ms + nonnegative_ms(
+                            target < previous ? g_tsd_config.cooldown_down_ms
+                                              : g_tsd_config.cooldown_up_ms);
                         continue;
                     }
                     tsd_dispatcher_policy_force_fallback(policy_state);
@@ -412,7 +416,7 @@ void* thermal_monitor_thread(void *arg) {
                 }
                 tsd_log_warn(LOG_COMPONENT, "%s", message);
                 simd_width_t target = width - 1;
-                record_dwell_metric(width, dwell_ticks);
+                record_dwell_metric(width, dwell_ms);
                 if (!tsd_runtime_flags_allow_transitions() && target > SIMD_SSE41) {
                     target = SIMD_SSE41;
                 }
@@ -437,8 +441,8 @@ void* thermal_monitor_thread(void *arg) {
                     }
                 }
                 throttle_count = 0;
-                cooldown = g_tsd_config.cooldown_down_ticks;
-                dwell_ticks = 0;
+                cooldown_until_ms = now_ms + nonnegative_ms(g_tsd_config.cooldown_down_ms);
+                width_since_ms = now_ms;
             }
         } else {
             stable_count++;
@@ -455,7 +459,7 @@ void* thermal_monitor_thread(void *arg) {
                              eval.trimmed_ratio_milli / 1000, eval.trimmed_ratio_milli % 1000,
                              eval.llc_mpki_milli / 1000, eval.llc_mpki_milli % 1000);
                 simd_width_t target = width + 1;
-                record_dwell_metric(width, dwell_ticks);
+                record_dwell_metric(width, dwell_ms);
                 int patch_rc = tsd_trampoline_patch(target);
                 if (patch_rc == 0) {
                     width = target;
@@ -477,8 +481,8 @@ void* thermal_monitor_thread(void *arg) {
                     }
                 }
                 stable_count = 0;
-                cooldown = g_tsd_config.cooldown_up_ticks;
-                dwell_ticks = 0;
+                cooldown_until_ms = now_ms + nonnegative_ms(g_tsd_config.cooldown_up_ms);
+                width_since_ms = now_ms;
             }
         }
     }

@@ -102,6 +102,20 @@ static int allow_software_upgrades(void) {
     return (env && env[0] != '\0' && strcmp(env, "0") != 0) ? 1 : 0;
 }
 
+static void reset_measurement_domain(perf_ctx_t *ctx) {
+    if (!ctx) {
+        return;
+    }
+    ctx->slow_cpi = 0;
+    ctx->fast_cpi = 0;
+    ctx->slow_llc_mpki = 0;
+    ctx->fast_llc_mpki = 0;
+    memset(ctx->ratio_history, 0, sizeof(ctx->ratio_history));
+    ctx->ratio_history_count = 0;
+    ctx->ratio_history_cursor = 0;
+    ctx->ratio_trimmed_milli = 0;
+}
+
 static void publish_perf_state(const perf_ctx_t *ctx, int healthy) {
     if (!ctx) {
         return;
@@ -196,6 +210,9 @@ static void perf_set_mode(perf_ctx_t *ctx, tsd_perf_mode_t mode, const char *rea
         return;
     }
 
+    /* Hardware CPI and software ns/work-item are different physical
+     * quantities. Never carry EWMAs/history from one domain into the other. */
+    reset_measurement_domain(ctx);
     ctx->mode = mode;
     clock_gettime(CLOCK_MONOTONIC, &ctx->mode_entered_at);
     ctx->timeout_notified = 0;
@@ -1100,13 +1117,17 @@ int tsd_perf_evaluate(perf_ctx_t *ctx, tsd_thermal_eval_t *out, const tsd_runtim
         if (delta_iters == 0 || delta_ns == 0) {
             return 0;
         }
-        uint64_t current_cpi = (delta_ns * 1000ULL) / delta_iters;
-        if (current_cpi == 0) {
-            current_cpi = ctx->baseline_cpi ? ctx->baseline_cpi : 1000;
+        /* Software mode estimates elapsed nanoseconds per completed work
+         * item, scaled by 1000. It is a control cost, not hardware CPI. The
+         * domain reset on mode entry ensures ratios are only compared against
+         * software-mode history. */
+        uint64_t software_cost_milli = (delta_ns * 1000ULL) / delta_iters;
+        if (software_cost_milli == 0) {
+            software_cost_milli = 1;
         }
         tsd_telemetry_sample_t telemetry = {0};
         fetch_fused_telemetry(ctx, &telemetry);
-        return process_measurement(ctx, out, current_cpi, 0, cfg, &telemetry);
+        return process_measurement(ctx, out, software_cost_milli, 0, cfg, &telemetry);
     }
 
     if (ctx->mode != TSD_PERF_MODE_HARDWARE || !ctx->hardware_validated) {
