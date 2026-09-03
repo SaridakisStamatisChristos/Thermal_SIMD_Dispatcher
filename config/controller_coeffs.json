@@ -5,5 +5,7 @@
   "severity": [0.05],
   "trimmed_ratio": [0.0],
   "ma": 0.25,
-  "staleness_window_ms": 750
+  "staleness_window_ms": 750,
+  "width_temperature_millic_per_step": 2000.0,
+  "width_performance_benefit_milli_per_step": 100.0
 }
