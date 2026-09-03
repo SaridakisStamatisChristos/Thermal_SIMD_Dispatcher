@@ -5,10 +5,13 @@
 #include <stdint.h>
 #include <stdlib.h>
 
+#include <thermal/simd/runtime.h>
 #include <thermal/simd/thermal_config.h>
 #include <thermal/simd/thermal_cpu.h>
 #include <thermal/simd/thermal_perf.h>
 #include <thermal/simd/thermal_trampoline.h>
+
+#include "../runtime_guard_internal.h"
 
 struct tsd_kernel_dispatch {
     tsd_kernel_variants_t variants;
@@ -27,18 +30,18 @@ static simd_width_t detect_host_max(void) {
 }
 
 /*
- * Production width publication spans several legacy compatibility globals.
- * The patcher owns g_tsd_patch_lock across the complete transition, so readers
- * that need a coherent control-plane snapshot take the same lock rather than
- * observing an intermediate width/pointer publication state.
+ * Callers hold the execution side of the process safety gate while resolving.
+ * Selection publication and every guard-state mutation require the write side,
+ * so the width and its authorization are stable for the complete invocation.
  */
 static simd_width_t selected_width_snapshot(void) {
-    int lock_rc = pthread_mutex_lock(&g_tsd_patch_lock);
-    if (lock_rc != 0) {
+    simd_width_t selected = atomic_load_explicit(&g_tsd_current_width, memory_order_acquire);
+    if (selected < SIMD_SSE41 || selected > SIMD_AVX512) {
         return SIMD_SSE41;
     }
-    simd_width_t selected = atomic_load_explicit(&g_tsd_current_width, memory_order_acquire);
-    pthread_mutex_unlock(&g_tsd_patch_lock);
+    if (selected > SIMD_SSE41 && !tsd_runtime_width_authorized(selected)) {
+        return SIMD_SSE41;
+    }
     return selected;
 }
 
@@ -51,9 +54,6 @@ static int resolve_internal(const tsd_kernel_dispatch_t *dispatch,
     }
 
     simd_width_t selected = selected_width_snapshot();
-    if (selected < SIMD_SSE41 || selected > SIMD_AVX512) {
-        selected = SIMD_SSE41;
-    }
     if (selected > dispatch->host_max) {
         selected = dispatch->host_max;
     }
@@ -112,15 +112,29 @@ int tsd_kernel_dispatch_resolve(const tsd_kernel_dispatch_t *dispatch,
         errno = EINVAL;
         return -1;
     }
-    return resolve_internal(dispatch, resolved_width, NULL);
+    if (tsd_runtime_execution_enter() != 0) {
+        return -1;
+    }
+    int rc = resolve_internal(dispatch, resolved_width, NULL);
+    int saved_errno = errno;
+    tsd_runtime_execution_leave();
+    if (rc != 0) errno = saved_errno;
+    return rc;
 }
 
 int tsd_kernel_dispatch_execute(tsd_kernel_dispatch_t *dispatch,
                                 size_t work_items,
                                 simd_width_t *used_width) {
+    if (tsd_runtime_execution_enter() != 0) {
+        return -1;
+    }
+
     tsd_kernel_fn fn = NULL;
     simd_width_t actual = SIMD_SSE41;
     if (resolve_internal(dispatch, &actual, &fn) != 0 || !fn) {
+        int saved_errno = errno;
+        tsd_runtime_execution_leave();
+        errno = saved_errno;
         return -1;
     }
 
@@ -133,6 +147,7 @@ int tsd_kernel_dispatch_execute(tsd_kernel_dispatch_t *dispatch,
     if (used_width) {
         *used_width = actual;
     }
+    tsd_runtime_execution_leave();
     return 0;
 }
 
@@ -179,9 +194,6 @@ static int resolve_v2_internal(const tsd_kernel_dispatch_v2_t *dispatch,
     }
 
     simd_width_t selected = selected_width_snapshot();
-    if (selected < SIMD_SSE41 || selected > SIMD_AVX512) {
-        selected = SIMD_SSE41;
-    }
     if (selected > dispatch->host_max) {
         selected = dispatch->host_max;
     }
@@ -238,20 +250,35 @@ int tsd_kernel_dispatch_v2_resolve(const tsd_kernel_dispatch_v2_t *dispatch,
         errno = EINVAL;
         return -1;
     }
-    return resolve_v2_internal(dispatch, resolved_width, NULL);
+    if (tsd_runtime_execution_enter() != 0) {
+        return -1;
+    }
+    int rc = resolve_v2_internal(dispatch, resolved_width, NULL);
+    int saved_errno = errno;
+    tsd_runtime_execution_leave();
+    if (rc != 0) errno = saved_errno;
+    return rc;
 }
 
 int tsd_kernel_dispatch_v2_execute(tsd_kernel_dispatch_v2_t *dispatch,
                                    size_t offset,
                                    size_t work_items,
                                    simd_width_t *used_width) {
+    if (tsd_runtime_execution_enter() != 0) {
+        return -1;
+    }
+
     tsd_kernel_fn_v2 fn = NULL;
     simd_width_t actual = SIMD_SSE41;
     if (resolve_v2_internal(dispatch, &actual, &fn) != 0 || !fn) {
+        int saved_errno = errno;
+        tsd_runtime_execution_leave();
+        errno = saved_errno;
         return -1;
     }
     int rc = fn(dispatch->variants.context, offset, work_items);
     if (rc != 0) {
+        tsd_runtime_execution_leave();
         return rc;
     }
     if (work_items > 0) {
@@ -262,6 +289,7 @@ int tsd_kernel_dispatch_v2_execute(tsd_kernel_dispatch_v2_t *dispatch,
     if (used_width) {
         *used_width = actual;
     }
+    tsd_runtime_execution_leave();
     return 0;
 }
 
