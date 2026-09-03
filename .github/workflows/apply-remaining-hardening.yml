@@ -27,7 +27,10 @@ jobs:
       - name: Validate diff
         run: |
           git diff --check
-          ! git grep -n 'TSD_ALLOW_SOFTWARE_UPGRADES' -- ':!README.md' ':!docs' || false
+          if git grep -n 'TSD_ALLOW_SOFTWARE_UPGRADES' -- src include; then
+            echo 'legacy software-upgrade authority remains in production source/header' >&2
+            exit 1
+          fi
       - name: GCC build and full tests
         run: |
           cmake -S . -B build-gcc -G Ninja -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTING=ON -DTSD_BUILD_BENCHMARKS=ON
