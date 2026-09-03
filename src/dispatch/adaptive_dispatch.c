@@ -26,6 +26,22 @@ static simd_width_t detect_host_max(void) {
     return tsd_detect_max_simd(&probe);
 }
 
+/*
+ * Production width publication spans several legacy compatibility globals.
+ * The patcher owns g_tsd_patch_lock across the complete transition, so readers
+ * that need a coherent control-plane snapshot take the same lock rather than
+ * observing an intermediate width/pointer publication state.
+ */
+static simd_width_t selected_width_snapshot(void) {
+    int lock_rc = pthread_mutex_lock(&g_tsd_patch_lock);
+    if (lock_rc != 0) {
+        return SIMD_SSE41;
+    }
+    simd_width_t selected = atomic_load_explicit(&g_tsd_current_width, memory_order_acquire);
+    pthread_mutex_unlock(&g_tsd_patch_lock);
+    return selected;
+}
+
 static int resolve_internal(const tsd_kernel_dispatch_t *dispatch,
                             simd_width_t *resolved,
                             tsd_kernel_fn *fn) {
@@ -34,7 +50,7 @@ static int resolve_internal(const tsd_kernel_dispatch_t *dispatch,
         return -1;
     }
 
-    simd_width_t selected = atomic_load_explicit(&g_tsd_current_width, memory_order_acquire);
+    simd_width_t selected = selected_width_snapshot();
     if (selected < SIMD_SSE41 || selected > SIMD_AVX512) {
         selected = SIMD_SSE41;
     }
@@ -162,7 +178,7 @@ static int resolve_v2_internal(const tsd_kernel_dispatch_v2_t *dispatch,
         return -1;
     }
 
-    simd_width_t selected = atomic_load_explicit(&g_tsd_current_width, memory_order_acquire);
+    simd_width_t selected = selected_width_snapshot();
     if (selected < SIMD_SSE41 || selected > SIMD_AVX512) {
         selected = SIMD_SSE41;
     }
