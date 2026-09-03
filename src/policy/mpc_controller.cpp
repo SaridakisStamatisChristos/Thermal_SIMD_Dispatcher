@@ -19,7 +19,8 @@ namespace policy {
 namespace {
 constexpr double kMinImprovement = 1.0;
 constexpr double kDefaultRatioTrendWeight = 0.25;
-constexpr double kTemperatureWeight = 0.001;
+/* Thermal cost is one-sided: cooler than the SLO is not a defect. */
+constexpr double kTemperatureWeight = 0.25;
 constexpr double kStabilityMargin = 0.25;
 constexpr std::chrono::milliseconds kDefaultStalenessWindow{500};
 
@@ -76,9 +77,7 @@ void MPCController::reset(const tsd_policy_config &config) {
     last_prediction_valid_ = false;
     history_limit_ = std::max<std::size_t>(1, config_.forecast_horizon);
     coeff_path_ = resolveCoefficientPath();
-    if (!loadCoefficients(true)) {
-        tsd_log_warn("policy", "using fallback averaging forecast due to coefficient load failure");
-    }
+    if (!loadCoefficients(true)) tsd_log_warn("policy", "using fallback averaging forecast due to coefficient load failure");
 }
 
 void MPCController::pushSample(const tsd_thermal_eval_t &sample, simd_width_t width) {
@@ -108,9 +107,7 @@ void MPCController::pushSample(const tsd_thermal_eval_t &sample, simd_width_t wi
     entry.timestamp = std::chrono::steady_clock::now();
     history_.push_back(entry);
     size_t limit = historyLimit();
-    if (limit > 0) {
-        while (history_.size() > limit) history_.pop_front();
-    }
+    while (limit > 0 && history_.size() > limit) history_.pop_front();
 }
 
 double MPCController::computeForecastRatio(size_t horizon) const {
@@ -136,6 +133,11 @@ double MPCController::computeForecastTemperature(size_t horizon, size_t &valid_c
         bool ok = false;
         double prediction = arx_model_.predict(history_, &ok);
         if (ok) {
+            /* Never let a one-step thermal decision become less conservative
+             * than a fresh observed control temperature solely because a demo
+             * plant model under-predicts it. */
+            const TelemetrySample &latest = history_.back();
+            if (latest.temp_valid) prediction = std::max(prediction, latest.temperature_millic);
             valid_count = 1;
             used_model = true;
             return prediction;
@@ -163,13 +165,8 @@ double MPCController::scoreWidth(simd_width_t candidate,
                                  double forecast_temp) const {
     const int control_step = widthIndex(candidate) - widthIndex(current);
 
-    /* Candidate width is an explicit control input. A wider width projects a
-     * deterministic performance benefit and a non-negative thermal cost from
-     * the coefficient bundle; it can never be scored as cooling the package
-     * merely because current performance happens to be inside the SLO. */
     double ratio_projection = forecast_ratio + ratio_trend * runtimeTrendWeight();
-    ratio_projection -= static_cast<double>(control_step) *
-                        arx_model_.widthPerformanceBenefitMilliPerStep();
+    ratio_projection -= static_cast<double>(control_step) * arx_model_.widthPerformanceBenefitMilliPerStep();
     if (ratio_projection < 0.0) ratio_projection = 0.0;
     double ratio_cost = std::fabs(ratio_projection - static_cast<double>(config_.slo_ratio_milli));
 
@@ -177,7 +174,8 @@ double MPCController::scoreWidth(simd_width_t candidate,
     if (config_.slo_temp_millic != 0 && horizon > 0 && std::isfinite(forecast_temp)) {
         double temp_projection = forecast_temp +
             static_cast<double>(control_step) * arx_model_.widthTemperatureMillicPerStep();
-        temp_cost = std::fabs(temp_projection - static_cast<double>(config_.slo_temp_millic)) * kTemperatureWeight;
+        double excess = temp_projection - static_cast<double>(config_.slo_temp_millic);
+        if (excess > 0.0) temp_cost = excess * kTemperatureWeight;
     }
 
     double transition_penalty = 0.0;
@@ -224,11 +222,8 @@ bool MPCController::recommend(simd_width_t current_width,
     size_t temp_valid_count = 0;
     bool used_model = false;
     double forecast_temp = computeForecastTemperature(horizon, temp_valid_count, used_model);
-    if (used_model) {
-        tsd_metrics_increment(TSD_METRIC_PREDICTIVE_FORECASTS);
-    } else if (temp_valid_count == 0) {
-        forecast_temp = std::numeric_limits<double>::quiet_NaN();
-    }
+    if (used_model) tsd_metrics_increment(TSD_METRIC_PREDICTIVE_FORECASTS);
+    else if (temp_valid_count == 0) forecast_temp = std::numeric_limits<double>::quiet_NaN();
     last_prediction_millic_ = forecast_temp;
     last_prediction_valid_ = used_model;
 
@@ -236,8 +231,7 @@ bool MPCController::recommend(simd_width_t current_width,
     simd_width_t best_width = current_width;
     auto evaluate_width = [&](simd_width_t candidate) {
         if (widthIndex(candidate) > widthIndex(max_width)) return;
-        double cost = scoreWidth(candidate, current_width, horizon, forecast_ratio,
-                                 ratio_trend, forecast_temp);
+        double cost = scoreWidth(candidate, current_width, horizon, forecast_ratio, ratio_trend, forecast_temp);
         if (cost + kStabilityMargin < best_cost) {
             best_cost = cost;
             best_width = candidate;
@@ -254,8 +248,7 @@ bool MPCController::recommend(simd_width_t current_width,
         return false;
     }
 
-    double current_cost = scoreWidth(current_width, current_width, horizon, forecast_ratio,
-                                     ratio_trend, forecast_temp);
+    double current_cost = scoreWidth(current_width, current_width, horizon, forecast_ratio, ratio_trend, forecast_temp);
     if (current_cost - best_cost < kMinImprovement) {
         out_width = current_width;
         return false;
@@ -280,16 +273,13 @@ bool MPCController::loadCoefficients(bool log_success) {
     long long window_ms = static_cast<long long>(arx_model_.stalenessWindowMs());
     if (window_ms <= 0) window_ms = kDefaultStalenessWindow.count();
     staleness_window_ = std::chrono::milliseconds(window_ms);
-    history_limit_ = std::max<std::size_t>(std::max<std::size_t>(1, config_.forecast_horizon),
-                                           arx_model_.requiredHistory());
+    history_limit_ = std::max<std::size_t>(std::max<std::size_t>(1, config_.forecast_horizon), arx_model_.requiredHistory());
     arx_model_.resetResidual();
     tsd_metrics_increment(TSD_METRIC_PREDICTIVE_RELOADS);
     if (log_success) {
-        tsd_log_info("policy",
-                     "loaded coefficients from %s (staleness=%lld ms, history=%zu, width_temp=%.1f, width_perf=%.1f)",
+        tsd_log_info("policy", "loaded coefficients from %s (staleness=%lld ms, history=%zu, width_temp=%.1f, width_perf=%.1f)",
                      coeff_path_.c_str(), static_cast<long long>(staleness_window_.count()), history_limit_,
-                     arx_model_.widthTemperatureMillicPerStep(),
-                     arx_model_.widthPerformanceBenefitMilliPerStep());
+                     arx_model_.widthTemperatureMillicPerStep(), arx_model_.widthPerformanceBenefitMilliPerStep());
     }
     return true;
 }
