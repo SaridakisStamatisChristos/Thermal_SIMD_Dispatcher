@@ -26,9 +26,11 @@
 #define TSD_TEMP_MIN_MILLIC (-50000LL)
 #define TSD_TEMP_MAX_MILLIC 150000LL
 
+/* Retry scheduling is elapsed-time state and must not move with CLOCK_REALTIME. */
 static time_t tsd_now_seconds(void) {
-    time_t now = time(NULL);
-    return now < 0 ? 0 : now;
+    struct timespec now = {0};
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0 || now.tv_sec < 0) return 0;
+    return now.tv_sec;
 }
 
 static void schedule_retry(time_t *deadline, int *backoff) {
@@ -137,17 +139,40 @@ static int temperature_candidate_score(const char *driver, const char *label, in
     return score;
 }
 
-static void consider_temp_candidate(const char *path, int score,
-                                    char *best_path, size_t best_path_size, int *best_score) {
-    if (!path || !best_path || !best_score || score <= *best_score || access(path, R_OK) != 0) return;
+typedef struct {
+    char path[256];
+    int score;
+    int explicit_package_match;
+    int ambiguous;
+} temp_candidate_state_t;
+
+static void consider_temp_candidate(const char *path,
+                                    int score,
+                                    int explicit_package_match,
+                                    temp_candidate_state_t *best) {
+    if (!path || !best || access(path, R_OK) != 0) return;
     long long value = 0;
     if (read_long_from_path(path, &value) != 0 || value < TSD_TEMP_MIN_MILLIC || value > TSD_TEMP_MAX_MILLIC) {
         return;
     }
-    if (copy_path(best_path, best_path_size, path) == 0) *best_score = score;
+
+    if (score > best->score ||
+        (score == best->score && explicit_package_match > best->explicit_package_match)) {
+        if (copy_path(best->path, sizeof(best->path), path) == 0) {
+            best->score = score;
+            best->explicit_package_match = explicit_package_match;
+            best->ambiguous = 0;
+        }
+        return;
+    }
+
+    if (score == best->score && explicit_package_match == best->explicit_package_match &&
+        best->path[0] != '\0' && strcmp(path, best->path) != 0) {
+        best->ambiguous = 1;
+    }
 }
 
-static void scan_thermal_zones(int package_id, char *best_path, size_t best_path_size, int *best_score) {
+static void scan_thermal_zones(int package_id, temp_candidate_state_t *best) {
     DIR *dir = opendir("/sys/class/thermal");
     if (!dir) return;
     struct dirent *entry = NULL;
@@ -162,7 +187,9 @@ static void scan_thermal_zones(int package_id, char *best_path, size_t best_path
         if (read_text_from_path(type_path, type, sizeof(type)) != 0) continue;
         lowercase_ascii(type);
         int score = temperature_candidate_score(type, type, package_id);
-        if (score >= 50) consider_temp_candidate(temp_path, score, best_path, best_path_size, best_score);
+        if (score >= 50) {
+            consider_temp_candidate(temp_path, score, label_mentions_package(type, package_id), best);
+        }
     }
     closedir(dir);
 }
@@ -182,7 +209,7 @@ static int parse_hwmon_temp_input(const char *name, unsigned int *index) {
     return 1;
 }
 
-static void scan_hwmon(int package_id, char *best_path, size_t best_path_size, int *best_score) {
+static void scan_hwmon(int package_id, temp_candidate_state_t *best) {
     DIR *root = opendir("/sys/class/hwmon");
     if (!root) return;
     struct dirent *hw = NULL;
@@ -214,7 +241,7 @@ static void scan_hwmon(int package_id, char *best_path, size_t best_path_size, i
             char label[128] = {0};
             if (read_text_from_path(label_path, label, sizeof(label)) == 0) lowercase_ascii(label);
             int score = driver_score + temperature_candidate_score(NULL, label, package_id);
-            consider_temp_candidate(input_path, score, best_path, best_path_size, best_score);
+            consider_temp_candidate(input_path, score, label_mentions_package(label, package_id), best);
         }
         closedir(dir);
     }
@@ -226,18 +253,30 @@ static int detect_temp_sensor(tsd_telemetry_helper_t *helper) {
     helper->temp_available = 0;
     helper->temp_path[0] = '\0';
 
-    char best_path[sizeof(helper->temp_path)] = {0};
-    int best_score = -1;
+    temp_candidate_state_t best = {{0}, -1, 0, 0};
     int package_id = physical_package_id(helper->cpu);
-    scan_thermal_zones(package_id, best_path, sizeof(best_path), &best_score);
-    scan_hwmon(package_id, best_path, sizeof(best_path), &best_score);
+    scan_thermal_zones(package_id, &best);
+    scan_hwmon(package_id, &best);
 
-    if (best_score < 0 || best_path[0] == '\0' || copy_path(helper->temp_path, sizeof(helper->temp_path), best_path) != 0) {
+    if (best.score < 0 || best.path[0] == '\0') return 0;
+
+    /*
+     * On multi-package hosts an unlabeled top-scoring package sensor is not a
+     * safe package identity. Equal candidates are common with AMD k10temp/
+     * zenpower. Prefer absence of a thermal safety signal over silently using
+     * another socket's temperature.
+     */
+    if (package_id >= 0 && best.ambiguous && !best.explicit_package_match) {
+        tsd_log_warn(LOG_COMPONENT,
+                     "ambiguous package temperature sensors for cpu=%d package=%d; refusing unsafe selection",
+                     helper->cpu, package_id);
         return 0;
     }
+
+    if (copy_path(helper->temp_path, sizeof(helper->temp_path), best.path) != 0) return 0;
     helper->temp_available = 1;
     tsd_log_debug(LOG_COMPONENT, "selected package temperature sensor cpu=%d package=%d score=%d path=%s",
-                  helper->cpu, package_id, best_score, helper->temp_path);
+                  helper->cpu, package_id, best.score, helper->temp_path);
     return 1;
 }
 
