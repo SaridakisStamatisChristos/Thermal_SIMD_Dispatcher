@@ -66,7 +66,7 @@ static int assert_immutable_cet_table(void) {
         return 1;
     }
 
-    tsd_patch_slot_t *active = std::atomic_load_explicit(&g_tsd_active_trampoline, std::memory_order_acquire);
+    tsd_patch_slot_t *active = tsd_trampoline_state_active();
     if (!active) {
         std::fprintf(stderr, "active slot missing\n");
         return 1;
@@ -129,7 +129,7 @@ static int assert_native_vector_width_payloads(void) {
 }
 
 static int assert_fail_closed_selection(void) {
-    simd_width_t before = std::atomic_load_explicit(&g_tsd_current_width, std::memory_order_acquire);
+    simd_width_t before = tsd_trampoline_state_current_width();
     simd_width_t target = before == SIMD_AVX2 ? SIMD_SSE41 : SIMD_AVX2;
 
     tsd_trampoline_force_failure(TSD_PATCH_FAIL_PROTECT_EXEC);
@@ -137,7 +137,7 @@ static int assert_fail_closed_selection(void) {
         std::fprintf(stderr, "fault injection unexpectedly allowed transition\n");
         return 1;
     }
-    if (std::atomic_load_explicit(&g_tsd_current_width, std::memory_order_acquire) != before) {
+    if (tsd_trampoline_state_current_width() != before) {
         std::fprintf(stderr, "failed transition changed current width\n");
         return 1;
     }
@@ -150,7 +150,7 @@ static int assert_fail_closed_selection(void) {
         std::fprintf(stderr, "normal immutable selection failed after injected fault\n");
         return 1;
     }
-    tsd_patch_slot_t *active = std::atomic_load_explicit(&g_tsd_active_trampoline, std::memory_order_acquire);
+    tsd_patch_slot_t *active = tsd_trampoline_state_active();
     if (!mapping_is_rx_not_writable(active)) {
         std::fprintf(stderr, "selected target is not RX-only\n");
         return 1;

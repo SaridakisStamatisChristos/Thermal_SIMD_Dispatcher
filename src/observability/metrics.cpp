@@ -17,6 +17,9 @@
 #include <chrono>
 #include <cctype>
 #include <condition_variable>
+#include <cerrno>
+#include <cstdlib>
+#include <stdexcept>
 #include <cstdint>
 #include <cstring>
 #include <deque>
@@ -64,6 +67,21 @@ std::string sanitize_for_statsd(const std::string &value) {
             result.push_back(ch);
         } else {
             result.push_back('_');
+        }
+    }
+    return result;
+}
+
+std::string escape_prometheus_label(const std::string &value) {
+    std::string result;
+    result.reserve(value.size());
+    for (char ch : value) {
+        switch (ch) {
+            case '\\': result += "\\\\"; break;
+            case '"': result += "\\\""; break;
+            case '\n': result += "\\n"; break;
+            case '\r': result.push_back('_'); break;
+            default: result.push_back(ch); break;
         }
     }
     return result;
@@ -197,26 +215,26 @@ public:
         body << "# HELP tsd_sensor_health_ratio Last reported sensor health ratio.\n";
         body << "# TYPE tsd_sensor_health_ratio gauge\n";
         for (const auto &entry : sensor_state_) {
-            body << "tsd_sensor_health_ratio{sensor=\"" << entry.first.sensor
+            body << "tsd_sensor_health_ratio{sensor=\"" << escape_prometheus_label(entry.first.sensor)
                  << "\",socket=\"" << entry.first.socket << "\"} " << entry.second.health << "\n";
         }
         body << "# HELP tsd_sensor_quality_ratio Last reported sensor quality ratio.\n";
         body << "# TYPE tsd_sensor_quality_ratio gauge\n";
         for (const auto &entry : sensor_state_) {
-            body << "tsd_sensor_quality_ratio{sensor=\"" << entry.first.sensor
+            body << "tsd_sensor_quality_ratio{sensor=\"" << escape_prometheus_label(entry.first.sensor)
                  << "\",socket=\"" << entry.first.socket << "\"} " << entry.second.quality << "\n";
         }
         body << "# HELP tsd_sensor_health_valid Last reported sensor validity (1=valid).\n";
         body << "# TYPE tsd_sensor_health_valid gauge\n";
         for (const auto &entry : sensor_state_) {
-            body << "tsd_sensor_health_valid{sensor=\"" << entry.first.sensor
+            body << "tsd_sensor_health_valid{sensor=\"" << escape_prometheus_label(entry.first.sensor)
                  << "\",socket=\"" << entry.first.socket << "\"} " << (entry.second.valid ? 1 : 0) << "\n";
         }
         body << "# HELP tsd_sensor_health_timestamp_seconds UNIX time of last sensor report.\n";
         body << "# TYPE tsd_sensor_health_timestamp_seconds gauge\n";
         for (const auto &entry : sensor_state_) {
             auto secs = std::chrono::duration_cast<std::chrono::seconds>(entry.second.updated_at.time_since_epoch());
-            body << "tsd_sensor_health_timestamp_seconds{sensor=\"" << entry.first.sensor
+            body << "tsd_sensor_health_timestamp_seconds{sensor=\"" << escape_prometheus_label(entry.first.sensor)
                  << "\",socket=\"" << entry.first.socket << "\"} " << secs.count() << "\n";
         }
 
@@ -313,20 +331,50 @@ public:
             return -1;
         }
 
-        observability::StatsdExporter::instance().configure(local_config.statsd_host, local_config.statsd_port);
-        listen_fd_ = fd;
-        listen_port_ = ntohs(actual.sin_port);
-        bind_address_ = local_config.bind_address;
-        config_ = local_config;
-        running_.store(true, std::memory_order_release);
+        try {
+            observability::StatsdExporter::instance().configure(local_config.statsd_host, local_config.statsd_port);
+            listen_fd_ = fd;
+            listen_port_ = ntohs(actual.sin_port);
+            bind_address_ = local_config.bind_address;
+            config_ = local_config;
+            running_.store(true, std::memory_order_release);
 
-        workers_.clear();
-        workers_.reserve(kWorkerCount);
-        for (size_t i = 0; i < kWorkerCount; ++i) {
-            workers_.emplace_back(&PrometheusExporter::worker_loop, this);
+            workers_.clear();
+            workers_.reserve(kWorkerCount);
+#ifdef TSD_ENABLE_TESTS
+            long fail_after = -1;
+            if (const char *value = std::getenv("TSD_TEST_METRICS_FAIL_THREAD_AFTER")) {
+                char *end = nullptr;
+                errno = 0;
+                long parsed = std::strtol(value, &end, 10);
+                if (errno == 0 && end != value && *end == '\0') fail_after = parsed;
+            }
+#endif
+            for (size_t i = 0; i < kWorkerCount; ++i) {
+#ifdef TSD_ENABLE_TESTS
+                if (fail_after >= 0 && static_cast<long>(i) >= fail_after) {
+                    throw std::runtime_error("injected metrics worker startup failure");
+                }
+#endif
+                workers_.emplace_back(&PrometheusExporter::worker_loop, this);
+            }
+            server_thread_ = std::thread(&PrometheusExporter::serve, this, fd);
+            return 0;
+        } catch (...) {
+            running_.store(false, std::memory_order_release);
+            (void)::shutdown(fd, SHUT_RDWR);
+            client_cv_.notify_all();
+            for (auto &worker : workers_) {
+                if (worker.joinable()) worker.join();
+            }
+            workers_.clear();
+            if (listen_fd_ == fd) listen_fd_ = -1;
+            listen_port_ = 0;
+            ::close(fd);
+            observability::StatsdExporter::instance().shutdown();
+            destroy_tls();
+            return -1;
         }
-        server_thread_ = std::thread(&PrometheusExporter::serve, this, fd);
-        return 0;
     }
 
     void stop() {
@@ -376,7 +424,7 @@ public:
 
 private:
     PrometheusExporter() = default;
-    ~PrometheusExporter() { stop(); }
+    ~PrometheusExporter() { try { stop(); } catch (...) {} }
     PrometheusExporter(const PrometheusExporter &) = delete;
     PrometheusExporter &operator=(const PrometheusExporter &) = delete;
 
@@ -639,7 +687,12 @@ private:
                 client = clients_.front();
                 clients_.pop_front();
             }
-            serve_client(client);
+            try {
+                serve_client(client);
+            } catch (...) {
+                /* A malformed/hostile request or allocation failure must kill
+                 * only this client, never the exporter process. */
+            }
             ::close(client);
         }
     }
@@ -725,49 +778,59 @@ private:
 extern "C" {
 
 int tsd_metrics_exporter_start_with_config(const tsd_metrics_exporter_config_t *config) {
-    ExporterConfig exporter_config;
-    if (config) {
-        if (config->bind_address) exporter_config.bind_address = config->bind_address;
-        exporter_config.port = config->port;
-        if (config->tls) {
-            exporter_config.tls.enabled = true;
-            if (config->tls->certificate_path) exporter_config.tls.certificate = config->tls->certificate_path;
-            if (config->tls->private_key_path) exporter_config.tls.key = config->tls->private_key_path;
-            if (config->tls->ca_certificate_path) exporter_config.tls.ca = config->tls->ca_certificate_path;
-            exporter_config.tls.require_client_auth = config->tls->require_client_auth != 0;
+    try {
+        ExporterConfig exporter_config;
+        if (config) {
+            if (config->bind_address) exporter_config.bind_address = config->bind_address;
+            exporter_config.port = config->port;
+            if (config->tls) {
+                exporter_config.tls.enabled = true;
+                if (config->tls->certificate_path) exporter_config.tls.certificate = config->tls->certificate_path;
+                if (config->tls->private_key_path) exporter_config.tls.key = config->tls->private_key_path;
+                if (config->tls->ca_certificate_path) exporter_config.tls.ca = config->tls->ca_certificate_path;
+                exporter_config.tls.require_client_auth = config->tls->require_client_auth != 0;
+            }
+            if (config->basic_auth) {
+                exporter_config.auth.enabled = true;
+                if (config->basic_auth->username) exporter_config.auth.username = config->basic_auth->username;
+                if (config->basic_auth->password) exporter_config.auth.password = config->basic_auth->password;
+            }
+            if (config->statsd_host) exporter_config.statsd_host = config->statsd_host;
+            exporter_config.statsd_port = config->statsd_port;
         }
-        if (config->basic_auth) {
-            exporter_config.auth.enabled = true;
-            if (config->basic_auth->username) exporter_config.auth.username = config->basic_auth->username;
-            if (config->basic_auth->password) exporter_config.auth.password = config->basic_auth->password;
-        }
-        if (config->statsd_host) exporter_config.statsd_host = config->statsd_host;
-        exporter_config.statsd_port = config->statsd_port;
+        return PrometheusExporter::instance().start(exporter_config);
+    } catch (...) {
+        errno = EIO;
+        return -1;
     }
-    return PrometheusExporter::instance().start(exporter_config);
 }
 
 int tsd_metrics_exporter_start(const char *bind_address, uint16_t port) {
-    tsd_metrics_exporter_config_t config{};
-    config.bind_address = bind_address;
-    config.port = port;
-    return tsd_metrics_exporter_start_with_config(&config);
+    try {
+        tsd_metrics_exporter_config_t config{};
+        config.bind_address = bind_address;
+        config.port = port;
+        return tsd_metrics_exporter_start_with_config(&config);
+    } catch (...) {
+        errno = EIO;
+        return -1;
+    }
 }
 
 void tsd_metrics_exporter_stop(void) {
-    PrometheusExporter::instance().stop();
+    try { PrometheusExporter::instance().stop(); } catch (...) {}
 }
 
 uint16_t tsd_metrics_exporter_listen_port(void) {
-    return PrometheusExporter::instance().listen_port();
+    try { return PrometheusExporter::instance().listen_port(); } catch (...) { return 0; }
 }
 
 void tsd_metrics_exporter_record_patch(simd_width_t from, simd_width_t to, int rc, uint64_t dwell_ms) {
-    PrometheusExporter::instance().registry().record_patch(from, to, rc, dwell_ms);
+    try { PrometheusExporter::instance().registry().record_patch(from, to, rc, dwell_ms); } catch (...) {}
 }
 
 void tsd_metrics_exporter_observe_dwell(simd_width_t width, uint64_t dwell_ms) {
-    PrometheusExporter::instance().registry().observe_dwell(width, dwell_ms);
+    try { PrometheusExporter::instance().registry().observe_dwell(width, dwell_ms); } catch (...) {}
 }
 
 void tsd_metrics_exporter_record_sensor_health(const char *sensor_name,
@@ -776,7 +839,9 @@ void tsd_metrics_exporter_record_sensor_health(const char *sensor_name,
                                                double quality,
                                                int valid) {
     if (!sensor_name) return;
-    PrometheusExporter::instance().registry().record_sensor_health(sensor_name, socket, health, quality, valid != 0);
+    try {
+        PrometheusExporter::instance().registry().record_sensor_health(sensor_name, socket, health, quality, valid != 0);
+    } catch (...) {}
 }
 
 } // extern "C"

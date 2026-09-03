@@ -216,8 +216,8 @@ void update_temperature_gate_unlocked(bool raw_temperature_available) {
      * above becomes false, so this best-effort selector update cannot create an
      * unsafe entry window. */
     if (!raw_temperature_available &&
-        std::atomic_load_explicit(&g_tsd_trampoline_initialized, std::memory_order_acquire) != 0 &&
-        std::atomic_load_explicit(&g_tsd_current_width, std::memory_order_acquire) != SIMD_SSE41) {
+        tsd_trampoline_state_initialized() != 0 &&
+        tsd_trampoline_state_current_width() != SIMD_SSE41) {
         (void)tsd_trampoline_patch(SIMD_SSE41);
     }
 }

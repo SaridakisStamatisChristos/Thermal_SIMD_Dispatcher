@@ -65,6 +65,7 @@ static int run_monitor_thread_scenario(void) {
     tsd_runtime_config_exit_degraded_mode(&g_tsd_config, "tests");
     g_tsd_config.degraded_policy_active = 0;
     tsd_test_measure_baseline(ctx);
+    tsd_test_perf_set_mode(ctx, TSD_PERF_MODE_HARDWARE);
 
     /*
      * The production runtime now treats package temperature as explicit

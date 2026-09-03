@@ -216,8 +216,8 @@ void discard_code_page(void *page, size_t pagesize) {
     for (auto &slot : g_slots) {
         slot = nullptr;
     }
-    std::atomic_store_explicit(&g_tsd_page_a_effective_writable, false, std::memory_order_release);
-    std::atomic_store_explicit(&g_tsd_page_b_effective_writable, false, std::memory_order_release);
+    tsd_trampoline_state_set_page_a_writable(0);
+    tsd_trampoline_state_set_page_b_writable(0);
 }
 
 void update_attestation_hash(const tsd_patch_slot_t *slot) {
@@ -266,8 +266,8 @@ int build_canonical_code_page() {
     g_tsd_trampoline_ctx.pkey = -1;
     g_tsd_trampoline_ctx.pkru_write_mask = 0;
     g_tsd_trampoline_ctx.pkru_disable_mask = 0;
-    std::atomic_store_explicit(&g_tsd_page_a_effective_writable, true, std::memory_order_release);
-    std::atomic_store_explicit(&g_tsd_page_b_effective_writable, false, std::memory_order_release);
+    tsd_trampoline_state_set_page_a_writable(1);
+    tsd_trampoline_state_set_page_b_writable(0);
 
     auto *slots = reinterpret_cast<tsd_patch_slot_t*>(page);
     for (size_t i = 0; i < kWidthCount; ++i) {
@@ -291,7 +291,7 @@ int build_canonical_code_page() {
     }
 
     g_tsd_trampoline_ctx.page_a_prot = PROT_READ | PROT_EXEC;
-    std::atomic_store_explicit(&g_tsd_page_a_effective_writable, false, std::memory_order_release);
+    tsd_trampoline_state_set_page_a_writable(0);
 
     if (!mapping_is_rx_not_writable(page)) {
         discard_code_page(page, pagesize);
@@ -335,14 +335,6 @@ extern "C" {
 
 tsd_trampoline_ctx_t g_tsd_trampoline_ctx = {};
 pthread_mutex_t g_tsd_patch_lock = PTHREAD_MUTEX_INITIALIZER;
-std::atomic<simd_width_t> g_tsd_current_width{SIMD_SSE41};
-std::atomic<unsigned char> g_tsd_current_width_byte{static_cast<unsigned char>(SIMD_SSE41)};
-std::atomic<int> g_tsd_trampoline_initialized{0};
-std::atomic<tsd_patch_slot_t*> g_tsd_active_trampoline{nullptr};
-std::atomic<unsigned char> g_tsd_last_patch_attempt{static_cast<unsigned char>(SIMD_SSE41)};
-std::atomic<unsigned char> g_tsd_last_patched_width{static_cast<unsigned char>(SIMD_SSE41)};
-std::atomic<bool> g_tsd_page_a_effective_writable{false};
-std::atomic<bool> g_tsd_page_b_effective_writable{false};
 
 int tsd_trampoline_init(void) {
     pthread_mutex_lock(&g_tsd_patch_lock);
@@ -356,12 +348,7 @@ int tsd_trampoline_init(void) {
 
     g_tsd_trampoline_ctx.active = g_slots[SIMD_SSE41];
     g_tsd_trampoline_ctx.inactive = g_slots[SIMD_AVX2];
-    std::atomic_store_explicit(&g_tsd_active_trampoline, g_slots[SIMD_SSE41], std::memory_order_seq_cst);
-    std::atomic_store_explicit(&g_tsd_current_width, SIMD_SSE41, std::memory_order_release);
-    std::atomic_store_explicit(&g_tsd_current_width_byte, static_cast<unsigned char>(SIMD_SSE41), std::memory_order_release);
-    std::atomic_store_explicit(&g_tsd_trampoline_initialized, 0, std::memory_order_release);
-    std::atomic_store_explicit(&g_tsd_last_patch_attempt, static_cast<unsigned char>(SIMD_SSE41), std::memory_order_release);
-    std::atomic_store_explicit(&g_tsd_last_patched_width, static_cast<unsigned char>(SIMD_SSE41), std::memory_order_release);
+    tsd_trampoline_state_reset(g_slots[SIMD_SSE41]);
     {
         std::lock_guard<std::mutex> hash_lock(g_attestation_mutex);
         g_active_hash_valid.store(false, std::memory_order_release);
@@ -378,8 +365,8 @@ int init_double_buffer_trampoline(void) {
 int tsd_trampoline_patch(simd_width_t new_width) {
     pthread_mutex_lock(&g_tsd_patch_lock);
 
-    simd_width_t previous_width = std::atomic_load_explicit(&g_tsd_current_width, std::memory_order_acquire);
-    std::atomic_store_explicit(&g_tsd_last_patch_attempt, static_cast<unsigned char>(new_width), std::memory_order_release);
+    simd_width_t previous_width = tsd_trampoline_state_current_width();
+    tsd_trampoline_state_set_last_patch_attempt(new_width);
     int rc = -1;
 
     do {
@@ -439,15 +426,11 @@ int tsd_trampoline_patch(simd_width_t new_width) {
             break;
         }
 
-        tsd_patch_slot_t *old_active = std::atomic_load_explicit(&g_tsd_active_trampoline, std::memory_order_acquire);
+        tsd_patch_slot_t *old_active = tsd_trampoline_state_active();
         g_tsd_trampoline_ctx.active = target;
         g_tsd_trampoline_ctx.inactive = old_active;
 
-        std::atomic_store_explicit(&g_tsd_current_width, new_width, std::memory_order_release);
-        std::atomic_store_explicit(&g_tsd_current_width_byte, static_cast<unsigned char>(new_width), std::memory_order_release);
-        std::atomic_store_explicit(&g_tsd_active_trampoline, target, std::memory_order_seq_cst);
-        std::atomic_store_explicit(&g_tsd_trampoline_initialized, 1, std::memory_order_release);
-        std::atomic_store_explicit(&g_tsd_last_patched_width, static_cast<unsigned char>(new_width), std::memory_order_release);
+        tsd_trampoline_state_publish_selection(new_width, target);
 
         update_attestation_hash(target);
         tsd_log_info(LOG_COMPONENT, "Selected immutable %s trampoline",
@@ -466,16 +449,16 @@ int tsd_trampoline_self_validate(char *reason, size_t reason_len) {
     if (reason && reason_len > 0) {
         reason[0] = '\0';
     }
-    if (!std::atomic_load_explicit(&g_tsd_trampoline_initialized, std::memory_order_acquire)) {
+    if (!tsd_trampoline_state_initialized()) {
         if (reason && reason_len > 0) {
             std::snprintf(reason, reason_len, "%s", "trampoline not initialised");
         }
         return -1;
     }
 
-    simd_width_t width = std::atomic_load_explicit(&g_tsd_current_width, std::memory_order_acquire);
+    simd_width_t width = tsd_trampoline_state_current_width();
     const auto *expected = selected_patch(width);
-    tsd_patch_slot_t *active = std::atomic_load_explicit(&g_tsd_active_trampoline, std::memory_order_acquire);
+    tsd_patch_slot_t *active = tsd_trampoline_state_active();
     if (!expected || !active) {
         if (reason && reason_len > 0) {
             std::snprintf(reason, reason_len, "%s", "active trampoline unavailable");
@@ -500,8 +483,8 @@ int tsd_trampoline_self_validate(char *reason, size_t reason_len) {
         }
         return -1;
     }
-    if (std::atomic_load_explicit(&g_tsd_page_a_effective_writable, std::memory_order_acquire) ||
-        std::atomic_load_explicit(&g_tsd_page_b_effective_writable, std::memory_order_acquire)) {
+    if (tsd_trampoline_state_page_a_writable() ||
+        tsd_trampoline_state_page_b_writable()) {
         if (reason && reason_len > 0) {
             std::snprintf(reason, reason_len, "%s", "trampoline page writable");
         }

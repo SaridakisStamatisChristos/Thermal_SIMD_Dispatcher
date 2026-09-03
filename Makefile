@@ -22,6 +22,7 @@ CORE_C := \
 	src/config/runtime_flags.c \
 	src/dispatch/adaptive_dispatch.c \
 	src/runtime_guard.c \
+	src/workload_counter.c \
 	src/runtime_api.c \
 	src/logging.c \
 	src/config_parser.c \
@@ -32,6 +33,7 @@ CORE_C := \
 	src/telemetry_helper.c \
 	src/thermal_config.c \
 	src/thermal_cpu.c \
+	src/patcher/trampoline_state.c \
 	src/patcher/trampoline_guard.c \
 	src/thermal_perf.c \
 	src/thermal_signals.c \
