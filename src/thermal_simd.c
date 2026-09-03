@@ -26,6 +26,8 @@
 #include <thermal/simd/policy/dispatcher_policy.h>
 #include <observability/metrics_exporter.h>
 
+#include "runtime_guard_internal.h"
+
 #ifdef TSD_ENABLE_TESTS
 #include "thermal_simd_test.h"
 #endif
@@ -54,6 +56,7 @@ static void tsd_handle_shutdown_signal(int sig) {
 }
 
 static int32_t simd_shim(int32_t a, int32_t b);
+static int32_t simd_shim_unlocked(int32_t a, int32_t b);
 
 static inline void workload_once(void) {
     (void)simd_shim(42, 7);
@@ -106,9 +109,15 @@ static int emergency_temperature_exceeded(const tsd_thermal_eval_t *eval) {
     return (int64_t)eval->package_temp_millic >= limit;
 }
 
+/*
+ * The naked shim is only entered while the execution side of the safety gate
+ * is held. That makes the legacy byte/pointer publication effectively atomic
+ * from the execution path: a selector writer cannot modify either field until
+ * the complete call has returned.
+ */
 __attribute__((naked))
-static int32_t simd_shim(int32_t a __attribute__((unused)),
-                         int32_t b __attribute__((unused))) {
+static int32_t simd_shim_unlocked(int32_t a __attribute__((unused)),
+                                  int32_t b __attribute__((unused))) {
     __asm__ __volatile__(
         "cmpb $0, g_tsd_avx_available(%rip)\n\t"
         "je 1f\n\t"
@@ -123,6 +132,28 @@ static int32_t simd_shim(int32_t a __attribute__((unused)),
         "movd %xmm0, %eax\n\t"
         "ret\n\t"
     );
+}
+
+static int32_t simd_shim(int32_t a, int32_t b) {
+    for (;;) {
+        if (tsd_runtime_execution_enter() != 0) {
+            return 0;
+        }
+        simd_width_t selected = atomic_load_explicit(&g_tsd_current_width, memory_order_acquire);
+        if (selected <= SIMD_SSE41 || tsd_runtime_width_authorized(selected)) {
+            int32_t result = simd_shim_unlocked(a, b);
+            tsd_runtime_execution_leave();
+            return result;
+        }
+        tsd_runtime_execution_leave();
+
+        /* A guard writer may revoke authorization before the global selector
+         * has been physically driven back to SSE. Never enter that stale wide
+         * slot; repair the compatibility selector and retry. */
+        if (tsd_trampoline_patch(SIMD_SSE41) != 0) {
+            return 0;
+        }
+    }
 }
 
 static void workload_loop(int iterations) {
@@ -221,7 +252,7 @@ static void print_configuration(simd_width_t max_width) {
                  max_width_str,
                  g_tsd_config.allow_avx512 ? "" : " [AVX-512 disabled by policy]");
     tsd_log_info(LOG_COMPONENT, "AVX transition guard: %s",
-                 g_tsd_avx_available ? "enabled" : "disabled");
+                 tsd_cpu_avx_available() ? "enabled" : "disabled");
     tsd_log_info(LOG_COMPONENT, "Policy configuration:");
     tsd_log_info(LOG_COMPONENT, "  Check interval: %d ms", g_tsd_config.check_interval_us / 1000);
     tsd_log_info(LOG_COMPONENT, "  Down threshold: %.1fx CPI (after %d events)",
@@ -266,6 +297,38 @@ static int evaluate_thermal(perf_ctx_t *ctx, tsd_thermal_eval_t *out) {
     return tsd_perf_evaluate(ctx, out, &g_tsd_config);
 }
 
+static int force_sse_safety(simd_width_t *width,
+                            tsd_dispatcher_policy_state *policy_state,
+                            uint64_t dwell_ms,
+                            const char *reason) {
+    simd_width_t current = atomic_load_explicit(&g_tsd_current_width, memory_order_acquire);
+    if (current == SIMD_SSE41) {
+        if (width) *width = current;
+        return 0;
+    }
+
+    record_dwell_metric(current, dwell_ms);
+    if (tsd_trampoline_patch(SIMD_SSE41) != 0) {
+        char errbuf[128];
+        int patch_err = errno;
+        tsd_log_error(LOG_COMPONENT,
+                      "event=safety_fallback state=failed reason=%s error=%s",
+                      reason ? reason : "unknown",
+                      patch_err ? tsd_log_strerror(patch_err, errbuf, sizeof(errbuf)) : "unknown");
+        if (width) *width = atomic_load_explicit(&g_tsd_current_width, memory_order_acquire);
+        return -1;
+    }
+
+    if (width) *width = SIMD_SSE41;
+    if (policy_state) {
+        tsd_dispatcher_policy_reset(policy_state, &g_tsd_config.policy);
+    }
+    tsd_log_warn(LOG_COMPONENT,
+                 "event=safety_fallback state=selected width=SSE4.1 reason=%s",
+                 reason ? reason : "unknown");
+    return 0;
+}
+
 void* thermal_monitor_thread(void *arg) {
     perf_ctx_t *ctx = (perf_ctx_t*)arg;
     simd_width_t width = atomic_load_explicit(&g_tsd_current_width, memory_order_acquire);
@@ -289,10 +352,9 @@ void* thermal_monitor_thread(void *arg) {
             if (g_tsd_stop_requested) break;
         }
         if (g_tsd_stop_requested || !atomic_load_explicit(&g_tsd_running, memory_order_acquire)) break;
+
         uint64_t now_ms = monotonic_now_ms();
         uint64_t dwell_ms = now_ms >= width_since_ms ? now_ms - width_since_ms : 0;
-
-        /* Fail-closed selections can originate inside telemetry evaluation. */
         width = atomic_load_explicit(&g_tsd_current_width, memory_order_acquire);
 
         if (policy_state) {
@@ -307,43 +369,47 @@ void* thermal_monitor_thread(void *arg) {
             }
         }
 
-        if (now_ms < cooldown_until_ms) {
-            continue;
-        }
-        if (dwell_ms < nonnegative_ms(g_tsd_config.min_dwell_ms)) {
-            continue;
-        }
-        if (tsd_perf_check_software_timeout(ctx, g_tsd_config.degraded_timeout_sec)) {
-            simd_width_t current_width = atomic_load_explicit(&g_tsd_current_width, memory_order_acquire);
-            record_dwell_metric(current_width, dwell_ms);
-            if (current_width != SIMD_SSE41) {
-                if (tsd_trampoline_patch(SIMD_SSE41) == 0) {
-                    width = SIMD_SSE41;
-                    if (policy_state) {
-                        tsd_dispatcher_policy_reset(policy_state, &g_tsd_config.policy);
-                    }
-                } else {
-                    tsd_log_error(LOG_COMPONENT, "fail-closed patch to SSE4.1 failed");
-                }
-            } else {
-                width = current_width;
-            }
-            cooldown_until_ms = now_ms + nonnegative_ms(g_tsd_config.cooldown_down_ms);
-            width_since_ms = now_ms;
-            continue;
-        }
+        /*
+         * Safety observation is never suppressed by ordinary dwell/cooldown.
+         * Evaluate timeout, perf state and raw thermal state on every sample.
+         */
+        int software_timeout = tsd_perf_check_software_timeout(ctx, g_tsd_config.degraded_timeout_sec);
         tsd_thermal_eval_t eval = {0};
         int predictive_fallback = 0;
         int evaluation_rc = evaluate_thermal(ctx, &eval);
         width = atomic_load_explicit(&g_tsd_current_width, memory_order_acquire);
-        if (emergency_temperature_exceeded(&eval)) {
-            evaluation_rc = 1;
-            if (eval.severity_milli == 0) {
-                eval.severity_milli = 1;
-            }
-        }
+        int emergency = emergency_temperature_exceeded(&eval);
+
         if (policy_state) {
             tsd_dispatcher_policy_record(policy_state, &eval, width);
+        }
+
+        if (software_timeout || emergency) {
+            const char *reason = software_timeout ? "software-timeout" : "raw-temperature-emergency";
+            if (force_sse_safety(&width, policy_state, dwell_ms, reason) == 0) {
+                throttle_count = 0;
+                stable_count = 0;
+                width_since_ms = now_ms;
+                cooldown_until_ms = now_ms + nonnegative_ms(g_tsd_config.cooldown_down_ms);
+            } else {
+                /* Failed safety transitions are retried at the next sample.
+                 * Never hide them behind a new cooldown or dwell epoch. */
+                throttle_count = g_tsd_config.down_count;
+                stable_count = 0;
+                cooldown_until_ms = 0;
+            }
+            continue;
+        }
+
+        if (emergency) {
+            evaluation_rc = 1;
+            if (eval.severity_milli == 0) eval.severity_milli = 1;
+        }
+
+        /* Dwell/cooldown control only normal optimization transitions. */
+        if (now_ms < cooldown_until_ms ||
+            dwell_ms < nonnegative_ms(g_tsd_config.min_dwell_ms)) {
+            continue;
         }
 
         if (policy_state) {
@@ -399,9 +465,7 @@ void* thermal_monitor_thread(void *arg) {
                 if (eval.temp_available) {
                     int32_t temp_whole = eval.package_temp_millic / 1000;
                     int32_t temp_frac = eval.package_temp_millic % 1000;
-                    if (temp_frac < 0) {
-                        temp_frac = -temp_frac;
-                    }
+                    if (temp_frac < 0) temp_frac = -temp_frac;
                     append_message(message, sizeof(message), &cursor,
                                    " temp=%d.%03dC", temp_whole, temp_frac);
                 }
@@ -411,18 +475,19 @@ void* thermal_monitor_thread(void *arg) {
                                    eval.freq_ratio_milli / 1000, eval.freq_ratio_milli % 1000);
                 }
                 if (eval.memory_bound) {
-                    append_message(message, sizeof(message), &cursor,
-                                   " [memory bound guard raised]");
+                    append_message(message, sizeof(message), &cursor, " [memory bound guard raised]");
                 }
                 tsd_log_warn(LOG_COMPONENT, "%s", message);
+
                 simd_width_t target = width - 1;
                 record_dwell_metric(width, dwell_ms);
-                if (!tsd_runtime_flags_allow_transitions() && target > SIMD_SSE41) {
-                    target = SIMD_SSE41;
-                }
+                if (!tsd_runtime_flags_allow_transitions() && target > SIMD_SSE41) target = SIMD_SSE41;
                 int patch_rc = tsd_trampoline_patch(target);
                 if (patch_rc == 0) {
                     width = target;
+                    throttle_count = 0;
+                    cooldown_until_ms = now_ms + nonnegative_ms(g_tsd_config.cooldown_down_ms);
+                    width_since_ms = now_ms;
                 } else {
                     int patch_err = errno;
                     width = atomic_load_explicit(&g_tsd_current_width, memory_order_acquire);
@@ -439,10 +504,10 @@ void* thermal_monitor_thread(void *arg) {
                     } else {
                         tsd_log_error(LOG_COMPONENT, "downgrade patch failed");
                     }
+                    /* Keep the throttle saturated and retry next sample. */
+                    throttle_count = g_tsd_config.down_count;
+                    cooldown_until_ms = 0;
                 }
-                throttle_count = 0;
-                cooldown_until_ms = now_ms + nonnegative_ms(g_tsd_config.cooldown_down_ms);
-                width_since_ms = now_ms;
             }
         } else {
             stable_count++;
@@ -463,6 +528,9 @@ void* thermal_monitor_thread(void *arg) {
                 int patch_rc = tsd_trampoline_patch(target);
                 if (patch_rc == 0) {
                     width = target;
+                    stable_count = 0;
+                    cooldown_until_ms = now_ms + nonnegative_ms(g_tsd_config.cooldown_up_ms);
+                    width_since_ms = now_ms;
                 } else {
                     int patch_err = errno;
                     width = atomic_load_explicit(&g_tsd_current_width, memory_order_acquire);
@@ -479,33 +547,25 @@ void* thermal_monitor_thread(void *arg) {
                     } else {
                         tsd_log_error(LOG_COMPONENT, "upgrade patch failed");
                     }
+                    stable_count = 0;
                 }
-                stable_count = 0;
-                cooldown_until_ms = now_ms + nonnegative_ms(g_tsd_config.cooldown_up_ms);
-                width_since_ms = now_ms;
             }
         }
     }
-    if (policy_state) {
-        tsd_dispatcher_policy_destroy(policy_state);
-    }
+    if (policy_state) tsd_dispatcher_policy_destroy(policy_state);
     return NULL;
 }
 
 static int ensure_runtime_prerequisites(void) {
     if (g_tsd_config.check_interval_us <= 0) {
         tsd_runtime_config_set_defaults(&g_tsd_config);
-        if (tsd_runtime_config_refresh_ticks(&g_tsd_config) != 0) {
-            return -1;
-        }
+        if (tsd_runtime_config_refresh_ticks(&g_tsd_config) != 0) return -1;
     }
     if (!tsd_cpu_has_sse41()) {
         errno = ENOTSUP;
         return -1;
     }
-    if (tsd_trampoline_init() != 0 || tsd_trampoline_patch(SIMD_SSE41) != 0) {
-        return -1;
-    }
+    if (tsd_trampoline_init() != 0 || tsd_trampoline_patch(SIMD_SSE41) != 0) return -1;
 
     if (!tsd_runtime_flags_sandbox_complete()) {
         tsd_runtime_flags_init();
@@ -541,6 +601,13 @@ int tsd_runtime_start(tsd_runtime_t **out_runtime, tsd_workload_fn workload) {
         return -1;
     }
 
+    if (tsd_runtime_safety_write_enter() != 0) {
+        pthread_mutex_unlock(&g_tsd_runtime_lock);
+        return -1;
+    }
+    tsd_runtime_set_stopping_locked(0);
+    tsd_runtime_safety_write_leave();
+
     tsd_runtime_t *runtime = calloc(1, sizeof(*runtime));
     if (!runtime) {
         pthread_mutex_unlock(&g_tsd_runtime_lock);
@@ -555,12 +622,9 @@ int tsd_runtime_start(tsd_runtime_t **out_runtime, tsd_workload_fn workload) {
     }
 
     tsd_perf_mode_t mode = tsd_perf_get_mode(runtime->perf);
-    if (mode == TSD_PERF_MODE_HARDWARE) {
-        tsd_perf_enable(runtime->perf);
-    }
+    if (mode == TSD_PERF_MODE_HARDWARE) tsd_perf_enable(runtime->perf);
     tsd_perf_measure_baseline(runtime->perf, &g_tsd_config);
 
-    /* Baseline/telemetry validation may fail closed, but never start wide. */
     if (atomic_load_explicit(&g_tsd_current_width, memory_order_acquire) != SIMD_SSE41) {
         if (tsd_trampoline_patch(SIMD_SSE41) != 0) {
             tsd_perf_cleanup(runtime->perf);
@@ -596,7 +660,13 @@ int tsd_runtime_start(tsd_runtime_t **out_runtime, tsd_workload_fn workload) {
 
 void tsd_runtime_request_stop(tsd_runtime_t *runtime) {
     if (!runtime) return;
-    atomic_store_explicit(&g_tsd_running, 0, memory_order_release);
+    if (tsd_runtime_safety_write_enter() == 0) {
+        tsd_runtime_set_stopping_locked(1);
+        atomic_store_explicit(&g_tsd_running, 0, memory_order_release);
+        tsd_runtime_safety_write_leave();
+    } else {
+        atomic_store_explicit(&g_tsd_running, 0, memory_order_release);
+    }
 }
 
 int tsd_runtime_stop(tsd_runtime_t *runtime) {
@@ -612,18 +682,40 @@ int tsd_runtime_stop(tsd_runtime_t *runtime) {
         return -1;
     }
 
+    if (tsd_runtime_safety_write_enter() != 0) {
+        pthread_mutex_unlock(&g_tsd_runtime_lock);
+        return -1;
+    }
+    tsd_runtime_set_stopping_locked(1);
     atomic_store_explicit(&g_tsd_running, 0, memory_order_release);
+    tsd_runtime_safety_write_leave();
+
     if (runtime->monitor_started) {
         pthread_join(runtime->monitor, NULL);
         runtime->monitor_started = 0;
     }
-    if (atomic_load_explicit(&g_tsd_current_width, memory_order_acquire) != SIMD_SSE41) {
-        (void)tsd_trampoline_patch(SIMD_SSE41);
+
+    /* Successful shutdown requires the conservative selection to be committed.
+     * If that transition fails, retain the active stopping runtime and its guard
+     * resources so the caller can retry stop; never report a false-success
+     * cleanup while a wide selector remains published. */
+    if (atomic_load_explicit(&g_tsd_current_width, memory_order_acquire) != SIMD_SSE41 &&
+        tsd_trampoline_patch(SIMD_SSE41) != 0) {
+        int saved_errno = errno ? errno : EIO;
+        pthread_mutex_unlock(&g_tsd_runtime_lock);
+        errno = saved_errno;
+        return -1;
     }
+
     tsd_perf_cleanup(runtime->perf);
     runtime->perf = NULL;
     g_tsd_active_runtime = NULL;
     free(runtime);
+
+    if (tsd_runtime_safety_write_enter() == 0) {
+        tsd_runtime_set_stopping_locked(0);
+        tsd_runtime_safety_write_leave();
+    }
     pthread_mutex_unlock(&g_tsd_runtime_lock);
     return 0;
 }
@@ -634,9 +726,7 @@ int tsd_runtime_is_running(const tsd_runtime_t *runtime) {
 }
 
 tsd_perf_mode_t tsd_runtime_perf_mode(const tsd_runtime_t *runtime) {
-    if (!runtime || runtime != g_tsd_active_runtime || !runtime->perf) {
-        return TSD_PERF_MODE_NONE;
-    }
+    if (!runtime || runtime != g_tsd_active_runtime || !runtime->perf) return TSD_PERF_MODE_NONE;
     return tsd_perf_get_mode(runtime->perf);
 }
 
@@ -670,9 +760,7 @@ static void run_demo(void) {
                                             g_tsd_config.run_forever);
     log_demo_result(&result);
     tsd_runtime_request_stop(runtime);
-    if (tsd_runtime_stop(runtime) != 0) {
-        tsd_log_error(LOG_COMPONENT, "adaptive runtime cleanup failed");
-    }
+    if (tsd_runtime_stop(runtime) != 0) tsd_log_error(LOG_COMPONENT, "adaptive runtime cleanup failed");
 }
 
 static void install_runtime_signal_handlers(void) {
@@ -716,9 +804,7 @@ int tsd_dispatcher_main(int argc, char **argv) {
         if (g_tsd_config.metrics_tls_cert_path[0] != '\0' && g_tsd_config.metrics_tls_key_path[0] != '\0') {
             tls_cfg.certificate_path = g_tsd_config.metrics_tls_cert_path;
             tls_cfg.private_key_path = g_tsd_config.metrics_tls_key_path;
-            if (g_tsd_config.metrics_tls_ca_path[0] != '\0') {
-                tls_cfg.ca_certificate_path = g_tsd_config.metrics_tls_ca_path;
-            }
+            if (g_tsd_config.metrics_tls_ca_path[0] != '\0') tls_cfg.ca_certificate_path = g_tsd_config.metrics_tls_ca_path;
             tls_cfg.require_client_auth = g_tsd_config.metrics_tls_require_client_auth;
             exporter_cfg.tls = &tls_cfg;
         }
@@ -739,15 +825,11 @@ int tsd_dispatcher_main(int argc, char **argv) {
         if (tsd_metrics_exporter_start_with_config(&exporter_cfg) == 0) {
             metrics_started = 1;
             uint16_t actual_port = tsd_metrics_exporter_listen_port();
-            tsd_log_info(LOG_COMPONENT,
-                         "Metrics exporter listening on %s:%u",
-                         g_tsd_config.metrics_bind_host,
-                         (unsigned)actual_port);
+            tsd_log_info(LOG_COMPONENT, "Metrics exporter listening on %s:%u",
+                         g_tsd_config.metrics_bind_host, (unsigned)actual_port);
         } else {
-            tsd_log_warn(LOG_COMPONENT,
-                         "Failed to start metrics exporter on %s:%d",
-                         g_tsd_config.metrics_bind_host,
-                         g_tsd_config.metrics_port);
+            tsd_log_warn(LOG_COMPONENT, "Failed to start metrics exporter on %s:%d",
+                         g_tsd_config.metrics_bind_host, g_tsd_config.metrics_port);
         }
     }
 
@@ -793,8 +875,7 @@ int tsd_dispatcher_main(int argc, char **argv) {
         } else {
             tsd_log_warn(LOG_COMPONENT,
                          "Operating in safe SIMD mode; detected maximum %d but constrained: %s",
-                         (int)max_width,
-                         tsd_runtime_flags_status_message());
+                         (int)max_width, tsd_runtime_flags_status_message());
         }
     }
 
@@ -838,162 +919,48 @@ void tsd_test_reset_runtime(void) {
 }
 
 void tsd_test_set_policy_counts(int down, int up) {
-    if (down > 0) {
-        g_tsd_config.down_count = down;
-    }
-    if (up > 0) {
-        g_tsd_config.up_count = up;
-    }
+    if (down > 0) g_tsd_config.down_count = down;
+    if (up > 0) g_tsd_config.up_count = up;
 }
 
 void tsd_test_set_timing(int interval_us, int cooldown_down_ms, int cooldown_up_ms, int dwell_ms) {
-    if (interval_us > 0) {
-        g_tsd_config.check_interval_us = interval_us;
-    }
-    if (cooldown_down_ms >= 0) {
-        g_tsd_config.cooldown_down_ms = cooldown_down_ms;
-    }
-    if (cooldown_up_ms >= 0) {
-        g_tsd_config.cooldown_up_ms = cooldown_up_ms;
-    }
-    if (dwell_ms >= 0) {
-        g_tsd_config.min_dwell_ms = dwell_ms;
-    }
+    if (interval_us > 0) g_tsd_config.check_interval_us = interval_us;
+    if (cooldown_down_ms >= 0) g_tsd_config.cooldown_down_ms = cooldown_down_ms;
+    if (cooldown_up_ms >= 0) g_tsd_config.cooldown_up_ms = cooldown_up_ms;
+    if (dwell_ms >= 0) g_tsd_config.min_dwell_ms = dwell_ms;
 }
 
-int tsd_test_refresh_ticks(void) {
-    return tsd_runtime_config_refresh_ticks(&g_tsd_config);
-}
-
-void tsd_test_set_running(int value) {
-    atomic_store_explicit(&g_tsd_running, value, memory_order_release);
-}
-
-void tsd_test_run_workload(int iterations) {
-    if (iterations < 0) {
-        return;
-    }
-    workload_loop(iterations);
-}
-
-void tsd_test_reset_workload_counter(void) {
-    atomic_store_explicit(&g_tsd_workload_iterations, 0, memory_order_relaxed);
-}
-
-void tsd_test_set_detect_override(simd_width_t (*fn)(void)) {
-    tsd_cpu_set_detect_override(fn);
-}
-
-void tsd_test_clear_detect_override(void) {
-    tsd_cpu_clear_detect_override();
-}
-
-void tsd_test_override_patch(simd_width_t width, const uint8_t *bytes, size_t len) {
-    tsd_trampoline_override_patch(width, bytes, len);
-}
-
-void tsd_test_clear_patch_overrides(void) {
-    tsd_trampoline_clear_overrides();
-}
-
-const uint8_t* tsd_test_patch_bytes(simd_width_t width, size_t *len) {
-    return tsd_trampoline_patch_bytes(width, len);
-}
-
-void tsd_test_set_fake_perf_script(const uint32_t *ratios, size_t count, uint32_t mpki) {
-    tsd_perf_set_fake_script(ratios, count, mpki);
-}
-
-void tsd_test_set_fake_telemetry(const tsd_telemetry_sample_t *samples, size_t count) {
-    tsd_perf_set_fake_telemetry(samples, count);
-}
-
-void tsd_test_clear_fake_perf_script(void) {
-    tsd_perf_clear_fake_script();
-}
-
-const char* tsd_test_last_patch_error(void) {
-    return tsd_trampoline_last_error();
-}
-
-void tsd_test_force_patch_failure(tsd_patch_fail_stage_t stage) {
-    tsd_trampoline_force_failure(stage);
-}
-
-simd_width_t tsd_test_current_width(void) {
-    return atomic_load_explicit(&g_tsd_current_width, memory_order_relaxed);
-}
-
-unsigned char tsd_test_last_patched_width(void) {
-    return atomic_load_explicit(&g_tsd_last_patched_width, memory_order_relaxed);
-}
-
-simd_width_t tsd_test_detect_host_max(void) {
-    return tsd_cpu_detect_ignoring_override(&g_tsd_config);
-}
-
-int tsd_test_patch(simd_width_t width) {
-    return tsd_trampoline_patch(width);
-}
-
-int tsd_test_inactive_page_writable(void) {
-    return tsd_trampoline_inactive_page_writable();
-}
-
-perf_ctx_t* tsd_test_init_perf(void) {
-    return tsd_perf_init(workload_once);
-}
-
-void tsd_test_measure_baseline(perf_ctx_t *ctx) {
-    tsd_perf_measure_baseline(ctx, &g_tsd_config);
-}
-
-void tsd_test_cleanup_perf(perf_ctx_t *ctx) {
-    tsd_perf_cleanup(ctx);
-}
-
-perf_ctx_t* tsd_test_perf_create_dummy_context(void) {
-    return tsd_perf_test_create_dummy_context();
-}
-
-void tsd_test_perf_destroy_dummy_context(perf_ctx_t *ctx) {
-    tsd_perf_test_destroy_dummy_context(ctx);
-}
-
-void tsd_test_perf_set_group_fd(perf_ctx_t *ctx, int fd) {
-    tsd_perf_test_set_group_fd(ctx, fd);
-}
-
-void tsd_test_perf_set_llc_fd(perf_ctx_t *ctx, int fd) {
-    tsd_perf_test_set_llc_fd(ctx, fd);
-}
-
-void tsd_test_perf_set_mode(perf_ctx_t *ctx, tsd_perf_mode_t mode) {
-    tsd_perf_test_set_mode(ctx, mode);
-}
-
-void tsd_test_perf_set_read_streams(const tsd_perf_test_read_stream_t *streams, size_t count) {
-    tsd_perf_test_set_read_streams(streams, count);
-}
-
-void tsd_test_perf_clear_read_streams(void) {
-    tsd_perf_test_clear_read_streams();
-}
-
-uint64_t tsd_test_perf_get_baseline_cpi(const perf_ctx_t *ctx) {
-    return tsd_perf_test_get_baseline_cpi(ctx);
-}
-
-uint64_t tsd_test_perf_get_baseline_mpki(const perf_ctx_t *ctx) {
-    return tsd_perf_test_get_baseline_mpki(ctx);
-}
-
-int tsd_test_perf_get_last_group_valid(const perf_ctx_t *ctx) {
-    return tsd_perf_test_get_last_group_valid(ctx);
-}
-
-uint64_t tsd_test_perf_get_last_llc_value(const perf_ctx_t *ctx) {
-    return tsd_perf_test_get_last_llc_value(ctx);
-}
-
+int tsd_test_refresh_ticks(void) { return tsd_runtime_config_refresh_ticks(&g_tsd_config); }
+void tsd_test_set_running(int value) { atomic_store_explicit(&g_tsd_running, value, memory_order_release); }
+void tsd_test_run_workload(int iterations) { if (iterations >= 0) workload_loop(iterations); }
+void tsd_test_reset_workload_counter(void) { atomic_store_explicit(&g_tsd_workload_iterations, 0, memory_order_relaxed); }
+void tsd_test_set_detect_override(simd_width_t (*fn)(void)) { tsd_cpu_set_detect_override(fn); }
+void tsd_test_clear_detect_override(void) { tsd_cpu_clear_detect_override(); }
+void tsd_test_override_patch(simd_width_t width, const uint8_t *bytes, size_t len) { tsd_trampoline_override_patch(width, bytes, len); }
+void tsd_test_clear_patch_overrides(void) { tsd_trampoline_clear_overrides(); }
+const uint8_t* tsd_test_patch_bytes(simd_width_t width, size_t *len) { return tsd_trampoline_patch_bytes(width, len); }
+void tsd_test_set_fake_perf_script(const uint32_t *ratios, size_t count, uint32_t mpki) { tsd_perf_set_fake_script(ratios, count, mpki); }
+void tsd_test_set_fake_telemetry(const tsd_telemetry_sample_t *samples, size_t count) { tsd_perf_set_fake_telemetry(samples, count); }
+void tsd_test_clear_fake_perf_script(void) { tsd_perf_clear_fake_script(); }
+const char* tsd_test_last_patch_error(void) { return tsd_trampoline_last_error(); }
+void tsd_test_force_patch_failure(tsd_patch_fail_stage_t stage) { tsd_trampoline_force_failure(stage); }
+simd_width_t tsd_test_current_width(void) { return atomic_load_explicit(&g_tsd_current_width, memory_order_relaxed); }
+unsigned char tsd_test_last_patched_width(void) { return atomic_load_explicit(&g_tsd_last_patched_width, memory_order_relaxed); }
+simd_width_t tsd_test_detect_host_max(void) { return tsd_cpu_detect_ignoring_override(&g_tsd_config); }
+int tsd_test_patch(simd_width_t width) { return tsd_trampoline_patch(width); }
+int tsd_test_inactive_page_writable(void) { return tsd_trampoline_inactive_page_writable(); }
+perf_ctx_t* tsd_test_init_perf(void) { return tsd_perf_init(workload_once); }
+void tsd_test_measure_baseline(perf_ctx_t *ctx) { tsd_perf_measure_baseline(ctx, &g_tsd_config); }
+void tsd_test_cleanup_perf(perf_ctx_t *ctx) { tsd_perf_cleanup(ctx); }
+perf_ctx_t* tsd_test_perf_create_dummy_context(void) { return tsd_perf_test_create_dummy_context(); }
+void tsd_test_perf_destroy_dummy_context(perf_ctx_t *ctx) { tsd_perf_test_destroy_dummy_context(ctx); }
+void tsd_test_perf_set_group_fd(perf_ctx_t *ctx, int fd) { tsd_perf_test_set_group_fd(ctx, fd); }
+void tsd_test_perf_set_llc_fd(perf_ctx_t *ctx, int fd) { tsd_perf_test_set_llc_fd(ctx, fd); }
+void tsd_test_perf_set_mode(perf_ctx_t *ctx, tsd_perf_mode_t mode) { tsd_perf_test_set_mode(ctx, mode); }
+void tsd_test_perf_set_read_streams(const tsd_perf_test_read_stream_t *streams, size_t count) { tsd_perf_test_set_read_streams(streams, count); }
+void tsd_test_perf_clear_read_streams(void) { tsd_perf_test_clear_read_streams(); }
+uint64_t tsd_test_perf_get_baseline_cpi(const perf_ctx_t *ctx) { return tsd_perf_test_get_baseline_cpi(ctx); }
+uint64_t tsd_test_perf_get_baseline_mpki(const perf_ctx_t *ctx) { return tsd_perf_test_get_baseline_mpki(ctx); }
+int tsd_test_perf_get_last_group_valid(const perf_ctx_t *ctx) { return tsd_perf_test_get_last_group_valid(ctx); }
+uint64_t tsd_test_perf_get_last_llc_value(const perf_ctx_t *ctx) { return tsd_perf_test_get_last_llc_value(ctx); }
 #endif
