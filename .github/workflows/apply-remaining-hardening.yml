@@ -5,6 +5,7 @@ on:
     branches: [deep-runtime-hardening-v0.4]
     paths:
       - 'ci/apply_remaining_hardening.py'
+      - 'ci/apply_counter_abi.py'
       - '.github/workflows/apply-remaining-hardening.yml'
 
 permissions:
@@ -22,13 +23,19 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential cmake ninja-build clang
-      - name: Apply guarded transform
-        run: python3 ci/apply_remaining_hardening.py
+      - name: Apply guarded transforms
+        run: |
+          python3 ci/apply_counter_abi.py
+          python3 ci/apply_remaining_hardening.py
       - name: Validate diff
         run: |
           git diff --check
           if git grep -n 'TSD_ALLOW_SOFTWARE_UPGRADES' -- src include; then
             echo 'legacy software-upgrade authority remains in production source/header' >&2
+            exit 1
+          fi
+          if git grep -n 'extern std::atomic' -- include; then
+            echo 'C++ ABI still exposes foreign atomic representation' >&2
             exit 1
           fi
       - name: GCC build and full tests
@@ -48,7 +55,7 @@ jobs:
         run: make clean all
       - name: Commit validated hardening only
         run: |
-          rm -f ci/apply_remaining_hardening.py .github/workflows/apply-remaining-hardening.yml
+          rm -f ci/apply_remaining_hardening.py ci/apply_counter_abi.py .github/workflows/apply-remaining-hardening.yml
           git add -A
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
