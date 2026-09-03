@@ -12,20 +12,12 @@ void TelemetryBus::publish(TelemetrySignal signal, const TelemetryReading &readi
     std::lock_guard<std::mutex> lock(mutex_);
     auto &slot = readings_[signal];
 
-    /*
-     * Arbitration is freshness-first among valid samples and quality is the
-     * deterministic tie-breaker. An invalid sample never evicts a valid one.
-     * This avoids the previous OR rule where an older equal-quality reading
-     * could replace a newer sample, while still allowing a fresh lower-quality
-     * fallback source to keep the signal alive when a preferred source stalls.
-     */
-    if (reading.valid) {
-        if (!slot.valid || reading.timestamp > slot.timestamp ||
-            (reading.timestamp == slot.timestamp && reading.quality > slot.quality)) {
-            slot = reading;
-        }
-    } else if (!slot.valid &&
-               (slot.timestamp.time_since_epoch().count() == 0 || reading.timestamp > slot.timestamp)) {
+    /* Freshness is authoritative. A newer invalid observation must invalidate
+     * an older good sample; otherwise sensor loss is hidden until the stale
+     * reading ages out. Quality is only a tie-breaker at equal timestamps. */
+    if (slot.timestamp.time_since_epoch().count() == 0 ||
+        reading.timestamp > slot.timestamp ||
+        (reading.timestamp == slot.timestamp && reading.quality > slot.quality)) {
         slot = reading;
     }
 }
@@ -33,9 +25,7 @@ void TelemetryBus::publish(TelemetrySignal signal, const TelemetryReading &readi
 std::optional<TelemetryReading> TelemetryBus::latest(TelemetrySignal signal) const {
     std::lock_guard<std::mutex> lock(mutex_);
     auto it = readings_.find(signal);
-    if (it == readings_.end()) {
-        return std::nullopt;
-    }
+    if (it == readings_.end()) return std::nullopt;
     return it->second;
 }
 
@@ -52,9 +42,7 @@ std::shared_ptr<TelemetryBus> TelemetryBusManager::bus() const {
 }
 
 void TelemetryBusManager::add_collector(std::shared_ptr<TelemetryCollector> collector) {
-    if (!collector) {
-        return;
-    }
+    if (!collector) return;
     std::lock_guard<std::mutex> lock(mutex_);
     collectors_.push_back(std::move(collector));
 }
@@ -72,14 +60,9 @@ void TelemetryBusManager::poll(std::chrono::steady_clock::time_point now) {
         bus = bus_;
         collectors = collectors_;
     }
-    if (!bus) {
-        return;
-    }
+    if (!bus) return;
     for (auto &collector : collectors) {
-        if (!collector) {
-            continue;
-        }
-        collector->collect(*bus, now);
+        if (collector) collector->collect(*bus, now);
     }
 }
 
