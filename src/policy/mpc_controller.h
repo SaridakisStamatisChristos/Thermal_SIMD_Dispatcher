@@ -52,8 +52,7 @@ private:
                       size_t horizon,
                       double forecast_ratio,
                       double ratio_trend,
-                      double forecast_temp,
-                      double ratio_error) const;
+                      double forecast_temp) const;
     size_t historyLimit() const;
 
     tsd_policy_config config_{};
