@@ -24,6 +24,12 @@ public:
     std::size_t requiredHistory() const { return required_history_; }
     std::uint64_t stalenessWindowMs() const { return staleness_window_ms_; }
 
+    /* Explicit control-input effects used to evaluate candidate width changes.
+     * Positive temperature cost means wider SIMD projects hotter; positive
+     * performance benefit means wider SIMD projects a lower CPI ratio. */
+    double widthTemperatureMillicPerStep() const { return width_temperature_millic_per_step_; }
+    double widthPerformanceBenefitMilliPerStep() const { return width_performance_benefit_milli_per_step_; }
+
 private:
     bool parseContent(const std::string &content, std::string *error_out);
 
@@ -39,6 +45,8 @@ private:
     bool coefficients_loaded_;
     std::size_t required_history_;
     std::uint64_t staleness_window_ms_;
+    double width_temperature_millic_per_step_;
+    double width_performance_benefit_milli_per_step_;
 };
 
 }  // namespace policy
