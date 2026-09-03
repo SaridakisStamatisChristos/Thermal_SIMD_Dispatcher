@@ -13,6 +13,8 @@ static tsd_thermal_eval_t make_sample(uint32_t ratio_milli, int32_t temp_millic)
     sample.thermal_severity_milli = ratio_milli;
     sample.temp_available = 1;
     sample.package_temp_millic = temp_millic;
+    sample.filtered_temp_available = 1;
+    sample.filtered_package_temp_millic = temp_millic;
     sample.freq_ratio_available = 0;
     sample.memory_bound = 0;
     return sample;
@@ -22,6 +24,8 @@ static tsd_thermal_eval_t make_sample_without_temperature(uint32_t ratio_milli) 
     tsd_thermal_eval_t sample = make_sample(ratio_milli, 0);
     sample.temp_available = 0;
     sample.package_temp_millic = 0;
+    sample.filtered_temp_available = 0;
+    sample.filtered_package_temp_millic = 0;
     sample.thermal_severity_milli = 0;
     return sample;
 }
@@ -49,7 +53,6 @@ static void test_predictive_convergence(void) {
     assert(fallback == 0);
     assert(rc == 1);
     assert(target < SIMD_AVX512);
-    (void)rc;
 
     tsd_dispatcher_policy_destroy(state);
 }
@@ -76,12 +79,11 @@ static void test_predictive_stability(void) {
     assert(fallback == 0);
     assert(rc == 0);
     assert(target == SIMD_AVX2);
-    (void)rc;
 
     tsd_dispatcher_policy_destroy(state);
 }
 
-static void test_missing_temperature_is_not_zero_celsius(void) {
+static void test_missing_temperature_does_not_invent_thermal_relief(void) {
     tsd_policy_config cfg;
     tsd_policy_config_set_defaults(&cfg);
     cfg.slo_ratio_milli = 1500;
@@ -102,14 +104,12 @@ static void test_missing_temperature_is_not_zero_celsius(void) {
     int fallback = 0;
     int rc = tsd_dispatcher_policy_recommend(state, SIMD_AVX2, SIMD_AVX2, &target, &fallback);
 
-    /*
-     * Ratio-only scoring improves by exactly one cost unit when stepping down.
-     * Treating missing temperature as 0 C adds a synthetic 0.01 penalty and
-     * suppresses the transition; correct missing-data handling preserves it.
-     */
+    /* Missing temperature is neither 0 C nor evidence that narrowing will
+       relieve thermal throttling. Keep the current width instead of inventing
+       a physical benefit from absent telemetry. */
     assert(fallback == 0);
-    assert(rc == 1);
-    assert(target == SIMD_SSE41);
+    assert(rc == 0);
+    assert(target == SIMD_AVX2);
 
     tsd_dispatcher_policy_destroy(state);
 }
@@ -129,7 +129,6 @@ static void test_predictive_fallback(void) {
     assert(rc == 0);
     assert(fallback == 1);
     assert(target == SIMD_AVX2);
-    (void)rc;
 
     tsd_dispatcher_policy_destroy(state);
 }
@@ -137,7 +136,7 @@ static void test_predictive_fallback(void) {
 int main(void) {
     test_predictive_convergence();
     test_predictive_stability();
-    test_missing_temperature_is_not_zero_celsius();
+    test_missing_temperature_does_not_invent_thermal_relief();
     test_predictive_fallback();
     printf("policy controller tests passed\n");
     return 0;
