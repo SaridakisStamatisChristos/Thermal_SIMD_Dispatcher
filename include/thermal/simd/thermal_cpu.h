@@ -10,8 +10,14 @@
 extern "C" {
 #endif
 
+/*
+ * Assembly compatibility byte. C/C++ callers should use
+ * tsd_cpu_avx_available() so reads pair with the atomic capability publish in
+ * thermal_cpu.c.
+ */
 extern uint8_t g_tsd_avx_available;
 
+int tsd_cpu_avx_available(void);
 simd_width_t tsd_detect_max_simd(const tsd_runtime_config *cfg);
 int tsd_cpu_has_sse41(void);
 
