@@ -87,6 +87,75 @@ void test_arx_prediction_basic() {
     assert(model.stalenessWindowMs() == 250);
 }
 
+void test_arx_requires_complete_history_and_temperature_lags() {
+    auto path = writeCoefficients(
+        "coeff_warmup.json",
+        R"JSON({
+  "bias": 50.0,
+  "ar_temperature": [0.7, 0.2, 0.1],
+  "ratio": [0.01, 0.005],
+  "severity": [0.0],
+  "ma": 0.0,
+  "staleness_window_ms": 250
+})JSON");
+
+    ARXModel model;
+    std::string error;
+    assert(model.loadFromFile(path.string(), &error));
+    assert(model.requiredHistory() == 3);
+
+    TelemetrySample sample{};
+    sample.temperature_millic = 80000.0;
+    sample.temp_valid = true;
+    sample.ratio_milli = 1400.0;
+    sample.trimmed_ratio_milli = 1400.0;
+    sample.timestamp = std::chrono::steady_clock::now();
+
+    std::deque<TelemetrySample> history;
+    history.push_back(sample);
+
+    bool prediction_ok = true;
+    assert(model.predict(history, &prediction_ok) == 0.0);
+    assert(!prediction_ok);
+
+    sample.temperature_millic = 80500.0;
+    history.push_back(sample);
+    prediction_ok = true;
+    assert(model.predict(history, &prediction_ok) == 0.0);
+    assert(!prediction_ok);
+
+    sample.temperature_millic = 81000.0;
+    history.push_back(sample);
+    history[1].temp_valid = false;
+    prediction_ok = true;
+    assert(model.predict(history, &prediction_ok) == 0.0);
+    assert(!prediction_ok);
+
+    history[1].temp_valid = true;
+    prediction_ok = false;
+    double prediction = model.predict(history, &prediction_ok);
+    assert(prediction_ok);
+    assert(std::isfinite(prediction));
+    assert(prediction > 0.0);
+}
+
+void test_arx_rejects_nonfinite_coefficients() {
+    auto path = writeCoefficients(
+        "coeff_nonfinite.json",
+        R"JSON({
+  "bias": 1e309,
+  "ar_temperature": [1.0],
+  "ratio": [0.0],
+  "severity": [0.0],
+  "ma": 0.0
+})JSON");
+
+    ARXModel model;
+    std::string error;
+    assert(!model.loadFromFile(path.string(), &error));
+    assert(!error.empty());
+}
+
 void test_mpc_staleness_guard() {
     auto path = writeCoefficients(
         "coeff_stale.json",
@@ -182,6 +251,8 @@ void test_mpc_explicit_reload() {
 
 int main() {
     test_arx_prediction_basic();
+    test_arx_requires_complete_history_and_temperature_lags();
+    test_arx_rejects_nonfinite_coefficients();
     test_mpc_staleness_guard();
     test_mpc_explicit_reload();
     std::printf("policy ARX model tests passed\n");
