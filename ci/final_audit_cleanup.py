@@ -127,7 +127,7 @@ for filename in ["tests/test_thermal_simd.c", "tests/stress/stress_common.c", "t
 doc_replacements = {
     "docs/runbooks/sensor-failure.md": [
         ("Hardware perf loss enters software/degraded mode and blocks wider upgrades by\ndefault. Missing or stale raw temperature also blocks wider authorization.\nDo not set `TSD_ALLOW_SOFTWARE_UPGRADES` during incident response; it is an\nexplicit override of the conservative behavior. Liveness remains healthy so\n",
-         "Hardware perf loss enters software/degraded mode and blocks wider upgrades\nunconditionally. Missing or stale raw temperature also blocks wider authorization.\nThe historical `TSD_ALLOW_SOFTWARE_UPGRADES` variable is ignored by the runtime and\ncannot restore wider SIMD authority. Liveness remains healthy so\n"),
+         "Hardware perf loss enters software/degraded mode and blocks wider upgrades\nunconditionally. Missing or stale raw temperature also blocks wider authorization.\nThe historical software-upgrade override is ignored by the runtime and cannot\nrestore wider SIMD authority. Liveness remains healthy so\n"),
     ],
     "docs/telemetry-fusion.md": [
         ("3. fails closed to SSE4.1 by default;\n4. continuously denies wider SIMD while software mode remains active unless `TSD_ALLOW_SOFTWARE_UPGRADES` is explicitly enabled;\n5.",
