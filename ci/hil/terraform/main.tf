@@ -56,20 +56,17 @@ resource "aws_iam_role" "hil_runner" {
   })
 }
 
-resource "aws_iam_role_policy" "hil_runner" {
-  name = "${var.project}-hil-runner"
+resource "aws_iam_role_policy" "hil_runner_token" {
+  name = "${var.project}-hil-runner-token"
   role = aws_iam_role.hil_runner.id
 
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [
       {
-        Action = [
-          "ec2:DescribeInstances",
-          "ec2:DescribeInstanceAttribute"
-        ]
+        Action   = "ssm:GetParameter"
         Effect   = "Allow"
-        Resource = "*"
+        Resource = var.runner_authentication_token_parameter_arn
       }
     ]
   })
@@ -84,6 +81,8 @@ locals {
 }
 
 resource "aws_instance" "hil_runner" {
+  depends_on = [aws_iam_role_policy.hil_runner_token]
+
   ami                         = var.ami_id
   instance_type               = var.instance_type
   subnet_id                   = var.subnet_id
@@ -98,14 +97,16 @@ resource "aws_instance" "hil_runner" {
   }
 
   metadata_options {
-    http_endpoint = "enabled"
+    http_endpoint               = "enabled"
+    http_tokens                 = "required"
+    http_put_response_hop_limit = 1
   }
 
   user_data = templatefile("${path.module}/user_data.sh.tpl", {
-    runner_registration_token = var.runner_registration_token
-    runner_tags               = join(",", var.runner_tags)
-    runner_name               = "${var.project}-hil-runner"
-    runner_coordinator_url    = var.runner_coordinator_url
+    runner_authentication_token_parameter_arn = var.runner_authentication_token_parameter_arn
+    runner_name                               = "${var.project}-hil-runner"
+    runner_coordinator_url                    = var.runner_coordinator_url
+    runner_region                             = var.region
   })
 
   root_block_device {

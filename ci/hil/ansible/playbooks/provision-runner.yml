@@ -2,7 +2,5 @@
 - name: Provision AVX-512 hardware-in-the-loop runners
   hosts: hil_runners
   become: true
-  vars:
-    enable_trampoline_validations: true
   roles:
     - runner

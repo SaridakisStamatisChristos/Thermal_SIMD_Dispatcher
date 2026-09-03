@@ -138,6 +138,11 @@ if(TSD_BUILD_BENCHMARKS)
     add_executable(benchmark_dispatch benchmarks/dispatch_overhead.c)
     target_link_libraries(benchmark_dispatch PRIVATE thermal_simd_core)
     target_compile_options(benchmark_dispatch PRIVATE -O3 -Wall -Wextra)
+
+    add_executable(benchmark_registered_kernel benchmarks/registered_kernel.c)
+    target_link_libraries(benchmark_registered_kernel PRIVATE thermal_simd_core Threads::Threads)
+    target_compile_options(benchmark_registered_kernel
+        PRIVATE -O3 -Wall -Wextra -Wpedantic -Werror=return-type -mno-avx -msse4.1)
 endif()
 
 if(BUILD_TESTING)
@@ -145,6 +150,9 @@ if(BUILD_TESTING)
     # assert()-based regression checks. Tests must validate the same invariants
     # in every configuration, including the normal Release CI job.
     add_compile_options(-UNDEBUG)
+
+    add_test(NAME hil_common_helpers
+             COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/hil/test_hil_common.sh)
 
     add_library(thermal_simd_core_tests STATIC ${THERMAL_SIMD_CORE_SOURCES})
     target_include_directories(thermal_simd_core_tests

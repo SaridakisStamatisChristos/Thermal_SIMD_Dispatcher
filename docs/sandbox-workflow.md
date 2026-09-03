@@ -1,61 +1,69 @@
-# Sandbox Workflow
+# Software and Startup Sandbox Workflow
 
-This workflow describes how to exercise the dispatcher in a non-production sandbox using synthetic telemetry and workload shims. It underpins developer testing, QA sign-off, and security reviews.
+This repository uses “sandbox” in two concrete ways:
 
-## Goals
-- Provide a reproducible environment for stress-testing SIMD patching and thermal controls.
-- Simulate adverse telemetry conditions (dropouts, noisy sensors) without touching production hardware.
-- Validate packaging artifacts prior to release.
+1. the executable's bounded startup diagnostic (`--sandbox-only` or
+   `--health-check`);
+2. the hosted [Sandbox Regression workflow](../.github/workflows/sandbox.yml),
+   which runs deterministic policy/telemetry tests and forced software-perf
+   behavior.
 
-## Components
-| Component | Location | Purpose |
-| --- | --- | --- |
-| Sandbox runner | `ci/sandbox/run.sh` | Orchestrates containers, mounts perf/MSR devices, and collects logs. |
-| Synthetic workload | `tests/fixtures/synthetic_workload.so` | Generates CPU-bound loops parameterized by SIMD width. |
-| Telemetry fuzzer | `tools/telemetry_fuzzer.py` | Injects jitter, dropouts, and outliers into telemetry stream. |
-| Metrics harness | `tools/metrics_probe.py` | Scrapes `/metrics` and `/healthz` during test runs. |
+It does not contain a container orchestrator under `ci/sandbox`, an injectable
+telemetry Unix socket, telemetry fuzzer, synthetic workload shared object or
+metrics-probe tool.
 
-## Setup
-1. Build the dispatcher image:
-   ```bash
-   make sandbox-image
-   ```
-   This targets `packaging/Dockerfile` with sandbox overlays (installs telemetry fuzzer dependencies and debug symbols).
+## Startup diagnostic
 
-2. Provision local capabilities:
-   ```bash
-   sudo modprobe msr
-   sudo setcap cap_sys_admin,cap_perfmon+ep ./build/thermal_simd
-   ```
+Build and run:
 
-3. Launch the sandbox runner:
-   ```bash
-   ci/sandbox/run.sh --workload synthetic --duration 120 \
-     --telemetry-fuzzer tools/telemetry_fuzzer.py \
-     --metrics-probe tools/metrics_probe.py \
-     --enable-metrics
-   ```
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
+cmake --build build --target thermal_simd -j
+./build/thermal_simd --sandbox-only --metrics-port=0
+```
 
-## Workflow Details
-- The runner starts the dispatcher container with `--health-check` followed by a steady-state workload phase.
-- Telemetry fuzzer attaches over a Unix domain socket exposed by the dispatcher (`/run/tsd/telemetry.sock`).
-- Metrics probe scrapes `localhost:9464` and writes results to `artifacts/metrics.ndjson`.
-- Sandbox artifacts (logs, metrics, telemetry traces) land under `artifacts/YYYYmmdd-HHMMSS/` for upload to CI.
+The diagnostic checks the immutable trampoline mapping, initializes the perf
+subsystem and requires a hardware perf mode plus at least one temperature or
+frequency telemetry source. It exits after reporting success/failure. Run it
+under the same user, capabilities, cpuset and sysfs mounts as the intended
+service; running it as an administrator does not validate the service identity.
 
-## Scenarios
-| Scenario | Flag | Description |
-| --- | --- | --- |
-| Telemetry dropout | `--telemetry-fuzzer dropout` | Randomly zeroes temperature/frequency for bursts of 500ms. |
-| Thermal spike | `--telemetry-fuzzer spike --spike-temp 15` | Injects sudden 15°C spike; expect downgrade and cooldown. |
-| Sensor skew | `--telemetry-fuzzer skew --skew-ms 40` | Pushes collector skew beyond `max_skew_ms` to validate staleness guard. |
-| Metrics outage | `--disable-metrics` | Ensures dispatcher stays operational without exporters (logs degrade). |
+`--health-check` includes the same startup checks and exits with status. Normal
+persistent startup also runs the sandbox and stays locked to SSE4.1 safe mode
+when it fails.
 
-## Exit Criteria
-- Dispatcher exits 0.
-- `artifacts/*/metrics.ndjson` contains expected counters (`predictive_decisions_total > 0` during spike scenario).
-- No `state=emergency` logs during nominal runs.
+## Deterministic software-perf path
 
-## Automation
-- CI job `ci/sandbox.yml` runs the workflow nightly with dropout and spike scenarios.
-- Developers can run `make sandbox-smoke` to execute a shortened (60s) scenario before pushing.
-- Security reviews require attaching sandbox artifacts to the compliance ticket (see `docs/security/threat-model.md`).
+`TSD_FAKE_PERF=1` is a development/test override that forces recoverable
+software mode without changing host perf permissions:
+
+```bash
+TSD_FAKE_PERF=1 ./build/thermal_simd \
+  --no-avx512 --duration-sec=1 --metrics-port=0
+```
+
+This validates fail-closed behavior, not hardware recovery or thermal
+performance. Never present it as HIL evidence and do not configure it in
+production.
+
+## Hosted regression suite
+
+Run the same bounded targets used by `.github/workflows/sandbox.yml`:
+
+```bash
+ctest --test-dir build --output-on-failure \
+  -R 'telemetry|policy|runtime_config'
+TSD_FAKE_PERF=1 ./build/thermal_simd \
+  --no-avx512 --duration-sec=1 --work-iters=100000 --metrics-port=0
+```
+
+The broader CTest suite also includes telemetry-fusion concurrency and three
+bounded stress executables. Their command-line options can be increased for
+longer software stress, but they still do not replace bare-metal HIL.
+
+## Evidence boundary
+
+Hosted runs may establish parser, policy, lifecycle, concurrency and failover
+invariants. Only [`ci/thermal-soak.sh`](../ci/thermal-soak.sh) on a suitable
+self-hosted machine produces the target-aware perf/temperature/ISA evidence
+described in [`ci-hil.md`](ci-hil.md).

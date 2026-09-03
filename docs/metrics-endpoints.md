@@ -1,76 +1,99 @@
-# Metrics Endpoints
+# Metrics and Health Endpoints
 
-The dispatcher exports metrics and health data via a multi-channel strategy tailored for on-host scraping, fleet-wide aggregation, and incident response.
+The runtime provides an in-process metrics registry, a small HTTP exporter and
+an optional StatsD sink. The implementation is in
+[`src/observability/metrics.cpp`](../src/observability/metrics.cpp),
+[`src/runtime_metrics.c`](../src/runtime_metrics.c) and
+[`src/observability/statsd_exporter.cpp`](../src/observability/statsd_exporter.cpp).
 
-## Architecture
-- **In-process registry:** `metrics/registry.c` tracks counters, gauges, and histograms. All subsystems register metrics during initialization.
-- **Snapshot API:** `metrics/snapshot.h` exposes `metrics_snapshot_collect()` which produces a read-only view of the current values.
-- **Exporters:**
-- **Prometheus text endpoint** on `localhost:9464/metrics` (TLS enabled via `--metrics-cert` / `--metrics-key`).
-  - **StatsD UDP exporter** (disabled by default) configured via `--statsd-host` and `--statsd-port`.
-  - **Structured logs** that emit metric deltas under `event=metrics_flush` for environments without scrape support.
+## HTTP exporter
 
-## Prometheus Endpoint
-- Implemented in `metrics/prometheus_server.c`.
-- Runs on a dedicated thread, using `epoll` and non-blocking I/O to support high-frequency scrapes.
-- Supports basic authentication when `--metrics-basic-auth` is provided (format `user:pass`).
-- TLS requires pointing `--metrics-cert` and `--metrics-key` at PEM files with read-only permissions.
-- Exports default process metrics (RSS, file descriptors) alongside dispatcher-specific gauges.
+The exporter listens on `127.0.0.1:9464` by default. `--metrics-port=0`
+disables it. It uses four request workers, a bounded 32-client queue, an 8 KiB
+request limit and two-second client I/O timeouts so a stalled client cannot
+indefinitely occupy every probe worker.
 
-### Key Metrics
-| Metric | Type | Description |
+Only `GET` is supported. Basic authentication, when configured, applies to all
+three endpoints:
+
+| Endpoint | Success status | Meaning |
 | --- | --- | --- |
-| `predictive_forecasts_total` | Counter | Forecast cycles executed by the predictive controller. |
-| `predictive_decisions_total` | Counter | Control loop iterations that issued a predictive decision. |
-| `predictive_abs_error_millic_total` | Counter | Accumulated absolute error between forecast and observed temperature. |
-| `predictive_stale_samples_total` | Counter | Telemetry snapshots rejected because they exceeded the staleness window. |
-| `predictive_coeff_reload_total` | Counter | Successful coefficient reloads (startup and SIGHUP). |
-| `predictive_coeff_reload_errors_total` | Counter | Failed attempts to reload the coefficient file. |
-| `telemetry_snapshots_total` | Counter | Telemetry fusion snapshots published. |
-| `telemetry_degraded_total` | Counter | Snapshots flagged as degraded due to missing signals. |
-| `patch_transitions_total` | Counter | Successful SIMD trampoline swaps. |
-| `patch_failures_total` | Counter | Failed trampoline swaps (auto rollback). |
-| `software_timeout_escalations_total` | Counter | Dispatch loop timeouts. |
-| `health_check_failures_total` | Counter | Failed health-check runs. |
-| `metrics_flush_duration_ms` | Histogram | Latency of exporter flush cycles. |
+| `/metrics` | 200 | Prometheus text snapshot. |
+| `/healthz` | 200 while the exporter is running | Process/exporter liveness. Recoverable dependency degradation remains live and is visible in the JSON body. |
+| `/readyz` | 200 when strict dependency checks pass; otherwise 503 | Operational readiness for adaptive dispatch. |
 
-### Configuration Flags
+Readiness requires controller, telemetry-fusion and perf snapshots newer than
+five seconds, no controller fallback, running/non-degraded fusion, and healthy
+hardware perf counters. The `/healthz` and `/readyz` bodies contain the same
+controller, fusion and perf state; their status-code semantics differ.
+
+Other responses are 401 for failed authentication, 404 for an unknown path, 405
+for a non-GET request, and 400/408 for malformed, oversized or timed-out
+requests.
+
+## Prometheus metrics
+
+The current `/metrics` payload exposes:
+
+| Metric family | Meaning |
+| --- | --- |
+| `tsd_patch_transitions_total` | Selection attempts by source width, target width and outcome. |
+| `tsd_dwell_time_ms_{sum,count,max}` | Observed dwell durations by SIMD width. |
+| `tsd_sensor_health_ratio` | Last reported sensor-health ratio by sensor and socket. |
+| `tsd_sensor_quality_ratio` | Last reported sensor-quality ratio by sensor and socket. |
+| `tsd_sensor_health_valid` | Whether the last sensor report was valid. |
+| `tsd_sensor_health_timestamp_seconds` | UNIX timestamp of the last sensor report. |
+| `tsd_package_temperature_c` | Raw safety and filtered control temperatures when available. |
+| `tsd_package_temperature_available` | Availability of the raw and filtered temperature channels. |
+
+The C runtime also maintains atomic counters through the public snapshot API in
+[`include/thermal/simd/metrics.h`](../include/thermal/simd/metrics.h). Those
+counters are available to an embedding application, but they are not currently
+duplicated in the Prometheus payload.
+
+## Configuration
+
 | Flag | Description | Default |
 | --- | --- | --- |
-| `--metrics-port` | Listen port for HTTP endpoint. | 9464 |
-| `--metrics-addr` | Bind address. | `127.0.0.1` |
-| `--metrics-cert` / `--metrics-key` | Enable TLS for Prometheus endpoint. | Disabled |
-| `--metrics-ca` | Client CA bundle for mutual TLS. | Disabled |
-| `--metrics-require-client-auth` | Enforce mTLS for `/metrics` and `/healthz`. | Disabled |
-| `--metrics-basic-auth` | `user:pass` credentials for basic auth. | None |
-| `--statsd-host` | StatsD host for UDP export. | Disabled |
-| `--statsd-port` | StatsD port. | 8125 |
-| `--metrics-interval` | Interval (ms) between StatsD flushes. | 1000 |
+| `--metrics-port` | HTTP listen port; `0` disables the exporter. | `9464` |
+| `--metrics-bind` | Numeric IPv4 bind address. | `127.0.0.1` |
+| `--metrics-cert` / `--metrics-key` | PEM certificate and private key; both are required to enable TLS. | disabled |
+| `--metrics-ca` | Optional client CA bundle. | unset |
+| `--metrics-require-client-auth` | Require a verified client certificate; also requires `--metrics-ca`. | false |
+| `--metrics-basic-auth` | Credentials in `user:pass` form. | unset |
+| `--statsd-host` | Enables StatsD event export when nonempty. | unset |
+| `--statsd-port` | StatsD UDP destination port. | `8125` |
 
-Environment variables mirror flags with `TSD_METRICS_*` prefix.
+The equivalent JSON keys are documented in
+[`docs/configuration.md`](configuration.md). There is no `--metrics-interval`
+option and metrics flags are not implicitly mirrored by environment variables.
 
-## StatsD Export
-- Located in `metrics/statsd_exporter.c`.
-- Encodes counters as `metric.name:delta|c`, gauges as `metric.name:value|g`.
-- Batches packets up to 512 bytes to respect network MTU and reduce UDP loss.
-- Controlled by `--statsd-host`, `--statsd-port`, and `--metrics-interval`.
+TLS uses OpenSSL and enforces TLS 1.2 or newer. Supplying a CA without requiring
+client authentication loads it for verification configuration but does not by
+itself require a client certificate. Bind to a non-loopback address only when
+network policy and authentication match the deployment threat model.
 
-## Structured Logs
-- Enabled via `--log-level=info` or lower.
-- Every `metrics_interval` milliseconds, emit `event=metrics_flush` with JSON payload.
-- Downstream log shippers (Fluent Bit, Vector) parse and forward to time-series databases.
+## StatsD
 
-## Health Probes
-- `GET /healthz` (same port as Prometheus) returns 200 when the dispatcher is not degraded and telemetry is fresh.
-- Returns 429 when telemetry is stale or predictive controller is in emergency mode.
-- Fails closed (503) if patching subsystem reports unrecoverable errors.
+StatsD is disabled until a host is configured. Counter and gauge datagrams are
+sent immediately when the corresponding transition, dwell or sensor event is
+recorded. Each event is one UDP datagram; there is no batching thread or
+periodic structured-log flush.
 
-## Security Considerations
-- Metrics endpoint binds to localhost by default; production deployments front it with mTLS-enabled sidecars.
-- Basic auth credentials are read from an environment variable `TSD_METRICS_BASIC_AUTH` when not specified via CLI.
-- TLS private keys should be mounted read-only and owned by the service account UID (`sduser`).
+Example names include:
 
-## Testing & CI
-- `tests/metrics_endpoint_test.cpp` validates Prometheus output formatting.
-- CI runs `tests/smoke.sh --metrics` to ensure endpoint readiness.
-- `ci/hw-smoke.sh` scrapes the endpoint from a separate node to validate TLS and basic auth wiring.
+```text
+tsd.patch_transition.avx2.avx512.success:1|c
+tsd.dwell.observed.avx2:125.000|g
+tsd.sensor.package.socket0.health:1.000|g
+```
+
+UDP delivery is best effort. A DNS, socket or send failure does not stop the
+dispatcher.
+
+## Testing
+
+[`tests/observability/test_metrics_exporter.cpp`](../tests/observability/test_metrics_exporter.cpp)
+checks Prometheus formatting, raw/filtered temperature channels, TLS, Basic
+Auth, strict readiness versus liveness, StatsD emission and probe availability
+while another TLS client stalls.

@@ -64,7 +64,7 @@ sudo cmake --install build-install
 External CMake projects can consume the installed package with:
 
 ```cmake
-find_package(thermal_simd_dispatcher 0.3 CONFIG REQUIRED)
+find_package(thermal_simd_dispatcher 0.4 CONFIG REQUIRED)
 target_link_libraries(my_target PRIVATE thermal::simd)
 ```
 
@@ -168,6 +168,9 @@ cmake --build build-bench --target benchmark_dispatch -j
 
 See [`docs/benchmarking.md`](docs/benchmarking.md) for interpretation and
 reporting requirements. It intentionally makes no thermal or energy claim.
+The HIL path additionally builds `benchmark_registered_kernel`, whose SSE4.1,
+AVX2 and AVX-512 implementations perform identical checksum-verified integer
+work for fixed-width controls and adaptive application dispatch.
 
 ## Run
 
@@ -290,25 +293,29 @@ See [`docs/testing-matrix.md`](docs/testing-matrix.md) for the full subsystem ma
 
 ## Hardware-in-the-loop evidence
 
-`.github/workflows/hil.yml` is manual and runs only on self-hosted runners labelled `hil` and `avx512`.
+`.github/workflows/hil.yml` is manual. Select `avx2` or `avx512`; the job is
+routed to a self-hosted runner carrying `hil` plus the selected ISA label. The
+default `avx2` lane supports machines such as an Intel Core i5-9500.
 
 The characterization harness:
 
-- checks AVX-512F and explicitly opts into AVX-512;
+- preflights tools, CPU ISA, affinity, metrics-port availability and visible sensors;
+- creates a new artifact subdirectory for every run and never recursively deletes a caller-selected path;
 - records commit, kernel, CPU model, microcode, affinity, topology, governor, perf settings, and sensor/powercap metadata;
-- runs the persistent runtime;
+- alternates repeated, checksum-identical fixed SSE4.1/AVX2/(optional) AVX-512 registered-kernel controls;
+- runs the same registered kernel through persistent adaptive dispatch;
 - samples width, liveness/readiness, perf health, frequency, RAPL power where available, **raw safety temperature**, and **filtered control temperature**;
-- requires AVX-512 to actually be observed;
+- requires strict readiness and the selected AVX2 or AVX-512 width to execute application work;
 - terminates the runtime with SIGTERM and requires clean status-0 shutdown;
-- uploads CSV, JSONL, JSON summary, metadata, logs, and final Prometheus output.
+- uploads fixed-control CSV/JSON, adaptive CSV/JSONL, metadata, logs, and final Prometheus output.
 
 The summary keeps the historical `max_temperature_c`/`mean_temperature_c` keys as aliases of the raw safety channel and additionally records explicit raw and filtered statistics.
 
 This repository does **not** claim HIL evidence exists until the workflow has actually run on compatible hardware.
 
 ```bash
-ci/hw-smoke.sh
-SOAK_MINUTES=30 ci/thermal-soak.sh
+HIL_TARGET_ISA=avx2 ci/hw-smoke.sh
+HIL_TARGET_ISA=avx2 SOAK_MINUTES=30 ci/thermal-soak.sh
 ```
 
 ## Packaging
