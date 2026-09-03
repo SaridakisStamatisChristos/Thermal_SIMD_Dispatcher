@@ -102,7 +102,6 @@ static void reset_measurement_domain(perf_ctx_t *ctx) {
     }
     ctx->slow_cpi = 0;
     ctx->fast_cpi = 0;
-    ctx->calibrated_cpi_reference = 0;
     ctx->slow_llc_mpki = 0;
     ctx->fast_llc_mpki = 0;
     memset(ctx->ratio_history, 0, sizeof(ctx->ratio_history));
@@ -199,6 +198,8 @@ static void perf_set_mode(perf_ctx_t *ctx, tsd_perf_mode_t mode, const char *rea
     const char *why = reason ? reason : "unknown";
 
     if (mode == TSD_PERF_MODE_SOFTWARE) {
+        /* Hardware CPI is not comparable to software ns/work-item. */
+        ctx->calibrated_cpi_reference = 0;
         ctx->hardware_validated = 0;
         tsd_metrics_increment(TSD_METRIC_PERF_FALLBACKS);
         tsd_runtime_config_enter_degraded_mode(&g_tsd_config, why);
@@ -799,6 +800,7 @@ static int measure_hardware_baseline(perf_ctx_t *ctx, const tsd_runtime_config *
     }
 
     ctx->baseline_cpi = (delta_cycles * 1000) / delta_insns;
+    ctx->calibrated_cpi_reference = ctx->baseline_cpi ? ctx->baseline_cpi : 1;
     uint64_t delta_llc = (ctx->fd_llc_misses >= 0 && llc_after >= llc_before) ? (llc_after - llc_before) : 0;
     ctx->baseline_llc_mpki_milli = (delta_llc * MPKI_SCALE) / delta_insns;
     if (ctx->baseline_llc_mpki_milli == 0) {
@@ -852,6 +854,7 @@ void tsd_perf_measure_baseline(perf_ctx_t *ctx, const tsd_runtime_config *cfg) {
             surrogate_cpi = 1000;
         }
         ctx->baseline_cpi = surrogate_cpi;
+        ctx->calibrated_cpi_reference = surrogate_cpi;
         ctx->baseline_llc_mpki_milli = 1000;
         ctx->slow_cpi = ctx->fast_cpi = ctx->baseline_cpi;
         ctx->slow_llc_mpki = ctx->fast_llc_mpki = ctx->baseline_llc_mpki_milli;
@@ -1291,6 +1294,24 @@ void tsd_perf_test_set_mode(perf_ctx_t *ctx, tsd_perf_mode_t mode) {
         ctx->timeout_notified = 0;
         clock_gettime(CLOCK_MONOTONIC, &ctx->mode_entered_at);
     }
+}
+
+void tsd_perf_test_seed_cpi_reference(perf_ctx_t *ctx, uint64_t baseline_cpi) {
+    if (!ctx || baseline_cpi == 0) return;
+    ctx->baseline_cpi = baseline_cpi;
+    ctx->calibrated_cpi_reference = baseline_cpi;
+    ctx->slow_cpi = baseline_cpi;
+    ctx->fast_cpi = baseline_cpi;
+    memset(ctx->ratio_history, 0, sizeof(ctx->ratio_history));
+    ctx->ratio_history_count = 0;
+    ctx->ratio_history_cursor = 0;
+    ctx->ratio_trimmed_milli = 0;
+}
+
+int tsd_perf_test_process_cpi(perf_ctx_t *ctx, uint64_t current_cpi,
+                              tsd_thermal_eval_t *out, const tsd_runtime_config *cfg) {
+    tsd_telemetry_sample_t telemetry = {0};
+    return process_measurement(ctx, out, current_cpi, 0, cfg, &telemetry);
 }
 
 void tsd_test_perf_rewind_mode(perf_ctx_t *ctx, int seconds) {

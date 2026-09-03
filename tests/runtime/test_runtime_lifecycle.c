@@ -199,7 +199,6 @@ int main(void) {
     /* The old software-upgrade escape hatch is intentionally retired: a
        process-global ns/work-item estimator is not a safe authority across
        heterogeneous registered kernels. */
-    assert(setenv("TSD_ALLOW_SOFTWARE_UPGRADES", "1", 1) == 0);
     errno = 0;
     assert(tsd_trampoline_patch(SIMD_AVX2) != 0);
     assert(errno == EAGAIN);
@@ -256,7 +255,6 @@ int main(void) {
     assert(tsd_runtime_destroy(runtime) == 0);
 
     clear_observability_guard();
-    unsetenv("TSD_ALLOW_SOFTWARE_UPGRADES");
     unsetenv("TSD_FAKE_PERF");
     return 0;
 }

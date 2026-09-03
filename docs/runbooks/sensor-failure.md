@@ -23,10 +23,10 @@ recovered and fail-closed reasons.
 
 ## Safety behavior
 
-Hardware perf loss enters software/degraded mode and blocks wider upgrades by
-default. Missing or stale raw temperature also blocks wider authorization.
-Do not set `TSD_ALLOW_SOFTWARE_UPGRADES` during incident response; it is an
-explicit override of the conservative behavior. Liveness remains healthy so
+Hardware perf loss enters software/degraded mode and blocks wider upgrades
+unconditionally. Missing or stale raw temperature also blocks wider authorization.
+The historical software-upgrade override is ignored by the runtime and cannot
+restore wider SIMD authority. Liveness remains healthy so
 the runtime's bounded hardware re-probe can recover without an orchestrator
 restart loop.
 

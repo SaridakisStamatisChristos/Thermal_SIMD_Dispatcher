@@ -66,6 +66,24 @@ static void test_software_mode_never_authorizes_upgrades(void) {
     tsd_perf_test_destroy_dummy_context(ctx);
 }
 
+static void test_sustained_degradation_not_normalized_away(void) {
+    tsd_runtime_config_set_defaults(&g_tsd_config);
+    perf_ctx_t *ctx = tsd_perf_test_create_dummy_context();
+    assert(ctx != NULL);
+    tsd_perf_test_seed_cpi_reference(ctx, 1000);
+
+    tsd_thermal_eval_t eval = {0};
+    int throttled = 0;
+    for (int i = 0; i < 128; ++i) {
+        throttled = tsd_perf_test_process_cpi(ctx, 2000, &eval, &g_tsd_config);
+    }
+    assert(eval.ratio_milli >= 1900);
+    assert(eval.trimmed_ratio_milli >= 1900);
+    assert(eval.severity_milli > 0);
+    assert(throttled != 0);
+    tsd_perf_test_destroy_dummy_context(ctx);
+}
+
 static void test_group_progress_requires_actual_runtime(void) {
     assert(tsd_perf_test_group_progress_valid(100, 80, 1000, 500,
                                               200, 160, 2200, 1400) == 1);
@@ -136,6 +154,7 @@ static void test_fusion_is_reference_counted_and_cpu_coherent(void) {
 int main(void) {
     test_runtime_group_failure_fails_closed();
     test_software_mode_never_authorizes_upgrades();
+    test_sustained_degradation_not_normalized_away();
     test_group_progress_requires_actual_runtime();
     test_cpuset_selection_and_affinity_restoration();
     test_fusion_is_reference_counted_and_cpu_coherent();

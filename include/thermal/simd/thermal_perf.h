@@ -82,6 +82,9 @@ void tsd_perf_test_destroy_dummy_context(perf_ctx_t *ctx);
 void tsd_perf_test_set_group_fd(perf_ctx_t *ctx, int fd);
 void tsd_perf_test_set_llc_fd(perf_ctx_t *ctx, int fd);
 void tsd_perf_test_set_mode(perf_ctx_t *ctx, tsd_perf_mode_t mode);
+void tsd_perf_test_seed_cpi_reference(perf_ctx_t *ctx, uint64_t baseline_cpi);
+int tsd_perf_test_process_cpi(perf_ctx_t *ctx, uint64_t current_cpi,
+                              tsd_thermal_eval_t *out, const tsd_runtime_config *cfg);
 void tsd_perf_test_set_read_streams(const tsd_perf_test_read_stream_t *streams, size_t count);
 void tsd_perf_test_clear_read_streams(void);
 uint64_t tsd_perf_test_get_baseline_cpi(const perf_ctx_t *ctx);

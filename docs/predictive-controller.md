@@ -67,7 +67,7 @@ This is a finite candidate-selection problem. The implementation does not optimi
 2. `tsd_dispatcher_policy_recommend()` asks for a candidate width.
 3. If the predictive controller declines or is in fallback state, the runtime continues through the existing reactive hysteresis logic.
 4. Any wider target is independently gated by sandbox state, current perf mode and current package-temperature headroom.
-5. In software perf mode, wider SIMD is continuously prohibited unless `TSD_ALLOW_SOFTWARE_UPGRADES` is explicitly enabled.
+5. In software perf mode, wider SIMD is continuously prohibited and software mode never authorizes a wider target.
 6. If a different width remains authorized, `tsd_trampoline_patch()` selects the corresponding **immutable RX trampoline**.
 7. Cooldown and minimum-dwell constraints remain enforced by the dispatcher loop.
 

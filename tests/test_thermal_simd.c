@@ -32,7 +32,6 @@ static int run_monitor_thread_scenario(void) {
     perf_ctx_t *ctx = NULL;
 
     setenv("TSD_FAKE_PERF", "1", 1);
-    setenv("TSD_ALLOW_SOFTWARE_UPGRADES", "1", 1);
     tsd_test_reset_runtime();
     tsd_test_set_policy_counts(1, 1);
     tsd_test_set_timing(1000, 1, 1, 1);
@@ -145,7 +144,6 @@ out:
     tsd_test_set_fake_telemetry(NULL, 0);
     tsd_test_clear_patch_overrides();
     unsetenv("TSD_FAKE_PERF");
-    unsetenv("TSD_ALLOW_SOFTWARE_UPGRADES");
     return rc;
 }
 
