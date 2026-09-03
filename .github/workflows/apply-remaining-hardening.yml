@@ -1,0 +1,53 @@
+name: Apply Remaining Hardening
+
+on:
+  push:
+    branches: [deep-runtime-hardening-v0.4]
+    paths:
+      - 'ci/apply_remaining_hardening.py'
+      - '.github/workflows/apply-remaining-hardening.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  transform-build-test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: deep-runtime-hardening-v0.4
+          fetch-depth: 0
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake ninja-build clang
+      - name: Apply guarded transform
+        run: python3 ci/apply_remaining_hardening.py
+      - name: Validate diff
+        run: |
+          git diff --check
+          ! git grep -n 'TSD_ALLOW_SOFTWARE_UPGRADES' -- ':!README.md' ':!docs' || false
+      - name: GCC build and full tests
+        run: |
+          cmake -S . -B build-gcc -G Ninja -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTING=ON -DTSD_BUILD_BENCHMARKS=ON
+          cmake --build build-gcc
+          ctest --test-dir build-gcc --output-on-failure
+      - name: Clang build and full tests
+        env:
+          CC: clang
+          CXX: clang++
+        run: |
+          cmake -S . -B build-clang -G Ninja -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTING=ON
+          cmake --build build-clang
+          ctest --test-dir build-clang --output-on-failure
+      - name: Legacy Make build
+        run: make clean all
+      - name: Commit validated hardening only
+        run: |
+          rm -f ci/apply_remaining_hardening.py .github/workflows/apply-remaining-hardening.yml
+          git add -A
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'Finish deep-audit runtime hardening'
+          git push origin HEAD:deep-runtime-hardening-v0.4
