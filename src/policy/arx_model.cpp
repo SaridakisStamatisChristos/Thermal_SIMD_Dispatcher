@@ -83,9 +83,9 @@ bool parseDoubleField(const std::string &content,
     char *endptr = nullptr;
     errno = 0;
     double value = std::strtod(token.c_str(), &endptr);
-    if (errno != 0 || !endptr || *endptr != '\0') {
+    if (errno != 0 || !endptr || *endptr != '\0' || !std::isfinite(value)) {
         if (error_out) {
-            *error_out = "failed to parse double for field: " + key;
+            *error_out = "failed to parse finite double for field: " + key;
         }
         return false;
     }
@@ -113,9 +113,9 @@ bool parseUint64Field(const std::string &content,
     if (found) {
         *found = true;
     }
-    if (value < 0.0) {
+    if (value < 0.0 || value > static_cast<double>(UINT64_MAX)) {
         if (error_out) {
-            *error_out = "negative value for field: " + key;
+            *error_out = "out-of-range value for field: " + key;
         }
         return false;
     }
@@ -174,9 +174,9 @@ bool parseDoubleArrayField(const std::string &content, const std::string &key, s
         char *endptr = nullptr;
         errno = 0;
         double value = std::strtod(token.c_str(), &endptr);
-        if (errno != 0 || !endptr || *endptr != '\0') {
+        if (errno != 0 || !endptr || *endptr != '\0' || !std::isfinite(value)) {
             if (error_out) {
-                *error_out = "invalid numeric entry in array for field: " + key;
+                *error_out = "invalid finite numeric entry in array for field: " + key;
             }
             return false;
         }
@@ -298,56 +298,52 @@ bool ARXModel::parseContent(const std::string &content, std::string *error_out) 
 }
 
 double ARXModel::predict(const std::deque<TelemetrySample> &history, bool *ok) const {
-    if (!coefficients_loaded_) {
-        if (ok) {
-            *ok = false;
-        }
+    if (ok) {
+        *ok = false;
+    }
+    if (!coefficients_loaded_ || history.size() < required_history_) {
         return 0.0;
     }
-    if (history.empty()) {
-        if (ok) {
-            *ok = false;
-        }
-        return 0.0;
-    }
+
     std::size_t size = history.size();
     double prediction = bias_;
     bool used_temperature = false;
 
-    for (std::size_t i = 0; i < temperature_coeffs_.size() && i < size; ++i) {
+    for (std::size_t i = 0; i < temperature_coeffs_.size(); ++i) {
         const TelemetrySample &sample = history[size - 1 - i];
         if (!sample.temp_valid) {
-            continue;
+            /* Missing required thermal lag is not a zero-degree observation. */
+            return 0.0;
         }
         prediction += temperature_coeffs_[i] * sample.temperature_millic;
         used_temperature = true;
     }
 
-    for (std::size_t i = 0; i < ratio_coeffs_.size() && i < size; ++i) {
+    for (std::size_t i = 0; i < ratio_coeffs_.size(); ++i) {
         const TelemetrySample &sample = history[size - 1 - i];
         double ratio = sample.trimmed_ratio_milli > 0.0 ? sample.trimmed_ratio_milli : sample.ratio_milli;
         prediction += ratio_coeffs_[i] * ratio;
     }
 
-    for (std::size_t i = 0; i < severity_coeffs_.size() && i < size; ++i) {
+    for (std::size_t i = 0; i < severity_coeffs_.size(); ++i) {
         const TelemetrySample &sample = history[size - 1 - i];
         prediction += severity_coeffs_[i] * sample.severity_milli;
     }
 
-    for (std::size_t i = 0; i < trimmed_ratio_coeffs_.size() && i < size; ++i) {
+    for (std::size_t i = 0; i < trimmed_ratio_coeffs_.size(); ++i) {
         const TelemetrySample &sample = history[size - 1 - i];
         prediction += trimmed_ratio_coeffs_[i] * sample.trimmed_ratio_milli;
     }
 
-    if (!used_temperature) {
-        if (ok) {
-            *ok = false;
-        }
+    if (!used_temperature || !std::isfinite(prediction)) {
         return 0.0;
     }
 
     if (ma_enabled_ && residual_valid_) {
         prediction += ma_coefficient_ * last_residual_;
+        if (!std::isfinite(prediction)) {
+            return 0.0;
+        }
     }
 
     if (ok) {
