@@ -44,9 +44,10 @@ int tsd_perf_get_monitor_cpu(const perf_ctx_t *ctx);
 int tsd_perf_check_software_timeout(perf_ctx_t *ctx, int timeout_sec);
 
 /*
- * Wider SIMD authorization must be checked continuously. Hardware mode is
- * eligible only after a fresh, running perf baseline has been validated;
- * software mode is eligible only under TSD_ALLOW_SOFTWARE_UPGRADES.
+ * Wider SIMD authorization must be checked continuously. Only validated,
+ * currently healthy hardware perf mode may authorize an upgrade. Software mode
+ * is degraded diagnostic/control telemetry only and is always fail-closed to
+ * SSE4.1, regardless of legacy environment variables.
  */
 int tsd_perf_upgrades_allowed(const perf_ctx_t *ctx);
 
