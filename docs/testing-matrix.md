@@ -1,6 +1,6 @@
 # Validation Matrix
 
-This document maps dispatcher subsystems to automated coverage and hardware-only validation. Hosted CI is intentionally separated from hardware-in-the-loop checks because GitHub-hosted runners cannot guarantee AVX-512 availability, MSR/RAPL access, stable perf permissions or repeatable thermal behavior.
+This document maps dispatcher subsystems to automated coverage and hardware-only validation. Hosted CI is intentionally separated from hardware-in-the-loop checks because GitHub-hosted runners cannot guarantee a particular wide ISA, MSR/RAPL access, stable perf permissions or repeatable thermal behavior.
 
 ## Unit and bounded integration tests
 
@@ -13,7 +13,7 @@ This document maps dispatcher subsystems to automated coverage and hardware-only
 | Predictive policy | `test_policy_controller` | [`tests/policy/test_policy_controller.c`](../tests/policy/test_policy_controller.c) | Candidate convergence/stability, explicit fallback, missing-temperature semantics and guarded upgrade behavior. |
 | ARX estimator | `test_arx_model` | [`tests/policy/test_arx_model.cpp`](../tests/policy/test_arx_model.cpp) | Coefficient parsing, temperature forecasting, residual handling and explicit coefficient reload. |
 | Telemetry fusion | `test_telemetry`, `test_telemetry_fusion`, `test_telemetry_fusion_stress` | [`tests/telemetry/`](../tests/telemetry) | Sensor normalization, frequency-ratio units, raw-vs-filtered bridge semantics, raw spike visibility, EWMA bypass, staleness, fusion-thread behavior and concurrent access. |
-| Config parsing | `test_config_parser`, `test_runtime_config_cli` | [`tests/`](../tests) | CLI/env precedence and malformed override rejection. Production fusion consumes configured interval/freshness/EWMA values; unsupported profile manifests are explicitly rejected rather than silently ignored. |
+| Config parsing | `test_config_parser`, `test_runtime_config_cli` | [`tests/`](../tests) | Config-file/CLI precedence, `TSD_LOG_LEVEL`, and malformed override rejection. Production fusion consumes configured interval/freshness/EWMA values; unsupported profile manifests are explicitly rejected rather than silently ignored. |
 | Statistics helpers | `test_statistics` | [`tests/test_statistics.c`](../tests/test_statistics.c) | EWMA/trimmed statistics used by policy heuristics. |
 | Observability | `test_logging_metrics`, `test_observability_metrics` | [`tests/observability/`](../tests/observability) | Counters, exporters, TLS/auth configuration, strict readiness, liveness separation, slow-client availability and explicit perf state. Controller heartbeat is refreshed by the runtime monitor even when no transition is recommended. |
 
@@ -42,7 +42,7 @@ Attestation readers are serialized with width selection so the reported hash can
 | [`.github/workflows/security.yml`](../.github/workflows/security.yml) | push to `main`, pull request, weekly | Focused immutable-trampoline, attestation and health-check security regressions. |
 | [`.github/workflows/sandbox.yml`](../.github/workflows/sandbox.yml) | push to `main`, pull request, weekly | Policy/telemetry tests plus forced software-perf degraded mode. |
 | [`.github/workflows/quality.yml`](../.github/workflows/quality.yml) | push to `main`, pull request, manual | GCC/Clang debug builds, Clang ASan+UBSan, focused Clang TSan, Makefile parity, staged install, external CMake consumer and Docker build. |
-| [`.github/workflows/hil.yml`](../.github/workflows/hil.yml) | manual | Bare-metal/self-hosted hardware smoke, stress and evidence-producing thermal characterization on runners labelled `hil` + `avx512`. |
+| [`.github/workflows/hil.yml`](../.github/workflows/hil.yml) | manual | Bare-metal/self-hosted hardware smoke, stress and evidence-producing characterization on runners labelled `hil` plus the selected `avx2` or `avx512` target. |
 
 The first four workflows are expected to run on ordinary GitHub-hosted Linux runners. The HIL workflow requires an explicitly provisioned self-hosted machine.
 
@@ -62,30 +62,35 @@ The CTest registrations use deliberately bounded arguments so they can run in ho
 
 ## Hardware-in-the-loop
 
-The canonical GitHub HIL entrypoint is [`.github/workflows/hil.yml`](../.github/workflows/hil.yml). It runs three ordered stages on `[self-hosted, hil, avx512]`:
+The canonical GitHub HIL entrypoint is [`.github/workflows/hil.yml`](../.github/workflows/hil.yml). It runs three ordered stages on a self-hosted `hil` runner carrying the selected `avx2` or `avx512` label:
 
 1. `hardware-smoke` — build plus `ci/hw-smoke.sh`;
 2. `stress-suite` — transition, signal and telemetry-fault stress;
-3. `thermal-characterization` — `ci/thermal-soak.sh` plus `ci/hil_sampler.py` for a caller-selected 1–300 minute window.
+3. `thermal-characterization` — fixed registered-kernel controls followed by an adaptive registered-kernel soak and `ci/hil_sampler.py` for a caller-selected 1–300 minute window.
 
 The characterization stage records and uploads:
 
 - exact commit and UTC start time;
 - kernel, CPU model, microcode, CPU-package topology and allowed affinity;
 - cpufreq governors and visible thermal/powercap/MSR sources;
+- alternating fixed-width registered-kernel trials, checksums, throughput medians and dispersion;
 - time-series liveness/readiness;
 - current and recommended SIMD width;
 - perf mode/counter health and selected workload/monitor CPUs;
 - package temperature and frequency ratio;
 - CPU sysfs frequency;
-- derived package RAPL power when top-level powercap energy counters are available;
+- derived package RAPL energy and time-weighted power when top-level powercap energy counters are available;
 - raw health JSON snapshots;
 - runtime logs and final Prometheus output;
 - machine-readable JSON plus human-readable Markdown summaries.
 
-The HIL validator requires at least 95% health/liveness endpoint coverage, 90% validated hardware-perf coverage and 90% temperature coverage. RAPL remains optional because not every otherwise-valid target exposes package energy through Linux powercap.
+The HIL validator requires at least 95% health/liveness endpoint coverage, 90%
+strict readiness, 90% validated hardware-perf coverage, 90% temperature
+coverage, repeated checksum-identical fixed controls, and actual application
+work at the selected target width. RAPL remains optional because not every
+otherwise-valid target exposes package energy through Linux powercap.
 
-[`ci/pipeline.yml`](../ci/pipeline.yml) is retained for GitLab-compatible deployments. Provisioning guidance is in [`docs/ci-hil.md`](ci-hil.md). A runner should advertise `avx512` only when AVX-512 is genuinely executable and the required perf/thermal permissions are present.
+[`ci/pipeline.yml`](../ci/pipeline.yml) is retained for GitLab-compatible deployments. Provisioning guidance is in [`docs/ci-hil.md`](ci-hil.md). A runner should advertise an ISA label only when it is genuinely executable and the required perf/thermal permissions are present.
 
 A workflow definition is not evidence by itself. Hardware validation should only be claimed after the manual HIL workflow has actually completed on the relevant CPU family and its artifact has been retained with the release candidate.
 
@@ -133,5 +138,5 @@ The codebase now has hosted compiler, memory/UB sanitizer, focused thread saniti
 
 - run the manual HIL workflow on representative Intel/AMD deployment families;
 - retain long-haul perf-access revoke/restore experiments when the deployment environment can manipulate permissions safely;
-- publish throughput-per-watt results for **real registered application kernels**, not only the built-in width-demonstration payload;
+- repeat the included controlled registered-kernel procedure with deployment-specific application kernels before making workload-specific claims;
 - calibrate and validate platform-specific ARX bundles when predictive accuracy beyond the conservative default/demo model is required.

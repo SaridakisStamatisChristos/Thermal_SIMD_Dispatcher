@@ -3,22 +3,16 @@
   package:
     name:
       - git
+      - build-essential
       - cmake
+      - curl
       - ninja-build
+      - libssl-dev
       - linux-tools-common
       - linux-tools-generic
-      - libcap2-bin
       - hwloc
       - numactl
     state: present
-
-- name: Ensure perf_event_paranoid allows unprivileged perf
-  sysctl:
-    name: kernel.perf_event_paranoid
-    value: "1"
-    state: present
-    sysctl_set: true
-    reload: true
 
 - name: Verify AVX-512 feature availability
   command: lscpu
@@ -51,25 +45,12 @@
     - Reload systemd
     - Restart runner service
 
-- name: Grant CAP_PERFMON and CAP_SYS_ADMIN to perf binary
-  command: "setcap cap_perfmon,cap_sys_admin+ep {{ perf_capability_path }}"
-  register: perf_cap
-  changed_when: perf_cap.rc == 0
-  failed_when: perf_cap.rc != 0
-
-- name: Ensure dispatcher binary carries required capabilities
-  command: "setcap cap_perfmon,cap_sys_admin+ep {{ thermal_dispatcher_path }}"
-  when: thermal_dispatcher_path is defined
-  register: dispatcher_cap
-  changed_when: dispatcher_cap.rc == 0
-  failed_when: dispatcher_cap.rc != 0
-
 - name: Create runner facts directory
   file:
     path: /etc/thermal-simd
     state: directory
-    owner: {{ runner_user }}
-    group: {{ runner_user }}
+    owner: "{{ runner_user }}"
+    group: "{{ runner_user }}"
     mode: '0750'
 
 - name: Persist AVX-512 validation status
@@ -78,15 +59,6 @@
     content: |
       status=ok
       detected_flags={{ lscpu_output.stdout_lines | select('match', 'Flags:') | list | first | default('unknown') }}
-    owner: {{ runner_user }}
-    group: {{ runner_user }}
+    owner: "{{ runner_user }}"
+    group: "{{ runner_user }}"
     mode: '0640'
-
-- name: Enable trampoline validations (optional)
-  lineinfile:
-    path: /etc/environment
-    regexp: '^TSD_ENABLE_TRAMPOLINE_VALIDATION='
-    line: "TSD_ENABLE_TRAMPOLINE_VALIDATION={{ enable_trampoline_validations | ternary('1','0') }}"
-    create: true
-  notify:
-    - Restart runner service

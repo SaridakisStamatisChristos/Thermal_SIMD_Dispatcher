@@ -7,54 +7,58 @@ stages:
 variables:
   BUILD_DIR: "${CI_PROJECT_DIR}/build-ci"
   CMAKE_BUILD_TYPE: "Release"
+  HIL_TARGET_ISA: "avx2"
+  HIL_ARTIFACT_DIR: "${CI_PROJECT_DIR}/hil-artifacts"
 
 .default_build: &default_build
-  image: registry.gitlab.com/gitlab-org/ci-cd/gitlab-runner-helper:x86_64-latest
+  image: ubuntu:24.04
   before_script:
+    - apt-get update
+    - DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends build-essential ca-certificates cmake libssl-dev ninja-build pkg-config
     - cmake --version
-    - ninja --version || true
+    - ninja --version
 
 build:
   <<: *default_build
   stage: build
   script:
-    - cmake -S . -B "${BUILD_DIR}" -DCMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE}" -DBUILD_TESTING=ON
-    - cmake --build "${BUILD_DIR}" --target thermal_simd test_thermal_simd stress_patch_request stress_signal_storm stress_telemetry_faults -j"$(nproc)"
-  artifacts:
-    paths:
-      - build-ci/
-    expire_in: 2 days
+    - cmake -S . -B "${BUILD_DIR}" -G Ninja -DCMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE}" -DBUILD_TESTING=ON -DTSD_BUILD_BENCHMARKS=ON
+    - cmake --build "${BUILD_DIR}" -j"$(nproc)"
+    - ctest --test-dir "${BUILD_DIR}" --output-on-failure
 
 hardware-smoke:
   stage: hw_smoke
-  needs: ["build"]
   script:
     - ci/hw-smoke.sh
   tags:
     - hil
-    - avx512
+    - "${HIL_TARGET_ISA}"
   timeout: 30m
 
 stress-suite:
   stage: stress
-  needs: ["build"]
   script:
+    - cmake -S . -B "${BUILD_DIR}" -DCMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE}" -DBUILD_TESTING=ON
     - cmake --build "${BUILD_DIR}" --target stress_patch_request stress_signal_storm stress_telemetry_faults -j"$(nproc)"
-    - "${BUILD_DIR}/stress_patch_request" --threads="${PATCH_THREADS:-8}" --iterations="${PATCH_ITERATIONS:-4000}"
-    - "${BUILD_DIR}/stress_signal_storm" --duration-seconds="${SIGNAL_DURATION:-45}" --signal-rate="${SIGNAL_RATE:-350}"
-    - "${BUILD_DIR}/stress_telemetry_faults" --cycles="${TELEMETRY_CYCLES:-5}"
+    - '"${BUILD_DIR}/stress_patch_request" --threads="${PATCH_THREADS:-8}" --iterations="${PATCH_ITERATIONS:-4000}"'
+    - '"${BUILD_DIR}/stress_signal_storm" --duration-seconds="${SIGNAL_DURATION:-45}" --signal-rate="${SIGNAL_RATE:-350}"'
+    - '"${BUILD_DIR}/stress_telemetry_faults" --cycles="${TELEMETRY_CYCLES:-5}"'
   tags:
     - hil
-    - avx512
+    - "${HIL_TARGET_ISA}"
   timeout: 1h
 
 thermal-soak:
   stage: soak
-  needs: ["stress-suite"]
   script:
     - export SOAK_MINUTES="${SOAK_MINUTES:-120}"
     - ci/thermal-soak.sh
   tags:
     - hil
-    - avx512
+    - "${HIL_TARGET_ISA}"
   timeout: 6h
+  artifacts:
+    when: always
+    paths:
+      - hil-artifacts/
+    expire_in: 30 days

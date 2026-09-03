@@ -40,6 +40,11 @@ def discover_rapl_domains() -> list[tuple[pathlib.Path, int | None]]:
     for pattern in patterns:
         for raw in sorted(glob.glob(pattern)):
             energy = pathlib.Path(raw)
+            # Only sum package domains.  Linux commonly exposes child core,
+            # uncore and DRAM domains beside them in /sys/class/powercap;
+            # adding those again would double-count package energy.
+            if energy.parent.name.count(":") != 1:
+                continue
             max_range = read_int(energy.with_name("max_energy_range_uj"))
             domains.append((energy, max_range))
     return domains
@@ -113,8 +118,15 @@ def main() -> int:
     parser.add_argument("--summary", required=True)
     args = parser.parse_args()
 
-    if args.duration_seconds <= 0 or args.interval_seconds <= 0:
-        parser.error("duration and interval must be positive")
+    if (
+        not math.isfinite(args.duration_seconds)
+        or args.duration_seconds <= 0
+        or not math.isfinite(args.interval_seconds)
+        or not 0.05 <= args.interval_seconds <= 60.0
+    ):
+        parser.error(
+            "duration must be finite and positive; interval must be finite and in [0.05, 60] seconds"
+        )
 
     csv_path = pathlib.Path(args.csv)
     jsonl_path = pathlib.Path(args.jsonl)
@@ -160,6 +172,8 @@ def main() -> int:
     raw_temperatures: list[float] = []
     filtered_temperatures: list[float] = []
     powers: list[float] = []
+    total_rapl_energy_uj = 0
+    rapl_measurement_seconds = 0.0
     widths: Counter[str] = Counter()
 
     with csv_path.open("w", newline="", encoding="utf-8") as csv_file, jsonl_path.open(
@@ -168,7 +182,9 @@ def main() -> int:
         writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
         writer.writeheader()
 
-        next_sample = started
+        # Establish energy and endpoint baselines first.  Sampling immediately
+        # creates a tiny RAPL interval whose quantization can dominate max power.
+        next_sample = started + args.interval_seconds
         while True:
             now = time.monotonic()
             if now >= deadline:
@@ -190,6 +206,8 @@ def main() -> int:
                 rapl_power = (delta_energy / 1_000_000.0) / delta_time
                 if math.isfinite(rapl_power) and rapl_power >= 0:
                     powers.append(rapl_power)
+                    total_rapl_energy_uj += delta_energy
+                    rapl_measurement_seconds += delta_time
                 else:
                     rapl_power = None
             previous_energy_values = current_energy_values
@@ -291,10 +309,11 @@ def main() -> int:
             sample_count += 1
             next_sample += args.interval_seconds
             if next_sample < time.monotonic() - args.interval_seconds:
-                next_sample = time.monotonic()
+                next_sample = time.monotonic() + args.interval_seconds
 
     denominator = max(sample_count, 1)
     summary = {
+        "schema_version": 1,
         "duration_seconds": time.monotonic() - started,
         "sample_count": sample_count,
         "health_sample_fraction": health_samples / denominator,
@@ -312,9 +331,19 @@ def main() -> int:
         "mean_filtered_temperature_c": (
             sum(filtered_temperatures) / len(filtered_temperatures) if filtered_temperatures else None
         ),
-        "mean_rapl_power_w": sum(powers) / len(powers) if powers else None,
+        "rapl_energy_j": total_rapl_energy_uj / 1_000_000.0 if powers else None,
+        "rapl_measurement_seconds": rapl_measurement_seconds if powers else None,
+        "mean_rapl_power_w": (
+            (total_rapl_energy_uj / 1_000_000.0) / rapl_measurement_seconds
+            if powers and rapl_measurement_seconds > 0
+            else None
+        ),
         "max_rapl_power_w": max(powers) if powers else None,
         "rapl_domain_count": len(rapl_domains),
+        "rapl_domains": [
+            {"energy_path": str(path), "max_energy_range_uj": maximum}
+            for path, maximum in rapl_domains
+        ],
         "width_samples": dict(sorted(widths.items())),
     }
     summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8")

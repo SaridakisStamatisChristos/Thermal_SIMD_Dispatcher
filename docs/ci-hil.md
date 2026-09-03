@@ -1,99 +1,161 @@
 # Hardware-in-the-Loop Continuous Integration
 
-This document describes the hardware-in-the-loop (HIL) validation path for AVX-512-capable Linux machines, the evidence produced by a run, and operator triage steps.
-
-Hosted CI is intentionally not treated as hardware evidence. A runner should carry the `hil` and `avx512` labels only after operators have verified the actual CPU/VM exposes AVX-512 and the runtime has the perf/thermal permissions required for the intended test.
+This document describes the bare-metal hardware-in-the-loop (HIL) validation
+path, the evidence produced by a run and operator triage steps. Hosted CI checks
+software invariants, but it is not treated as evidence for thermal, power or
+ISA-specific performance claims.
 
 ## GitHub Actions entrypoint
 
-The canonical GitHub workflow is [`.github/workflows/hil.yml`](../.github/workflows/hil.yml). It is manually triggered and contains three ordered stages:
+The canonical workflow is [`.github/workflows/hil.yml`](../.github/workflows/hil.yml).
+It is manually triggered with a target ISA:
 
-1. **hardware-smoke** — builds and executes [`ci/hw-smoke.sh`](../ci/hw-smoke.sh);
-2. **stress-suite** — exercises immutable width selection, signal pressure and telemetry fault recovery;
-3. **thermal-characterization** — runs [`ci/thermal-soak.sh`](../ci/thermal-soak.sh) and [`ci/hil_sampler.py`](../ci/hil_sampler.py) for a selected 1–300 minute observation window.
+| Target | Required runner labels | Maximum runtime width |
+| --- | --- | --- |
+| `avx2` | `self-hosted`, `linux`, `x64`, `hil`, `avx2` | AVX2 |
+| `avx512` | `self-hosted`, `linux`, `x64`, `hil`, `avx512` | AVX-512 |
 
-The AVX-512 HIL contract is executable, not merely a runner label: `hw-smoke.sh` rejects a host without `avx512f`, both runtime HIL paths pass `--allow-avx512`, and thermal characterization requires an observed AVX-512 width sample.
+The workflow contains three ordered stages:
 
-The final stage uploads `hil-artifacts/` even when characterization fails, so machine metadata and partial logs remain available for diagnosis.
+1. **hardware-smoke** builds the project and runs [`ci/hw-smoke.sh`](../ci/hw-smoke.sh);
+2. **stress-suite** exercises immutable width selection, signal pressure and
+   telemetry fault recovery;
+3. **thermal-characterization** runs fixed-width controls followed by a real
+   registered adaptive workload for a selected 1–300 minute observation window.
+
+The target is enforced by scripts, not inferred from a runner label.
+[`ci/hil-preflight.sh`](../ci/hil-preflight.sh) rejects a machine without the
+required CPU flag. The runtime is capped at the selected ISA, and final
+validation requires application work to have executed at that width.
+
+The last stage uploads `hil-artifacts/` even on failure. Each invocation writes
+to a new child directory and refuses unsafe roots or reuse; it never recursively
+clears a caller-provided artifact directory.
 
 ## Required runner capabilities
 
-At minimum, validate on the self-hosted runner:
+Run the preflight check under the same service account that executes the runner:
 
 ```bash
-lscpu | grep -i avx512
-perf stat -- sleep 1
-cat /proc/sys/kernel/perf_event_paranoid
+HIL_TARGET_ISA=avx2 ci/hil-preflight.sh
 ```
 
-The repository runtime itself will additionally verify its immutable trampoline mappings and hardware-counter behavior. Package-temperature telemetry must be visible through a supported thermal-zone or `hwmon` source for HIL characterization to pass its coverage threshold.
+Use `HIL_TARGET_ISA=avx512` only on a host exposing `avx512f`. Preflight checks:
 
-MSR access is optional for frequency telemetry because cpufreq can be used as a fallback. RAPL power is optional because some otherwise-valid systems do not expose package energy through Linux powercap.
+- Bash, CMake, C/C++ compilers, Make, curl, Git, grep, `lscpu`, `nproc`,
+  Python 3 and `taskset`;
+- the selected CPU ISA flag;
+- at least two CPUs in the process affinity mask so workload and
+  monitor/sampling activity can be separated;
+- whether the configured metrics port can be bound.
 
-The normal runtime/HIL permission target is `CAP_PERFMON` or an equivalent perf-event policy. Do not add `CAP_SYS_ADMIN` as a generic workaround. If MSR-backed APERF/MPERF is explicitly required, prefer narrow read permission on the required `/dev/cpu/*/msr` devices; where the host requires a capability, grant `CAP_SYS_RAWIO` explicitly and only to that deployment.
+It warns when temperature or RAPL sources are unavailable. Temperature is
+required by the final characterization acceptance check. RAPL is optional and
+must be reported as unavailable, never as zero. The runtime itself verifies
+perf-event access and immutable trampoline mappings.
 
-## Optional infrastructure-as-code assets
+The normal permission target is `CAP_PERFMON` or an equivalent perf-event
+policy. Do not add `CAP_SYS_ADMIN` as a generic workaround. If MSR-backed
+APERF/MPERF is explicitly needed, grant only the narrow device access required
+by that deployment.
 
-The `ci/hil/terraform` and `ci/hil/ansible` assets remain available for teams using the repository's GitLab-compatible runner infrastructure. Cloud instance types and AVX-512 exposure change over time, so provisioning code is not proof that a resulting VM actually has the expected ISA. Verify the final machine before assigning HIL labels/tags.
+An Intel Core i5-9500 is an appropriate AVX2 lane, not an AVX-512 lane. A local
+characterization on that machine can be started with:
 
-The GitLab-compatible pipeline remains in [`ci/pipeline.yml`](../ci/pipeline.yml); GitHub users should prefer `.github/workflows/hil.yml`.
+```bash
+HIL_TARGET_ISA=avx2 SOAK_MINUTES=5 ci/thermal-soak.sh
+```
 
-## Characterization artifacts
+Stop unrelated workloads, allow the machine to return to a repeatable idle
+temperature and keep the governor/cooling setup unchanged between comparison
+runs.
 
-A successful `thermal-characterization` job records:
+Useful overrides are `SOAK_MINUTES`, `METRICS_PORT`, `BUILD_DIR`,
+`HIL_ARTIFACT_DIR`, `HIL_RUN_ID`, `HIL_WORK_ITEMS`, `HIL_CHUNK_ITEMS`,
+`HIL_WORK_ROUNDS`, `HIL_BENCHMARK_TRIALS`, `HIL_BENCHMARK_SECONDS`,
+`HIL_BENCHMARK_WARMUP_SECONDS`, `HIL_BENCHMARK_COOLDOWN_SECONDS`,
+`HIL_BENCHMARK_SAMPLE_INTERVAL_SECONDS`, `HIL_PRE_SOAK_COOLDOWN_SECONDS` and
+`HIL_ADAPTIVE_WARMUP_SECONDS`. Invalid or non-finite numeric values are rejected
+before the build begins.
 
-- exact Git commit and UTC start time;
-- kernel and architecture;
-- CPU model and microcode when exposed;
-- process allowed-affinity mask;
-- CPU package topology;
-- cpufreq governors;
-- visible thermal, powercap and MSR sources;
-- explicit AVX-512 request state;
-- runtime log;
-- one-second-by-default CSV telemetry timeline;
-- raw `/healthz` JSON snapshots in JSONL;
-- final Prometheus snapshot;
-- machine-readable summary JSON;
-- Markdown summary copied into the GitHub Actions step summary.
+## Characterization procedure and artifacts
 
-The timeline includes current/recommended width, liveness/readiness, perf mode and counter health, workload/monitor CPUs, package temperature, frequency ratio, current sysfs CPU frequency and RAPL-derived package power when available.
+[`ci/thermal-soak.sh`](../ci/thermal-soak.sh) builds
+`benchmark_registered_kernel`, then performs two distinct measurements:
+
+1. repeated fixed SSE4.1 and AVX2 trials, plus AVX-512 on that lane, with
+   alternating trial order, explicit warm-up and cooldown;
+2. the registered kernel under the adaptive runtime while
+   [`ci/hil_sampler.py`](../ci/hil_sampler.py) samples strict runtime health.
+
+All kernel variants implement the same deterministic integer transform.
+Checksums must match across fixed modes and the adaptive run. This prevents a
+dispatch-only demo or unequal work from being presented as an SIMD speedup.
+
+Each run directory includes:
+
+- `machine-metadata.txt`: commit, toolchain, CPU/microcode, affinity, topology,
+  governors and visible telemetry sources;
+- `controlled-benchmark.json` and `.csv`: individual trials, medians, median
+  absolute deviation, checksum, optional energy and efficiency ratios;
+- `controlled-trials/`: stdout/stderr and result JSON for every fixed trial;
+- `runtime.log` and `adaptive-workload.json`: adaptive registered-workload
+  evidence and per-width work counts;
+- `timeline.csv` and `health.jsonl`: sampled health/telemetry history;
+- `metrics-final.prom`, `summary.json` and `summary.md`.
+
+RAPL readings are wrap-aware. Mean power is computed from accumulated energy
+over measured time rather than averaging instantaneous samples. The result is
+still package-level energy, not energy attributable only to the process.
 
 The automatic acceptance checks require:
 
 - at least ten observations;
-- at least 95% health-endpoint availability;
-- at least 95% runtime liveness;
-- at least 90% validated hardware-perf coverage;
-- at least 90% package-temperature coverage;
-- at least one valid SIMD-width observation;
-- at least one observed AVX-512 sample on the AVX-512-labelled lane.
+- at least 95% endpoint availability and runtime liveness;
+- at least 90% strict readiness, hardware-perf coverage and package-temperature
+  coverage;
+- an observation of the selected width;
+- application work executed at the selected width;
+- at least one complete adaptive pass and graceful SIGTERM shutdown;
+- matching checksums across adaptive and fixed controls;
+- at least two fixed trials per required mode.
 
-These are minimum evidence-quality checks, not universal thermal-performance SLOs. Deployment-specific temperature, power, throughput and oscillation limits should be evaluated separately.
+These are evidence-quality gates, not universal performance or thermal SLOs.
+Temperature, power, throughput and acceptable variance depend on the CPU,
+firmware, cooling, governor and application workload.
 
-## Stress harnesses
+## Optional infrastructure-as-code assets
 
-The `tests/stress` directory builds three dedicated binaries:
+The `ci/hil/terraform` and `ci/hil/ansible` assets remain examples for teams
+using the GitLab-compatible runner infrastructure. They currently describe an
+AVX-512 lane. Cloud instance types and exposed CPU features change, so successful
+provisioning does not prove the final VM satisfies the HIL contract. Verify the
+machine before assigning labels or tags.
 
-- `stress_patch_request` repeatedly requests immutable SSE4.1/AVX2/AVX-512 width selections with optional failure injection. The historical name contains `patch`, but production code pages are not rewritten at runtime.
-- `stress_signal_storm` applies asynchronous signal pressure while width selections occur.
-- `stress_telemetry_faults` exercises telemetry dropout and recovery behavior.
+The Terraform example retrieves a modern `glrt-` runner authentication token
+from an existing SSM SecureString, avoiding a plaintext token in Terraform state
+and EC2 user data. Configure the `hil` and `avx512` tags when creating that
+runner in GitLab. The example grants only `ssm:GetParameter` for the supplied
+parameter ARN; a SecureString using a customer-managed KMS key also needs a
+narrow `kms:Decrypt` grant for that key.
 
-Each binary accepts CLI overrides so the workflow can scale workloads for quick smoke runs or extended validation.
+The GitLab-compatible entrypoint is [`ci/pipeline.yml`](../ci/pipeline.yml).
+Set `HIL_TARGET_ISA` and give the runner the matching tag.
 
 ## Failure triage
 
-### Hardware smoke failure
+### Hardware smoke
 
-1. Inspect the `hardware-smoke` log and the exact checked-out commit.
-2. Run `ci/hw-smoke.sh` directly on the machine.
-3. Verify `perf stat -- sleep 1` works under the same service user.
-4. Verify `lscpu` still reports the expected ISA; cloud migration or BIOS/firmware changes can alter exposed features.
-5. Check the runtime's immutable mapping self-validation output.
+1. Run `HIL_TARGET_ISA=<target> ci/hw-smoke.sh` directly on the runner.
+2. Confirm `lscpu` exposes the required flag under the runner's execution
+   environment.
+3. Check `perf stat -- sleep 1`, `perf_event_paranoid`, capabilities and process
+   affinity under the same service user.
+4. Check the runtime log for immutable mapping validation or startup failures.
 
-### Stress-suite failure
+### Stress suite
 
-Reproduce the specific harness with bounded parameters first:
+Reproduce the failing harness with bounded parameters:
 
 ```bash
 cmake -S . -B build -DBUILD_TESTING=ON
@@ -103,22 +165,26 @@ cmake --build build --target stress_patch_request stress_signal_storm stress_tel
 ./build/stress_telemetry_faults --cycles=3
 ```
 
-For perf-related behavior, capture `perf_event_paranoid`, capabilities and the runtime's reported perf mode. For telemetry faults, inspect which package sensor was selected and whether recovery/backoff events were logged.
+### Thermal characterization
 
-### Thermal characterization failure
-
-1. Download the `thermal-simd-hil-<sha>` artifact even if the job failed.
-2. Inspect `machine-metadata.txt` first to establish the CPU/kernel/governor/permission context.
-3. Inspect `summary.json` for the failed coverage fraction.
-4. Use `timeline.csv` to determine whether the issue was endpoint availability, perf fallback, missing temperature, missing AVX-512 execution, or sustained degraded state.
-5. Correlate `runtime.log` and `health.jsonl` around the failing timestamps.
-6. If RAPL is present, inspect power changes around width transitions; if it is absent, do not infer zero power.
-7. Reproduce with a shorter window:
+1. Download the artifact even when the job failed and locate its per-run child
+   directory.
+2. Read `machine-metadata.txt` before interpreting numbers.
+3. Inspect `controlled-benchmark.json` for checksum, trial variance and missing
+   RAPL data.
+4. Inspect `summary.json` for the failed coverage fraction.
+5. Correlate `timeline.csv`, `health.jsonl` and `runtime.log` around failures.
+6. If RAPL is absent, do not infer zero consumption.
+7. Reproduce with a shorter window and the same target:
 
 ```bash
-SOAK_MINUTES=5 ci/thermal-soak.sh
+HIL_TARGET_ISA=avx2 SOAK_MINUTES=5 ci/thermal-soak.sh
 ```
 
 ## Release use
 
-A HIL workflow definition is not itself evidence. For a release or a published hardware claim, retain the artifact from the exact release commit and identify the CPU family it represents. Repeat the characterization on materially different deployment families rather than assuming one AVX-512 machine generalizes to all AVX-512 systems.
+A workflow definition is not hardware evidence. Retain the artifact from the
+exact release commit and record the CPU family, BIOS/firmware, kernel, governor
+and cooling context. Repeat the characterization on materially different target
+families; results from one AVX2 or AVX-512 machine do not generalize to every
+machine exposing the same ISA.

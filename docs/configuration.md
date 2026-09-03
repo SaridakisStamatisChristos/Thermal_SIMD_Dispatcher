@@ -19,7 +19,6 @@ structure:
     "alpha": 0.25
   },
   "telemetry": {
-    "profile": "config/telemetry/profile.json",
     "interval_ms": 50,
     "max_skew_ms": 150,
     "ewma": 0.25
@@ -61,7 +60,7 @@ below. The `predictive.coeff_path` defaults to the bundled
 | Telemetry | `--telemetry-interval` / `telemetry.interval_ms` | Telemetry fusion poll interval (ms). | 50 |
 | Telemetry | `--telemetry-max-skew` / `telemetry.max_skew_ms` | Maximum allowed skew between collectors (ms). | 150 |
 | Telemetry | `--telemetry-ewma` / `telemetry.ewma` | Telemetry CPI EWMA alpha. | 0.25 |
-| Telemetry | `--telemetry-profile` / `telemetry.profile` | Optional telemetry profile manifest. | *(unset)* |
+| Telemetry | `--telemetry-profile` / `telemetry.profile` | Reserved for a future manifest format. A nonempty value is currently rejected when telemetry fusion starts. | *(unset)* |
 | Metrics | `--metrics-port` / `metrics.port` | Prometheus listen port (`0` disables). | 9464 |
 | Metrics | `--metrics-bind` / `metrics.bind_address` | Listen address. | `127.0.0.1` |
 | Metrics | `--metrics-cert` / `metrics.tls.certificate` | TLS certificate (PEM). | *(unset)* |
@@ -78,7 +77,10 @@ below. The `predictive.coeff_path` defaults to the bundled
   (or setting `metrics.tls.require_client_auth`) also requires a client CA bundle.
 - Basic authentication requires both username and password.
 - StatsD is enabled only when both host and port are set.
-- Telemetry intervals and skews must remain between 10 ms and 60,000 ms.
+- Telemetry profile manifests are not implemented. Leave `telemetry.profile`
+  unset; a nonempty path is rejected explicitly rather than ignored.
+- Telemetry intervals must remain between 10 ms and 60,000 ms; maximum skew
+  accepts 0 ms through 60,000 ms.
 - Predictive margins must fall between 0 °C and 60 °C.
 
 Invalid combinations terminate the process with a descriptive log entry so that

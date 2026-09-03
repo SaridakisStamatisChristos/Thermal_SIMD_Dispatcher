@@ -1,51 +1,55 @@
-# Runbook: Patcher Attestation Alert
+# Runbook: Trampoline Measurement Mismatch
 
-## Summary
-The security attestation service flagged the dispatcher patcher subsystem due to failed measurement verification (hash mismatch, signature failure, or stale nonce). The dispatcher may refuse to patch or run with reduced capabilities.
+## Scope
 
-## Detection
-- Alert `patcher_attestation_failure` firing from security monitoring.
-- Logs show `event=attestation state=failure reason=<...>`.
-- `/metrics` contains `patch_failures_total` increasing and `attestation_verifications_total` spiking.
+This runbook applies when an embedding application calls
+`tsd_attestation_expect_active_hash` and receives a mismatch. The repository
+does not ship an attestation daemon, alert rule, signed measurement bundle or
+remote nonce service.
 
-## Immediate Actions
-1. **Confirm Alert Context**
+The measured value is the SHA-256 digest of the currently selected immutable
+trampoline slot. A mismatch can mean the expected value is for another width or
+release, the caller compared at the wrong point in the selection lifecycle, or
+process memory/integration state is corrupted.
+
+## Immediate actions
+
+1. Stop sending work through the affected dispatcher instance and retain its
+   logs, executable digest, exact commit/version and the expected/actual slot
+   digests.
+2. Determine the active SIMD width at the same synchronized point used for the
+   comparison. Expected hashes are width- and build-specific.
+3. Run the standalone startup diagnostic from the same installed artifact:
+
    ```bash
-   kubectl logs <pod> | grep attestation | tail
-   curl -s http://<pod>:9464/metrics | egrep 'attestation|patch_failures_total'
+   /usr/local/bin/thermal_simd --sandbox-only --metrics-port=0
    ```
-2. **Check Dispatcher State**
-   ```bash
-   kubectl exec <pod> -- ./thermal_simd --health-check
-   ```
-   - Exit code 0 but logs show failure ⇒ patching suspended but runtime healthy.
-   - Exit code ≠0 ⇒ runtime degraded; escalate quickly.
 
-## Remediation Steps
-1. **Validate Attestation Material**
-   ```bash
-   kubectl exec <pod> -- sha256sum /etc/tsd/patcher_measurement.json
-   kubectl exec <pod> -- openssl dgst -sha256 -verify /etc/tsd/attestor_pub.pem -signature /run/tsd/nonce.sig /run/tsd/nonce.bin
-   ```
-   - Mismatch ⇒ rotate measurement bundle from artifact store.
-2. **Refresh Nonce**
-   ```bash
-   kubectl exec <pod> -- ./tools/attestation_client --refresh-nonce
-   ```
-   Confirms that the dispatcher can fetch a fresh nonce and sign it.
-3. **Redeploy Patcher**
-   ```bash
-   kubectl rollout restart daemonset/thermal-simd
-   ```
-   Ensures the trampoline patch buffer reinitializes with new attestation data.
-4. **Coordinate With Security**
-   - Notify security on-call with evidence (hashes, signature output).
-   - Request whitelist update if the release contains intentional changes (attach diff + ticket).
+4. Do not treat a restart as proof of integrity. If provenance is uncertain,
+   replace the executable from a trusted release source first.
 
-## Escalation
-- If attestation fails after bundle rotation, page Security Engineering immediately.
-- Open a compliance incident ticket if the dispatcher runs in degraded mode for >1 hour.
+## Investigation
 
-## Post-Incident
-- Update `docs/security/attestation.md` with new certificate fingerprints.
-- Schedule a sandbox run (`make sandbox-attestation`) to capture fresh artifacts for future baselines.
+- Compare `sha256sum` of the installed executable and controller coefficient
+  file against externally retained release provenance.
+- Confirm the embedding application uses the public attestation API while the
+  dispatcher object/runtime lifetime remains valid.
+- Confirm it does not reuse an expected digest from a different compiler,
+  release or SIMD width.
+- Review logs for `Trampoline hash=...`, failed immutable mapping validation or
+  rejected width-selection messages.
+- Reproduce the local mismatch test:
+
+  ```bash
+  cmake -S . -B build -DBUILD_TESTING=ON
+  cmake --build build --target test_trampoline_security
+  ctest --test-dir build --output-on-failure -R '^trampoline_security$'
+  ```
+
+## Recovery
+
+Redeploy a verified artifact and rerun the startup diagnostic plus the
+embedding application's expected-hash check. Escalate as a potential process
+integrity incident if a build- and width-correct digest still differs. Any
+signature verification, remote attestation or image admission policy belongs
+to the deployment platform and should be investigated there separately.

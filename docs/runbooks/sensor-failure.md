@@ -1,53 +1,71 @@
-# Runbook: Telemetry Sensor Failure
-
-## Summary
-A mandatory telemetry sensor (perf counters, MSR temperature, or frequency source) is unavailable or returning invalid data, causing the dispatcher to downgrade SIMD width and possibly enter degraded mode.
+# Runbook: Telemetry or Perf Failure
 
 ## Detection
-- Alert `telemetry_degraded_total` firing for >3 minutes.
-- Logs containing `event=telemetry_sensor state=degraded` with `sensor=temp|perf|freq`.
-- `/metrics` shows `telemetry_snapshots_total` increasing slower than the scheduler interval.
 
-## Immediate Actions
-1. **Confirm Scope**
-   ```bash
-   kubectl logs <pod> | grep telemetry_sensor | tail
-   curl -s http://<pod>:9464/metrics | grep telemetry_degraded_total
-   ```
-2. **Force Health Check**
-   ```bash
-   kubectl exec <pod> -- ./thermal_simd --health-check
-   ```
-   - Exit code 0 ⇒ transient; continue monitoring.
-   - Exit code ≠0 ⇒ remain degraded; proceed below.
-3. **Stabilize Workload**
-   - Set feature flag `TSD_FORCE_WIDTH=SSE41` via ConfigMap to minimize thermal stress until resolution.
+A recoverable dependency failure normally keeps `/healthz` at HTTP 200 but
+makes `/readyz` return 503. Inspect the health JSON rather than relying on
+Prometheus counters that the current exporter does not expose:
 
-## Remediation Steps
-1. **Check Node Permissions**
-   ```bash
-   sudo sysctl kernel.perf_event_paranoid
-   ls -l /dev/cpu/*/msr
-   ```
-   Ensure `perf_event_paranoid <= 1` and MSR device is readable by service account.
-2. **Restart Telemetry Collector**
-   ```bash
-   systemctl restart tsd-telemetry.service
-   ```
-   or redeploy the pod (`kubectl rollout restart daemonset/thermal-simd`).
-3. **Validate Sensor Output**
-   ```bash
-   sudo turbostat --Summary --show CoreTmp,CoreCnt
-   ```
-   Compare with telemetry logs to ensure the source is publishing valid data.
-4. **Clear Degraded Mode**
-   - Once sensors are stable for 5 minutes, remove `TSD_FORCE_WIDTH` override.
-   - Confirm `/metrics` shows `telemetry_degraded_total` flat.
+```bash
+curl --fail-with-body http://127.0.0.1:9464/healthz
+curl --fail-with-body http://127.0.0.1:9464/readyz
+```
 
-## Escalation
-- If sensors remain unavailable for >30 minutes, escalate to platform engineering (PE On-Call) and attach sandbox artifacts (see `docs/sandbox-workflow.md`).
-- For hardware-level failures, open a DC ops ticket referencing the host serial and attach turbostat output.
+Relevant fields are:
 
-## Post-Incident
-- File an incident report within 24h including root cause and mitigations.
-- Update observability thresholds if the alert fired too late/early.
+- `ready` and `controller.fallbackActive`;
+- `perf.mode`, `perf.countersHealthy`, `perf.pinnedCpu` and `perf.monitorCpu`;
+- `fusion.degraded`, `fusion.rawTempAvailable`,
+  `fusion.filteredTempAvailable` and `fusion.freqAvailable`.
+
+Logs use `event=perf_mode` and `event=telemetry_sensor` with degraded,
+recovered and fail-closed reasons.
+
+## Safety behavior
+
+Hardware perf loss enters software/degraded mode and blocks wider upgrades by
+default. Missing or stale raw temperature also blocks wider authorization.
+Do not set `TSD_ALLOW_SOFTWARE_UPGRADES` during incident response; it is an
+explicit override of the conservative behavior. Liveness remains healthy so
+the runtime's bounded hardware re-probe can recover without an orchestrator
+restart loop.
+
+## Investigation
+
+Run checks as the same user/capability set as the service:
+
+```bash
+cat /proc/sys/kernel/perf_event_paranoid
+getcap /usr/local/bin/thermal_simd 2>/dev/null || true
+find /sys/class/hwmon /sys/class/thermal -type f -readable 2>/dev/null | head
+find /sys/devices/system/cpu -path '*/cpufreq/*_freq' -readable 2>/dev/null | head
+```
+
+Then verify:
+
+1. the process affinity contains at least the intended workload and monitor
+   CPUs;
+2. `CAP_PERFMON` or the host perf-event policy reaches the actual service
+   process/container;
+3. the selected temperature and cpufreq files still exist and are readable;
+4. a container has the required sysfs visibility;
+5. suspend, CPU hotplug, kernel, firmware or VM migration did not change the
+   exposed interface.
+
+MSR absence alone is not fatal when cpufreq provides the frequency channel.
+RAPL absence affects energy evidence, not runtime readiness.
+
+## Recovery and verification
+
+Fix the host permission/sysfs/affinity cause and allow the built-in re-probe to
+run. Recovery is complete only after:
+
+- `/readyz` returns 200 for a sustained observation window;
+- `perf.mode` is `hardware` and `countersHealthy` is true;
+- raw temperature and frequency remain available;
+- logs show validated hardware recovery rather than merely a successful
+  `perf_event_open` call.
+
+Restart only when configuration or container mounts cannot be corrected in
+place. After any restart, rerun `ci/hw-smoke.sh` under the service identity and
+retain a short HIL artifact if the failure could affect release evidence.

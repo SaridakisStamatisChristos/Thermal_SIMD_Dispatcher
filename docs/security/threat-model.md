@@ -1,68 +1,84 @@
-# Security & Compliance: Threat Model and Attestation Procedures
+# Security Threat Model
 
-## Scope
-Covers the SIMD dispatcher runtime, predictive controller, telemetry collectors, and packaging artifacts (systemd unit, container image, Kubernetes manifests).
+## Scope and trust boundaries
 
-## Assets
-- Trampoline patch buffers and runtime code sections (integrity critical).
-- Telemetry data (temperature, frequency, power readings).
-- Controller policies (`controller_coeffs.json`).
-- Metrics endpoint and health check.
-- Attestation material (measurement JSON, certificates, nonce).
+This model covers the dispatcher process, immutable trampoline table,
+registered-kernel selection, local telemetry, controller coefficient file and
+metrics listener. It describes controls implemented in this repository; image
+signing, cluster admission, SIEM retention and remote attestation are deployment
+responsibilities.
 
-## Threat Actors
-| Actor | Capability | Goals |
-| --- | --- | --- |
-| Malicious tenant workload | Userland code within same host | Escalate privileges, manipulate SIMD decisions to degrade co-tenants. |
-| Compromised operator | Access to Kubernetes control plane | Deploy tampered binaries or disable attestation. |
-| Network attacker | Lateral movement within cluster | Scrape metrics or inject false telemetry. |
-| Rogue hardware | Faulty sensors/MSRs | Cause unsafe temperature operation or force scalar mode. |
+The process trusts:
 
-## Attack Surfaces & Mitigations
-| Surface | Threat | Mitigation |
-| --- | --- | --- |
-| Patcher double buffer | Code injection | W^X enforced, buffers sealed with `mprotect`, attestation verifies measurement. |
-| Telemetry socket (`/run/tsd/telemetry.sock`) | Unauthorized writes | Unix socket ACL restricted to dispatcher UID; sandbox fuzzer uses signed token. |
-| Metrics endpoint | Data exfiltration | Binds to localhost; TLS + basic auth required for remote scraping. |
-| Config hot reload | Policy tampering | ConfigMap signed with release key; hash compared to baseline (`policy_digest`). |
-| Container image | Supply chain | Image signed via cosign; CI enforces signature verification before deploy. |
+- the installed executable and controller coefficient file;
+- the host kernel's CPUID, affinity, perf-event and sysfs interfaces;
+- operators allowed to change process arguments, environment, files or
+  capabilities;
+- application-provided registered kernel pointers and context lifetimes.
 
-## Attestation Verification Procedure
-1. **Measurement Baseline**
-   - `packaging/artifacts/patcher_measurement.json` contains SHA256 of patch buffers and controller binaries.
-   - Baseline is versioned per release and stored in artifact registry (see `packaging/README.md`).
-2. **Startup Verification**
-   - On boot, dispatcher loads measurement file, verifies signature with `attestor_pub.pem`.
-   - Generates a nonce from the attestation service; signs it with enclave key.
-   - Submits signed nonce + measurement digest to attestation API.
-   - Attestation service returns `OK` with `expires_at` timestamp. Failure sets `state=degraded`.
-3. **Runtime Checks**
-   - Every `attestation_interval` (default 10m), dispatcher re-validates measurement and nonce freshness.
-   - Metrics `attestation_verifications_total` and `attestation_failure_total` track results.
-   - Structured logs `event=attestation` include `nonce_age_ms`, `result`, `digest`.
-4. **Operator Verification**
-   - Operators can run `tools/attestation_client --verify` to fetch current status:
-     ```bash
-     kubectl exec <pod> -- ./tools/attestation_client --verify
-     ```
-   - Output must show `result=OK` and digest matching release notes.
-5. **Incident Response**
-   - If attestation fails, follow `docs/runbooks/patcher-attestation-alert.md`.
-   - Compliance requires documenting failure, timestamps, and remediation in ticketing system within 4 hours.
+## Assets and threats
 
-## Compliance Controls
-- **CI Gate:** `ci/security.yml` runs SLSA provenance verification and cosign checks.
-- **Runtime Logging:** Attestation and policy events stream to SIEM with 7-year retention.
-- **Access Control:** Only the `sd-release` role can update measurement bundles via signed commits.
-- **Change Management:** Threat model reviewed quarterly; updates require approval from Security Engineering + Compliance.
+| Asset/surface | Threat | Implemented control | Remaining responsibility |
+| --- | --- | --- | --- |
+| Trampoline table | Writable/executable memory or a corrupted indirect target | The whole table is built RW/non-executable, sealed RX, verified through `/proc/self/maps`, and never rewritten in production. Every target starts with `ENDBR64`. | Protect the process and binary from a same-privilege debugger or arbitrary memory-write primitive. |
+| Width selection | Executing an ISA unsupported by the CPU/OS or wider than policy allows | CPUID/XCR0 checks, configured AVX-512 opt-in, immutable slot bounds and live perf/temperature authorization. SSE4.1 is fail-closed. | Register only correct, equivalent application kernels and honor context synchronization rules. |
+| Local slot digest | Reporting a digest that races a width transition | Digest reads and selection are serialized; SHA-256 covers the active immutable slot. | The local digest is not a signature or remote attestation. An embedder must provision and authenticate any expected digest. |
+| Perf/thermal telemetry | Missing, stale or invalid readings leading to unsafe upgrades | Freshness checks, hardware-counter validation, raw-temperature upgrade guard, safe-width fallback and bounded re-probe. | Secure the kernel/hardware telemetry path; privileged host compromise can falsify it. |
+| Coefficient file | Malicious or unsuitable policy after startup/SIGHUP | Strict parser, bounded values, explicit reload API/SIGHUP handling, and retention of prior/fallback state on reload failure. | Restrict file write access and promote calibrated files with external provenance controls. |
+| Metrics listener | Information disclosure, credential guessing or slow-client starvation | Loopback default, optional TLS 1.2+/mTLS/Basic Auth, constant-time credential comparison, bounded queue/workers/request size and client deadlines. | Do not expose plain unauthenticated HTTP beyond a trusted boundary; apply network policy and secret management. |
+| Logs and HIL artifacts | Host/topology/thermal data disclosure or tampering | New per-run artifact directories and no recursive clearing of caller paths. | Restrict access, retention and upload destinations; sign artifacts externally if required. |
 
-## Residual Risks
-- Hardware sensor spoofing below firmware level (mitigated by redundant sensors when available).
-- Side-channel leakage via SIMD width transitions (mitigated with fixed-time dispatchers in high-sensitivity tenants).
+## Local trampoline measurement
 
-## Review History
-| Date | Reviewer | Notes |
-| --- | --- | --- |
-| 2024-04-12 | Security Engineering | Initial model created for v1.3. |
-| 2024-07-22 | Compliance | Added attestation expiry controls. |
-| 2025-03-05 | Platform + Security | Updated for predictive controller rollout and telemetry fusion. |
+[`include/patcher/attestation.h`](../../include/patcher/attestation.h) exposes:
+
+- `tsd_attestation_get_active_hash`;
+- `tsd_attestation_get_active_hash_hex`;
+- `tsd_attestation_expect_active_hash`;
+- `tsd_attestation_last_error`.
+
+The measurement is updated after a successful immutable-slot selection. A
+mismatch is returned to the caller and covered by the trampoline security test.
+There is no manifest loader, signature verifier, nonce protocol, enclave key,
+periodic remote verifier or attestation network service in this codebase.
+
+## Abuse cases
+
+### Unprivileged local workload
+
+An unprivileged peer may contend for CPU/cache resources or influence the
+thermal environment. The dispatcher can react conservatively, but it cannot
+attribute contention to a tenant or guarantee isolation. Use cpusets, scheduler
+controls and workload-specific SLOs at deployment level.
+
+### Compromised metrics client
+
+Metrics and health endpoints are read-only. A client can still consume bounded
+connection slots or collect operational data. Keep the listener on loopback or
+use TLS/auth plus network policy. The bounded queue and deadlines reduce, but do
+not eliminate, denial-of-service risk.
+
+### Compromised operator or host kernel
+
+An actor able to replace the binary, change arguments/configuration, ptrace the
+process or falsify kernel telemetry is inside the trust boundary. Use external
+artifact signing, measured boot, admission controls and least-privilege access
+where the deployment requires them; these are not supplied by this library.
+
+## Verification
+
+Hosted tests cover RX-only mappings, CET landing pads, local digest mismatch,
+host/policy width bounds, perf failover/recovery, raw-temperature authorization,
+metrics TLS/auth and slow clients. Bare-metal HIL is still required for actual
+perf permissions, sensors, thermal behavior and ISA execution on each target
+CPU family.
+
+## Residual risks
+
+- microarchitectural side channels and thermal/frequency coupling between
+  colocated workloads;
+- kernel or firmware telemetry errors below the process trust boundary;
+- denial of service through resource exhaustion outside exporter limits;
+- incorrect or semantically unequal application-registered kernels;
+- calibration error in deployment-specific controller coefficients;
+- local digest verification without an externally authenticated expected value.

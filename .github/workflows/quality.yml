@@ -34,7 +34,7 @@ jobs:
           fi
 
       - name: Configure
-        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTING=ON
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTING=ON -DTSD_BUILD_BENCHMARKS=ON
 
       - name: Build
         run: cmake --build build -j2
@@ -184,7 +184,55 @@ jobs:
       - name: Configure and build benchmark
         run: |
           cmake -S . -B build-bench -G Ninja -DCMAKE_BUILD_TYPE=Release -DTSD_BUILD_BENCHMARKS=ON
-          cmake --build build-bench --target benchmark_dispatch -j2
+          cmake --build build-bench --target benchmark_dispatch benchmark_registered_kernel -j2
 
       - name: Validate benchmark execution
-        run: ./build-bench/benchmark_dispatch 100000
+        run: |
+          bash -n ci/*.sh tests/hil/*.sh
+          python3 - <<'PY'
+          from pathlib import Path
+
+          for path in sorted(Path("ci").glob("*.py")):
+              compile(path.read_text(encoding="utf-8"), str(path), "exec")
+          PY
+          ./build-bench/benchmark_dispatch 100000
+          ./build-bench/benchmark_registered_kernel \
+            --mode=sse41 \
+            --duration-seconds=0.05 \
+            --work-items=4096 \
+            --chunk-items=1024 \
+            --rounds=2 \
+            --result-json=registered-kernel-smoke.json
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          result = json.loads(Path("registered-kernel-smoke.json").read_text(encoding="utf-8"))
+          assert result["mode"] == "sse41"
+          assert result["completed_passes"] > 0
+          assert result["completed_work_items"] > 0
+          assert result["checksum_fnv1a64"]
+          PY
+          python3 ci/controlled_benchmark.py \
+            --executable ./build-bench/benchmark_registered_kernel \
+            --target-isa sse41 \
+            --trials 2 \
+            --duration-seconds 0.05 \
+            --warmup-seconds 0 \
+            --cooldown-seconds 0 \
+            --sample-interval-seconds 0.05 \
+            --work-items 4096 \
+            --chunk-items 1024 \
+            --rounds 2 \
+            --output-json controlled-smoke.json \
+            --output-csv controlled-smoke.csv \
+            --log-dir controlled-smoke-trials
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          summary = json.loads(Path("controlled-smoke.json").read_text(encoding="utf-8"))
+          assert summary["target_isa"] == "sse41"
+          assert summary["modes"]["sse41"]["trial_count"] == 2
+          assert len(summary["trials"]) == 2
+          PY

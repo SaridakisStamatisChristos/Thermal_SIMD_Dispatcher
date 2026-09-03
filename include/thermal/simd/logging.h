@@ -22,10 +22,15 @@ int tsd_log_level_from_string(const char *level_str, tsd_log_level_t *out_level)
 const char* tsd_log_level_to_string(tsd_log_level_t level);
 const char* tsd_log_strerror(int errnum, char *buf, size_t buf_len);
 
-#define tsd_log_error(component, fmt, ...) tsd_log(TSD_LOG_LEVEL_ERROR, component, fmt, ##__VA_ARGS__)
-#define tsd_log_warn(component, fmt, ...)  tsd_log(TSD_LOG_LEVEL_WARN,  component, fmt, ##__VA_ARGS__)
-#define tsd_log_info(component, fmt, ...)  tsd_log(TSD_LOG_LEVEL_INFO,  component, fmt, ##__VA_ARGS__)
-#define tsd_log_debug(component, fmt, ...) tsd_log(TSD_LOG_LEVEL_DEBUG, component, fmt, ##__VA_ARGS__)
+/*
+ * Keep the complete component/format/argument list in one variadic pack.  Each
+ * call always supplies at least component and format, so this is standard C99
+ * and C++11 syntax and does not need GNU's `, ##__VA_ARGS__` extension.
+ */
+#define tsd_log_error(...) tsd_log(TSD_LOG_LEVEL_ERROR, __VA_ARGS__)
+#define tsd_log_warn(...)  tsd_log(TSD_LOG_LEVEL_WARN,  __VA_ARGS__)
+#define tsd_log_info(...)  tsd_log(TSD_LOG_LEVEL_INFO,  __VA_ARGS__)
+#define tsd_log_debug(...) tsd_log(TSD_LOG_LEVEL_DEBUG, __VA_ARGS__)
 
 #ifdef __cplusplus
 }

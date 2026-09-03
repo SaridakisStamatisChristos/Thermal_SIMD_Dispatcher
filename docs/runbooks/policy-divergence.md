@@ -1,50 +1,60 @@
-# Runbook: Policy Divergence
-
-## Summary
-Production nodes are reporting divergent SIMD policies (e.g., controllers running different coefficients, telemetry skew thresholds mismatched), leading to inconsistent throttling behavior across the fleet.
+# Runbook: Predictive Policy Divergence
 
 ## Detection
-- Fleet-level alert `predictive_policy_mismatch` firing from compliance dashboards.
-- Logs with `event=policy_digest` showing different hashes across nodes.
-- `/metrics` exposes `policy_reload_total` increasing unexpectedly.
 
-## Immediate Actions
-1. **Gather Evidence**
-   ```bash
-   kubectl get cm -n thermal-simd controller-policy -o yaml > /tmp/policy.yaml
-   kubectl logs <pod> | grep policy_digest | tail
-   ```
-2. **Compare Hashes**
-   ```bash
-   sha256sum config/controller_coeffs.json
-   ```
-   Ensure it matches the blessed hash in release notes.
+Use this runbook when equivalent nodes make materially different width
+recommendations or forecasts under comparable workload and thermal conditions.
+First rule out expected platform differences: CPU model/microcode, cooling,
+governor, affinity, kernel perf policy and sensor selection all affect results.
 
-## Remediation Steps
-1. **Lock Policy Config**
-   - Set `featureFreeze=true` in the policy ConfigMap to prevent hot reloads:
-     ```bash
-     kubectl patch cm controller-policy -p '{"data":{"featureFreeze":"true"}}'
-     ```
-2. **Redeploy With Blessed Config**
-   ```bash
-   kubectl create configmap controller-policy --from-file=config/controller_coeffs.json --dry-run=client -o yaml | kubectl apply -f -
-   kubectl rollout restart daemonset/thermal-simd
-   ```
-3. **Verify Alignment**
-   ```bash
-   kubectl exec <pod> -- ./tools/policy_digest --coeff-path /etc/tsd/controller_coeffs.json
-   ```
-   Compare digest output across multiple nodes.
-4. **Monitor Metrics**
-   - Confirm `predictive_policy_mismatch` alert clears.
-   - Ensure `predictive_forecasts_total` growth resumes uniformly across nodes.
+The repository does not ship a fleet policy-digest service or
+`predictive_policy_mismatch` alert. A deployment may build those controls around
+the coefficient file and logs.
 
-## Escalation
-- If divergence persists, involve Release Engineering to audit artifact promotion pipeline.
-- Notify compliance if divergence existed >2 hours to evaluate reporting obligations.
+## Gather evidence
 
-## Post-Incident
-- Document root cause in the incident tracker with links to ConfigMap changes.
-- Update `docs/predictive-controller.md` with any coefficient adjustments made.
-- Add regression test covering policy reload scenario if missing.
+For every affected node retain:
+
+- executable/version and exact Git commit;
+- `sha256sum` of the active coefficient file;
+- process arguments and `TSD_PREDICTIVE_COEFF_PATH`, if set;
+- CPU, microcode, kernel, governor and affinity;
+- `/healthz` snapshots and logs around each recommendation;
+- raw safety temperature, filtered control temperature, frequency ratio and
+  perf mode.
+
+Do not compare only `currentWidth`: live safety guards may correctly clamp a
+controller recommendation.
+
+## Configuration and reload checks
+
+The standalone executable loads coefficients at startup and handles SIGHUP as
+an explicit reload request. An embedding application can call
+`tsd_dispatcher_policy_reload`. A failed reload retains existing/fallback state
+and emits a log; there is no ConfigMap signature or feature-freeze mechanism in
+this repository.
+
+```bash
+sha256sum /etc/thermal-simd/controller_coeffs.json
+dispatcher_pid=1234  # replace with the real PID
+kill -HUP "${dispatcher_pid}"
+journalctl -u thermal-simd --since '5 minutes ago' | grep -E 'coefficient|SIGHUP|policy'
+```
+
+Confirm every node resolves the same path and digest. Also check file
+permissions and whether an orchestration layer projected different ConfigMap or
+secret revisions.
+
+## Recovery
+
+1. Restore the intended, calibrated coefficient file from a trusted release.
+2. Reload once or redeploy the affected instances.
+3. Confirm logs report a successful load from the intended path.
+4. Compare nodes again under controlled, equivalent telemetry and workload.
+5. If divergence persists with identical inputs, reproduce with
+   `test_policy_controller` and `test_arx_model`, then retain the health/log
+   sequence for a code defect investigation.
+
+Do not promote a coefficient change solely because nodes converge. Preserve
+the model's calibration provenance and validate it on each deployment CPU
+family as described in [`../model-provenance.md`](../model-provenance.md).

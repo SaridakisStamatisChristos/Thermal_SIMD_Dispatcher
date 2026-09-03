@@ -3,6 +3,14 @@ name: Hardware-in-the-Loop
 on:
   workflow_dispatch:
     inputs:
+      target_isa:
+        description: Widest SIMD ISA to exercise
+        required: true
+        type: choice
+        default: avx2
+        options:
+          - avx2
+          - avx512
       soak_minutes:
         description: Thermal characterization duration in minutes
         required: false
@@ -10,8 +18,15 @@ on:
 
 jobs:
   hardware-smoke:
-    runs-on: [self-hosted, hil, avx512]
+    runs-on:
+      - self-hosted
+      - linux
+      - x64
+      - hil
+      - ${{ inputs.target_isa }}
     timeout-minutes: 30
+    env:
+      HIL_TARGET_ISA: ${{ inputs.target_isa }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -20,8 +35,15 @@ jobs:
 
   stress-suite:
     needs: hardware-smoke
-    runs-on: [self-hosted, hil, avx512]
+    runs-on:
+      - self-hosted
+      - linux
+      - x64
+      - hil
+      - ${{ inputs.target_isa }}
     timeout-minutes: 60
+    env:
+      HIL_TARGET_ISA: ${{ inputs.target_isa }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -38,9 +60,15 @@ jobs:
 
   thermal-characterization:
     needs: stress-suite
-    runs-on: [self-hosted, hil, avx512]
+    runs-on:
+      - self-hosted
+      - linux
+      - x64
+      - hil
+      - ${{ inputs.target_isa }}
     timeout-minutes: 360
     env:
+      HIL_TARGET_ISA: ${{ inputs.target_isa }}
       SOAK_MINUTES: ${{ inputs.soak_minutes }}
       HIL_ARTIFACT_DIR: ${{ github.workspace }}/hil-artifacts
     steps:
@@ -53,8 +81,9 @@ jobs:
       - name: Publish characterization summary
         if: always()
         run: |
-          if [ -f hil-artifacts/summary.md ]; then
-            cat hil-artifacts/summary.md >> "$GITHUB_STEP_SUMMARY"
+          summary_path=$(find hil-artifacts -mindepth 2 -maxdepth 2 -type f -name summary.md -print -quit 2>/dev/null || true)
+          if [ -n "$summary_path" ]; then
+            cat "$summary_path" >> "$GITHUB_STEP_SUMMARY"
           else
             echo "# Thermal SIMD HIL characterization" >> "$GITHUB_STEP_SUMMARY"
             echo "Characterization did not produce a summary; inspect the uploaded logs." >> "$GITHUB_STEP_SUMMARY"
@@ -64,7 +93,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: thermal-simd-hil-${{ github.sha }}
+          name: thermal-simd-hil-${{ inputs.target_isa }}-${{ github.sha }}
           path: hil-artifacts/
           if-no-files-found: warn
           retention-days: 30

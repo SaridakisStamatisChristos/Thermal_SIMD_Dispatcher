@@ -26,7 +26,7 @@ variable "subnet_id" {
 }
 
 variable "ami_id" {
-  description = "Base AMI with AVX-512 capable kernel"
+  description = "Debian/Ubuntu-compatible base AMI exposing AVX-512"
   type        = string
 }
 
@@ -39,7 +39,7 @@ variable "instance_type" {
 variable "associate_public_ip" {
   description = "Associate a public IPv4 address with the runner"
   type        = bool
-  default     = true
+  default     = false
 }
 
 variable "ssh_key_name" {
@@ -47,16 +47,14 @@ variable "ssh_key_name" {
   type        = string
 }
 
-variable "ssh_private_key_path" {
-  description = "Local path to the SSH private key"
+variable "runner_authentication_token_parameter_arn" {
+  description = "ARN of an existing SSM SecureString containing the GitLab glrt- runner authentication token"
   type        = string
-  default     = "~/.ssh/id_rsa"
-}
 
-variable "runner_registration_token" {
-  description = "CI coordinator registration token"
-  type        = string
-  sensitive   = true
+  validation {
+    condition     = can(regex("^arn:[^:]+:ssm:[^:]+:[0-9]{12}:parameter/.+", var.runner_authentication_token_parameter_arn))
+    error_message = "Provide a complete SSM parameter ARN."
+  }
 }
 
 variable "runner_coordinator_url" {
@@ -64,16 +62,15 @@ variable "runner_coordinator_url" {
   type        = string
 }
 
-variable "runner_tags" {
-  description = "Tags advertised by the runner"
-  type        = list(string)
-  default     = ["hil", "avx512"]
-}
-
 variable "allowed_ssh_cidrs" {
-  description = "List of CIDR ranges allowed to SSH into the runner"
+  description = "Explicit trusted CIDR ranges allowed to SSH into the runner"
   type        = list(string)
-  default     = ["0.0.0.0/0"]
+  validation {
+    condition = length(var.allowed_ssh_cidrs) > 0 && alltrue([
+      for cidr in var.allowed_ssh_cidrs : cidr != "0.0.0.0/0" && cidr != "::/0"
+    ])
+    error_message = "Provide at least one trusted SSH CIDR; world-open CIDRs are not accepted."
+  }
 }
 
 variable "tags" {
