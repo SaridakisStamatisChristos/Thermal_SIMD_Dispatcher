@@ -84,10 +84,10 @@ const tsd_runtime_config *tsd_runtime_config_active_snapshot(void);
  * initialization branches unreachable after activation. White-box test builds
  * keep the real writable g_tsd_config so their mutation hooks remain valid.
  */
+#if defined(TSD_RUNTIME_INTERNAL_IMPL) && !defined(TSD_ENABLE_TESTS)
 static inline tsd_runtime_config *tsd_runtime_config_active_snapshot_internal(void) {
     return (tsd_runtime_config *)(uintptr_t)tsd_runtime_config_active_snapshot();
 }
-#if defined(TSD_RUNTIME_INTERNAL_IMPL) && !defined(TSD_ENABLE_TESTS)
 #define g_tsd_config (*tsd_runtime_config_active_snapshot_internal())
 #endif
 
