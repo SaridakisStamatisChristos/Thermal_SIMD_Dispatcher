@@ -1,0 +1,58 @@
+name: Fix PR 54 shutdown test split
+
+on:
+  pull_request:
+    types: [synchronize]
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    if: github.event.pull_request.head.ref == 'deep-audit-fixes-v0.4.2' && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout PR head branch
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+
+      - name: Restore production lifecycle suite and add isolated white-box stop test
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          cmake = Path('CMakeLists.txt')
+          text = cmake.read_text(encoding='utf-8')
+          old = '''    # Lifecycle fault-injection hooks live only in the white-box build. Compile\n    # the public wrapper plus private runtime implementation into this test so\n    # production thermal_simd_core remains free of test-only symbols.\n    add_executable(test_runtime_lifecycle\n        tests/runtime/test_runtime_lifecycle.c\n        src/runtime_api.c\n        src/thermal_simd.c)\n    target_link_libraries(test_runtime_lifecycle PRIVATE thermal_simd_core_tests Threads::Threads m ${TSD_CXX_RUNTIME_LIBRARIES})\n    target_compile_definitions(test_runtime_lifecycle PRIVATE TSD_ENABLE_TESTS)\n    target_compile_options(test_runtime_lifecycle PRIVATE -Wall -Wextra -pthread -fPIC -mno-avx ${THERMAL_SIMD_DISPATCHER_CPU_FLAGS})\n    target_include_directories(test_runtime_lifecycle PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)\n    set_target_properties(test_runtime_lifecycle PROPERTIES LINKER_LANGUAGE CXX)\n    add_test(NAME runtime_lifecycle COMMAND test_runtime_lifecycle)\n'''
+          new = '''    add_executable(test_runtime_lifecycle tests/runtime/test_runtime_lifecycle.c)\n    target_link_libraries(test_runtime_lifecycle PRIVATE thermal_simd_core Threads::Threads)\n    target_compile_options(test_runtime_lifecycle PRIVATE -Wall -Wextra -pthread)\n    target_include_directories(test_runtime_lifecycle PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)\n    add_test(NAME runtime_lifecycle COMMAND test_runtime_lifecycle)\n\n    # Deterministic shutdown-failure injection belongs in an isolated white-box\n    # target so the production lifecycle suite continues exercising the exact\n    # installed runtime/trampoline semantics.\n    add_executable(test_runtime_stop_faults\n        tests/runtime/test_runtime_stop_faults.c\n        src/runtime_api.c\n        src/thermal_simd.c)\n    target_link_libraries(test_runtime_stop_faults PRIVATE thermal_simd_core_tests Threads::Threads m ${TSD_CXX_RUNTIME_LIBRARIES})\n    target_compile_definitions(test_runtime_stop_faults PRIVATE TSD_ENABLE_TESTS)\n    target_compile_options(test_runtime_stop_faults PRIVATE -Wall -Wextra -pthread -fPIC -mno-avx ${THERMAL_SIMD_DISPATCHER_CPU_FLAGS})\n    target_include_directories(test_runtime_stop_faults PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)\n    set_target_properties(test_runtime_stop_faults PROPERTIES LINKER_LANGUAGE CXX)\n    add_test(NAME runtime_stop_faults COMMAND test_runtime_stop_faults)\n'''
+          if text.count(old) != 1:
+              raise SystemExit(f'CMake lifecycle block mismatch: {text.count(old)}')
+          cmake.write_text(text.replace(old, new, 1), encoding='utf-8')
+
+          lifecycle = Path('tests/runtime/test_runtime_lifecycle.c')
+          text = lifecycle.read_text(encoding='utf-8')
+          text = text.replace('#include "runtime_guard_internal.h"\n#include "thermal_simd_test.h"\n', '#include "runtime_guard_internal.h"\n', 1)
+          start = text.find('static void test_stop_failures_are_retryable(void) {')
+          end_marker = '\nint main(void) {'
+          if start < 0:
+              raise SystemExit('stop failure helper not found')
+          end = text.find(end_marker, start)
+          if end < 0:
+              raise SystemExit('main marker not found')
+          text = text[:start] + text[end + 1:]
+          call = '    test_stop_failures_are_retryable();\n'
+          if text.count(call) != 1:
+              raise SystemExit(f'stop failure call mismatch: {text.count(call)}')
+          text = text.replace(call, '', 1)
+          lifecycle.write_text(text, encoding='utf-8')
+          PY
+
+      - name: Commit shutdown test split
+        run: |
+          if git diff --quiet; then exit 0; fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add CMakeLists.txt tests/runtime/test_runtime_lifecycle.c
+          git commit -m "Isolate shutdown fault injection from production lifecycle tests"
+          git push origin HEAD:${{ github.event.pull_request.head.ref }}
