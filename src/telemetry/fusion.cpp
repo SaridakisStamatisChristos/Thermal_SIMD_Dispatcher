@@ -11,6 +11,16 @@
 
 namespace telemetry {
 
+namespace {
+
+void publish_fusion_running_state(int running) {
+    tsd_fusion_telemetry_t telemetry{};
+    telemetry.running = running ? 1 : 0;
+    tsd_observability_update_fusion(&telemetry);
+}
+
+}  // namespace
+
 TelemetrySnapshotRingBuffer::TelemetrySnapshotRingBuffer(std::size_t capacity)
     : capacity_(capacity ? capacity : 1),
       buffer_(capacity_),
@@ -27,9 +37,7 @@ void TelemetrySnapshotRingBuffer::publish(const TelemetrySnapshot &snapshot) {
 
 std::optional<TelemetrySnapshot> TelemetrySnapshotRingBuffer::latest() const {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (last_generation_ == 0) {
-        return std::nullopt;
-    }
+    if (last_generation_ == 0) return std::nullopt;
     return buffer_[head_];
 }
 
@@ -39,9 +47,7 @@ std::optional<TelemetrySnapshot> TelemetrySnapshotRingBuffer::wait_for(
     if (generation == 0 || generation > last_generation_) {
         cv_.wait_for(lock, timeout, [&] { return last_generation_ >= generation && last_generation_ != 0; });
     }
-    if (last_generation_ == 0 || last_generation_ < generation) {
-        return std::nullopt;
-    }
+    if (last_generation_ == 0 || last_generation_ < generation) return std::nullopt;
     return buffer_[head_];
 }
 
@@ -53,9 +59,7 @@ TelemetryFusion::TelemetryFusion(TelemetryFusionConfig config,
       ring_(config_.ring_size),
       running_(false),
       generation_(0) {
-    if (!bus_manager_) {
-        bus_manager_ = std::make_shared<TelemetryBusManager>();
-    }
+    if (!bus_manager_) bus_manager_ = std::make_shared<TelemetryBusManager>();
     bus_manager_->set_bus(bus_);
 }
 
@@ -67,44 +71,106 @@ TelemetryFusion::~TelemetryFusion() {
 }
 
 void TelemetryFusion::start() {
-    bool expected = false;
-    if (!running_.compare_exchange_strong(expected, true)) {
+    std::lock_guard<std::mutex> lock(thread_mutex_);
+    if (running_.load(std::memory_order_acquire) || stop_callers_ != 0 ||
+        stop_join_in_progress_ || thread_.joinable()) {
         return;
     }
-    std::lock_guard<std::mutex> lock(thread_mutex_);
+
+    running_.store(true, std::memory_order_release);
     try {
         thread_ = std::thread([this] { run(); });
+        worker_thread_id_ = thread_.get_id();
     } catch (...) {
+        worker_thread_id_ = std::thread::id{};
         running_.store(false, std::memory_order_release);
+        publish_fusion_running_state(0);
         throw;
     }
-    tsd_fusion_telemetry_t telemetry{};
-    telemetry.running = 1;
-    tsd_observability_update_fusion(&telemetry);
+
+    /* Lifecycle observability is published under the same mutex as the thread
+     * state, so an older stop cannot overwrite a newer successful start. */
+    publish_fusion_running_state(1);
 }
 
 void TelemetryFusion::stop() {
-    bool expected = true;
-    if (!running_.compare_exchange_strong(expected, false)) {
+    std::thread joiner;
+    const std::thread::id caller = std::this_thread::get_id();
+
+    std::unique_lock<std::mutex> lock(thread_mutex_);
+    ++stop_callers_;
+
+    /* running_ is the predicate for wake_cv_. Synchronize its stop transition
+     * with wake_mutex_ so notification cannot be lost between the worker's
+     * predicate check and the atomic release performed by condition_variable.
+     * Without this mutex pairing, an interruptible 5-second poll could really
+     * take the full 5 seconds to stop under an unlucky interleaving. */
+    {
+        std::lock_guard<std::mutex> wake_lock(wake_mutex_);
+        running_.store(false, std::memory_order_release);
+    }
+    wake_cv_.notify_all();
+
+    const bool caller_is_worker = worker_thread_id_ != std::thread::id{} &&
+                                  worker_thread_id_ == caller;
+
+    if (stop_join_in_progress_) {
+        if (caller_is_worker) {
+            /* An external stop already owns the join and is waiting for this
+             * worker to return. Waiting here would deadlock that join. */
+            --stop_callers_;
+            thread_cv_.notify_all();
+            return;
+        }
+
+        thread_cv_.wait(lock, [&] { return !stop_join_in_progress_; });
+        /* The join owner publishes the stopped state before clearing the flag.
+         * stop_callers_ keeps start() closed until every overlapping stop has
+         * observed that completed lifecycle transition. */
+        --stop_callers_;
+        thread_cv_.notify_all();
         return;
     }
-    {
-        std::lock_guard<std::mutex> lock(thread_mutex_);
-        if (thread_.joinable()) {
-            thread_.join();
-        }
+
+    if (!thread_.joinable()) {
+        publish_fusion_running_state(0);
+        worker_thread_id_ = std::thread::id{};
+        --stop_callers_;
+        thread_cv_.notify_all();
+        return;
     }
-    tsd_fusion_telemetry_t telemetry{};
-    telemetry.running = 0;
-    tsd_observability_update_fusion(&telemetry);
+
+    if (caller_is_worker) {
+        /* A collector/provider may request stop from the worker itself. It
+         * cannot join itself; leave the completed thread joinable so the next
+         * external stop/destructor can reap it safely. */
+        publish_fusion_running_state(0);
+        --stop_callers_;
+        thread_cv_.notify_all();
+        return;
+    }
+
+    stop_join_in_progress_ = true;
+    joiner = std::move(thread_);
+    lock.unlock();
+
+    joiner.join();
+
+    lock.lock();
+    worker_thread_id_ = std::thread::id{};
+    /* Publish stopped before reopening lifecycle admission. This closes the
+     * old race where start() could publish running=true and then be overwritten
+     * by the previous stop's delayed running=false publication. */
+    publish_fusion_running_state(0);
+    stop_join_in_progress_ = false;
+    --stop_callers_;
+    thread_cv_.notify_all();
 }
 
-bool TelemetryFusion::running() const { return running_.load(); }
+bool TelemetryFusion::running() const { return running_.load(std::memory_order_acquire); }
 
 void TelemetryFusion::register_collector(TelemetryCollectorPtr collector) {
-    if (!collector) {
-        return;
-    }
+    if (!collector) return;
     bus_manager_->add_collector(std::move(collector));
 }
 
@@ -138,12 +204,15 @@ void TelemetryFusion::run() {
         }
 
         next_run += config_.poll_interval;
-        auto sleep_duration = next_run - std::chrono::steady_clock::now();
-        if (sleep_duration > std::chrono::milliseconds::zero()) {
-            std::this_thread::sleep_for(sleep_duration);
-        } else {
-            next_run = std::chrono::steady_clock::now();
+        auto now = std::chrono::steady_clock::now();
+        if (next_run <= now) {
+            next_run = now;
+            continue;
         }
+        std::unique_lock<std::mutex> wake_lock(wake_mutex_);
+        wake_cv_.wait_until(wake_lock, next_run, [&] {
+            return !running_.load(std::memory_order_acquire);
+        });
     }
 }
 
@@ -151,7 +220,6 @@ TelemetrySnapshot TelemetryFusion::fuse(std::chrono::steady_clock::time_point no
     TelemetrySnapshot snapshot;
     snapshot.generation = ++generation_;
     snapshot.capture_time = now;
-
     snapshot.degraded = false;
 
     assign_value(TelemetrySignal::kPackageTempC, snapshot.package_temp_c, snapshot.temp_available, now);
@@ -159,15 +227,8 @@ TelemetrySnapshot TelemetryFusion::fuse(std::chrono::steady_clock::time_point no
     assign_value(TelemetrySignal::kThermalCpi, snapshot.thermal_cpi, snapshot.cpi_available, now);
     assign_value(TelemetrySignal::kPowerBudgetWatts, snapshot.power_budget_w, snapshot.power_available, now);
 
-    /*
-     * Temperature and frequency are the production fusion bridge's required
-     * signals. CPI remains authoritative in thermal_perf.c and power is an
-     * optional enrichment, so their absence must not make otherwise valid
-     * hardware thermal telemetry look permanently degraded.
-     */
-    if (!snapshot.temp_available || !snapshot.freq_available) {
-        snapshot.degraded = true;
-    }
+    if (!snapshot.temp_available || !snapshot.freq_available) snapshot.degraded = true;
+
     tsd_fusion_telemetry_t telemetry{};
     telemetry.running = running_.load(std::memory_order_acquire) ? 1 : 0;
     telemetry.degraded = snapshot.degraded ? 1 : 0;
@@ -187,21 +248,22 @@ bool TelemetryFusion::assign_value(TelemetrySignal signal,
                                    double &out_value,
                                    bool &out_flag,
                                    std::chrono::steady_clock::time_point now) {
-    auto reading = bus_->latest(signal);
-    if (!reading || !reading->valid) {
+    const auto candidates = bus_->readings(signal);
+    const TelemetryReading *best = nullptr;
+    for (const auto &reading : candidates) {
+        if (!reading.valid || !std::isfinite(reading.value)) continue;
+        if (reading.timestamp.time_since_epoch().count() == 0 || reading.timestamp > now) continue;
+        if (now - reading.timestamp > config_.freshness_window) continue;
+        if (!best || reading.quality > best->quality ||
+            (reading.quality == best->quality && reading.timestamp > best->timestamp)) {
+            best = &reading;
+        }
+    }
+    if (!best) {
         out_flag = false;
         return false;
     }
-    if (reading->timestamp > now) {
-        out_flag = false;
-        return false;
-    }
-    auto age = now - reading->timestamp;
-    if (age > config_.freshness_window) {
-        out_flag = false;
-        return false;
-    }
-    out_value = reading->value;
+    out_value = best->value;
     out_flag = true;
     return true;
 }

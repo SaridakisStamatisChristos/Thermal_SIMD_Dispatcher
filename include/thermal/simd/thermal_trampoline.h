@@ -24,8 +24,8 @@
  *
  * Production code slots are created once on a writable, non-executable page,
  * then the page is sealed read+execute before any slot can be published.
- * Runtime width changes select between immutable RX slots with an atomic
- * pointer update; executable code is never rewritten while the process runs.
+ * Runtime width changes select between immutable RX slots; executable code is
+ * never rewritten while the process runs.
  */
 #if defined(__cplusplus)
 struct alignas(64) tsd_patch_slot_t {
@@ -53,6 +53,11 @@ typedef struct {
     unsigned int pkru_disable_mask;
 } tsd_trampoline_ctx_t;
 
+typedef struct {
+    simd_width_t width;
+    tsd_patch_slot_t *active;
+} tsd_trampoline_selection_t;
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -61,12 +66,10 @@ extern tsd_trampoline_ctx_t g_tsd_trampoline_ctx;
 extern pthread_mutex_t g_tsd_patch_lock;
 
 /*
- * The raw atomic objects are owned and defined by a C translation unit so their
- * representation is governed exclusively by C11. C++ code must use the C ABI
- * accessors below and never redeclare these objects as std::atomic<T>.
- *
- * g_tsd_current_width_byte and g_tsd_active_trampoline intentionally retain
- * stable C symbols because the naked assembly shim addresses them directly.
+ * Raw compatibility atomics are owned by a C translation unit. Control and
+ * execution paths that need a coherent {width,target} pair must use
+ * tsd_trampoline_state_snapshot(), whose authority is one atomic machine word.
+ * The legacy symbols remain for signal diagnostics and ABI compatibility only.
  */
 #ifndef __cplusplus
 extern _Atomic(simd_width_t) g_tsd_current_width;
@@ -79,6 +82,7 @@ extern _Atomic(bool) g_tsd_page_a_effective_writable;
 extern _Atomic(bool) g_tsd_page_b_effective_writable;
 #endif
 
+int tsd_trampoline_state_snapshot(tsd_trampoline_selection_t *out);
 simd_width_t tsd_trampoline_state_current_width(void);
 unsigned char tsd_trampoline_state_current_width_byte(void);
 int tsd_trampoline_state_initialized(void);
@@ -99,12 +103,10 @@ int tsd_trampoline_init(void);
 
 /*
  * Compatibility name retained for existing callers. This no longer rewrites
- * executable memory; it atomically selects an already-sealed implementation.
- * Production builds reject widths that exceed host ISA/static AVX-512 policy
- * and, while the adaptive runtime is active, also reject wider widths that are
- * not currently authorized by fresh perf and raw-temperature safety state.
- * White-box test builds retain controlled override hooks for deterministic
- * executable-memory regression tests.
+ * executable memory; it selects an already-sealed implementation. Production
+ * builds reject widths that exceed host ISA/static AVX-512 policy and, while
+ * the adaptive runtime is active, also reject wider widths that are not
+ * currently authorized by fresh perf and raw-temperature safety state.
  */
 int tsd_trampoline_patch(simd_width_t new_width);
 int init_double_buffer_trampoline(void);

@@ -107,6 +107,32 @@ static int physical_package_id(int cpu) {
     return (int)package;
 }
 
+
+static int physical_package_count(void) {
+    DIR *dir = opendir("/sys/devices/system/cpu");
+    if (!dir) return 0;
+    int packages[256];
+    size_t count = 0;
+    struct dirent *entry = NULL;
+    while ((entry = readdir(dir)) != NULL) {
+        if (strncmp(entry->d_name, "cpu", 3) != 0) continue;
+        const char *digits = entry->d_name + 3;
+        if (*digits < '0' || *digits > '9') continue;
+        char *end = NULL;
+        long cpu = strtol(digits, &end, 10);
+        if (!end || *end != '\0' || cpu < 0 || cpu > 1048576) continue;
+        int package = physical_package_id((int)cpu);
+        if (package < 0) continue;
+        int seen = 0;
+        for (size_t i = 0; i < count; ++i) {
+            if (packages[i] == package) { seen = 1; break; }
+        }
+        if (!seen && count < sizeof(packages) / sizeof(packages[0])) packages[count++] = package;
+    }
+    closedir(dir);
+    return (int)count;
+}
+
 static int label_mentions_package(const char *label, int package_id) {
     if (!label || package_id < 0) return 0;
     char needle[64];
@@ -259,6 +285,14 @@ static int detect_temp_sensor(tsd_telemetry_helper_t *helper) {
     scan_hwmon(package_id, &best);
 
     if (best.score < 0 || best.path[0] == '\0') return 0;
+
+    const int package_count = physical_package_count();
+    if (package_count > 1 && (package_id < 0 || !best.explicit_package_match)) {
+        tsd_log_warn(LOG_COMPONENT,
+                     "multi-package host requires explicit package-labelled thermal authority; cpu=%d package=%d packages=%d",
+                     helper->cpu, package_id, package_count);
+        return 0;
+    }
 
     /*
      * On multi-package hosts an unlabeled top-scoring package sensor is not a

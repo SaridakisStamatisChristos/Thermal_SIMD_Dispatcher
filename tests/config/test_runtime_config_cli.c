@@ -185,7 +185,27 @@ static void test_cli_overrides_config(void) {
     unlink(path);
 }
 
+
+static void test_config_defaults_are_pure(void) {
+    tsd_runtime_config_reset_dynamic_state();
+    tsd_runtime_config_set_defaults(&g_tsd_config);
+    tsd_runtime_config_enter_degraded_mode(&g_tsd_config, "test");
+    assert(tsd_runtime_config_is_degraded());
+
+    tsd_runtime_config local;
+    tsd_runtime_config_set_defaults(&local);
+    assert(tsd_runtime_config_is_degraded());
+    tsd_runtime_config_enter_degraded_mode(&local, "must-not-own-global-state");
+    assert(tsd_runtime_config_is_degraded());
+    tsd_runtime_config_exit_degraded_mode(&local, "must-not-own-global-state");
+    assert(tsd_runtime_config_is_degraded());
+
+    tsd_runtime_config_exit_degraded_mode(&g_tsd_config, "test-done");
+    assert(!tsd_runtime_config_is_degraded());
+}
+
 int main(void) {
+    test_config_defaults_are_pure();
     test_cli_predictive_and_metrics();
     test_service_cli();
     test_config_file_loading();

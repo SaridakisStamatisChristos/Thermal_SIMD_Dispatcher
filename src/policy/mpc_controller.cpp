@@ -19,9 +19,12 @@ namespace policy {
 namespace {
 constexpr double kMinImprovement = 1.0;
 constexpr double kDefaultRatioTrendWeight = 0.25;
-/* Thermal cost is one-sided: cooler than the SLO is not a defect. */
+constexpr double kRatioViolationWeight = 4.0;
+constexpr double kRatioEfficiencyWeight = 0.05;
 constexpr double kTemperatureWeight = 0.25;
 constexpr double kStabilityMargin = 0.25;
+constexpr double kHorizonDiscount = 0.90;
+constexpr double kHardConstraintCost = 1.0e9;
 constexpr std::chrono::milliseconds kDefaultStalenessWindow{500};
 
 inline int widthIndex(simd_width_t width) { return static_cast<int>(width); }
@@ -133,9 +136,6 @@ double MPCController::computeForecastTemperature(size_t horizon, size_t &valid_c
         bool ok = false;
         double prediction = arx_model_.predict(history_, &ok);
         if (ok) {
-            /* Never let a one-step thermal decision become less conservative
-             * than a fresh observed control temperature solely because a demo
-             * plant model under-predicts it. */
             const TelemetrySample &latest = history_.back();
             if (latest.temp_valid) prediction = std::max(prediction, latest.temperature_millic);
             valid_count = 1;
@@ -164,28 +164,57 @@ double MPCController::scoreWidth(simd_width_t candidate,
                                  double ratio_trend,
                                  double forecast_temp) const {
     const int control_step = widthIndex(candidate) - widthIndex(current);
+    const double ratio_benefit = arx_model_.widthPerformanceBenefitMilliPerStep();
+    const double temp_effect = arx_model_.widthTemperatureMillicPerStep();
 
-    double ratio_projection = forecast_ratio + ratio_trend * runtimeTrendWeight();
-    ratio_projection -= static_cast<double>(control_step) * arx_model_.widthPerformanceBenefitMilliPerStep();
-    if (ratio_projection < 0.0) ratio_projection = 0.0;
-    double ratio_cost = std::fabs(ratio_projection - static_cast<double>(config_.slo_ratio_milli));
+    double cost = 0.0;
+    double discount = 1.0;
+    const size_t rollout = std::max<std::size_t>(1, horizon);
+    for (size_t step = 1; step <= rollout; ++step) {
+        /* First-order actuator response: 50%, 75%, 87.5%, ... of the fitted
+         * steady width effect. This creates an actual finite-horizon rollout
+         * rather than applying one static offset to a one-step forecast. */
+        const double response = 1.0 - std::pow(0.5, static_cast<double>(step));
+        double ratio_projection = forecast_ratio +
+            ratio_trend * runtimeTrendWeight() * static_cast<double>(step);
+        ratio_projection -= static_cast<double>(control_step) * ratio_benefit * response;
+        if (ratio_projection < 0.0) ratio_projection = 0.0;
 
-    double temp_cost = 0.0;
-    if (config_.slo_temp_millic != 0 && horizon > 0 && std::isfinite(forecast_temp)) {
-        double temp_projection = forecast_temp +
-            static_cast<double>(control_step) * arx_model_.widthTemperatureMillicPerStep();
-        double excess = temp_projection - static_cast<double>(config_.slo_temp_millic);
-        if (excess > 0.0) temp_cost = excess * kTemperatureWeight;
+        /* ratio_milli is a degradation ceiling: lower is better. Never punish
+         * a prediction simply for being farther below the SLO. */
+        const double ratio_excess = std::max(
+            0.0, ratio_projection - static_cast<double>(config_.slo_ratio_milli));
+        const double ratio_cost = ratio_excess * kRatioViolationWeight +
+                                  ratio_projection * kRatioEfficiencyWeight;
+
+        double temp_cost = 0.0;
+        if (std::isfinite(forecast_temp)) {
+            const double temp_projection = forecast_temp +
+                static_cast<double>(control_step) * temp_effect * response;
+            if (config_.slo_temp_millic != 0) {
+                const double excess = temp_projection - static_cast<double>(config_.slo_temp_millic);
+                if (excess > 0.0) temp_cost += excess * kTemperatureWeight;
+            }
+            if (g_tsd_config.predictive_temp_ceiling_c >= 20 &&
+                g_tsd_config.predictive_temp_ceiling_c <= 125) {
+                const double hard_limit = static_cast<double>(g_tsd_config.predictive_temp_ceiling_c) * 1000.0;
+                if (temp_projection > hard_limit) {
+                    temp_cost += kHardConstraintCost + (temp_projection - hard_limit);
+                }
+            }
+        }
+
+        cost += discount * (ratio_cost + temp_cost);
+        discount *= kHorizonDiscount;
     }
 
-    double transition_penalty = 0.0;
     if (candidate != current) {
         double base_penalty = widthIndex(candidate) < widthIndex(current)
                                   ? static_cast<double>(config_.transition_penalty_down_milli)
                                   : static_cast<double>(config_.transition_penalty_up_milli);
-        transition_penalty = base_penalty * std::abs(control_step);
+        cost += base_penalty * std::abs(control_step);
     }
-    return ratio_cost + temp_cost + transition_penalty;
+    return cost;
 }
 
 bool MPCController::recommend(simd_width_t current_width,
@@ -231,9 +260,10 @@ bool MPCController::recommend(simd_width_t current_width,
     simd_width_t best_width = current_width;
     auto evaluate_width = [&](simd_width_t candidate) {
         if (widthIndex(candidate) > widthIndex(max_width)) return;
-        double cost = scoreWidth(candidate, current_width, horizon, forecast_ratio, ratio_trend, forecast_temp);
-        if (cost + kStabilityMargin < best_cost) {
-            best_cost = cost;
+        double candidate_cost = scoreWidth(candidate, current_width, horizon,
+                                           forecast_ratio, ratio_trend, forecast_temp);
+        if (candidate_cost + kStabilityMargin < best_cost) {
+            best_cost = candidate_cost;
             best_width = candidate;
         }
     };
@@ -248,14 +278,15 @@ bool MPCController::recommend(simd_width_t current_width,
         return false;
     }
 
-    double current_cost = scoreWidth(current_width, current_width, horizon, forecast_ratio, ratio_trend, forecast_temp);
+    double current_cost = scoreWidth(current_width, current_width, horizon,
+                                     forecast_ratio, ratio_trend, forecast_temp);
     if (current_cost - best_cost < kMinImprovement) {
         out_width = current_width;
         return false;
     }
 
-    tsd_log_info("policy", "decision current=%d target=%d forecast_ratio=%.2f forecast_temp=%.2f",
-                 widthIndex(current_width), widthIndex(best_width), forecast_ratio, forecast_temp);
+    tsd_log_info("policy", "decision current=%d target=%d horizon=%zu forecast_ratio=%.2f forecast_temp=%.2f",
+                 widthIndex(current_width), widthIndex(best_width), horizon, forecast_ratio, forecast_temp);
     tsd_metrics_increment(TSD_METRIC_PREDICTIVE_DECISIONS);
     out_width = best_width;
     return true;

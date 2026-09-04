@@ -32,7 +32,7 @@ typedef struct {
     int thermal_ratio_weight_milli;
     int degraded_timeout_sec;
     /* Compatibility/configuration field. Runtime degraded state is published
-     * separately by tsd_runtime_config_is_degraded() and no longer mutates this
+     * separately by tsd_runtime_config_is_degraded() and never mutates this
      * structure after startup. */
     int degraded_policy_active;
     int health_check_mode;
@@ -62,15 +62,17 @@ typedef struct {
 
 extern tsd_runtime_config g_tsd_config;
 
+/* Pure value initializers: these never modify process-global runtime state. */
 void tsd_runtime_config_set_defaults(tsd_runtime_config *cfg);
 int tsd_runtime_config_refresh_ticks(tsd_runtime_config *cfg);
 
 /*
- * Degraded mode no longer rewrites g_tsd_config in place. The startup
- * configuration remains immutable while the runtime is active; dynamic policy
- * callers use the effective accessors below. This removes cross-thread data
- * races during perf fallback/recovery.
+ * Dynamic degraded mode is one process-wide runtime overlay, deliberately
+ * separate from configuration values. Only the active global runtime config
+ * may enter/exit this state; initializing or editing an unrelated config value
+ * can never alter a live runtime's conservative policy.
  */
+void tsd_runtime_config_reset_dynamic_state(void);
 void tsd_runtime_config_enter_degraded_mode(tsd_runtime_config *cfg, const char *reason);
 void tsd_runtime_config_exit_degraded_mode(tsd_runtime_config *cfg, const char *reason);
 int tsd_runtime_config_is_degraded(void);

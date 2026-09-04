@@ -127,6 +127,7 @@ bool publish_sample_unlocked(const tsd_telemetry_sample_t &sample) {
         reading.valid = true;
         reading.quality = 100;
         reading.timestamp = now;
+        reading.source = "direct";
         bus->publish(telemetry::TelemetrySignal::kPackageTempC, reading);
         published = true;
     }
@@ -137,6 +138,7 @@ bool publish_sample_unlocked(const tsd_telemetry_sample_t &sample) {
         reading.valid = true;
         reading.quality = 100;
         reading.timestamp = now;
+        reading.source = "direct";
         bus->publish(telemetry::TelemetrySignal::kFrequencyRatio, reading);
         published = true;
     }

@@ -23,6 +23,8 @@
 #include <thermal/simd/metrics.h>
 #include <thermal/simd/thermal_trampoline.h>
 
+#include "runtime_guard_internal.h"
+
 #define LOG_COMPONENT "perf"
 #define RATIO_HISTORY TSD_RATIO_HISTORY
 #define FAST_EWMA_SHIFT 2
@@ -48,6 +50,8 @@ struct perf_ctx {
     int fd_llc_misses;
     uint64_t baseline_cpi;
     uint64_t calibrated_cpi_reference;
+    uint64_t baseline_work_cost_milli;
+    uint64_t calibrated_work_reference;
     uint64_t baseline_llc_mpki_milli;
     uint64_t slow_cpi;
     uint64_t fast_cpi;
@@ -74,6 +78,7 @@ struct perf_ctx {
     int software_adaptation;
     struct timespec sw_last_timestamp;
     uint64_t sw_last_iterations;
+    uint64_t hw_last_iterations;
     tsd_workload_fn workload;
     tsd_telemetry_helper_t telemetry;
     int fusion_acquired;
@@ -198,15 +203,19 @@ static void perf_set_mode(perf_ctx_t *ctx, tsd_perf_mode_t mode, const char *rea
     const char *why = reason ? reason : "unknown";
 
     if (mode == TSD_PERF_MODE_SOFTWARE) {
-        /* Hardware CPI is not comparable to software ns/work-item. */
+        /* Revoke admission before changing any physical selector. The guard
+         * publication below is authoritative; SSE selection is then cleanup. */
+        tsd_runtime_wide_admission_close();
         ctx->calibrated_cpi_reference = 0;
+        ctx->calibrated_work_reference = 0;
         ctx->hardware_validated = 0;
         tsd_metrics_increment(TSD_METRIC_PERF_FALLBACKS);
         tsd_runtime_config_enter_degraded_mode(&g_tsd_config, why);
+        publish_perf_state(ctx, 0);
         tsd_log_warn(LOG_COMPONENT,
                      "event=perf_mode state=software reason=%s workload_tid=%d pinned_cpu=%d monitor_cpu=%d",
                      why, (int)ctx->owner_tid, ctx->pinned_cpu, ctx->monitor_cpu);
-        if (atomic_load_explicit(&g_tsd_current_width, memory_order_acquire) != SIMD_SSE41) {
+        if (tsd_trampoline_state_current_width() != SIMD_SSE41) {
             if (tsd_trampoline_patch(SIMD_SSE41) == 0) {
                 tsd_log_warn(LOG_COMPONENT, "event=perf_mode action=forced-width width=SSE4.1 reason=%s", why);
             } else {
@@ -214,7 +223,6 @@ static void perf_set_mode(perf_ctx_t *ctx, tsd_perf_mode_t mode, const char *rea
                               why, errno);
             }
         }
-        publish_perf_state(ctx, 0);
     } else if (mode == TSD_PERF_MODE_HARDWARE) {
         if (previous == TSD_PERF_MODE_SOFTWARE && ctx->hardware_validated) {
             tsd_metrics_increment(TSD_METRIC_PERF_RECOVERIES);
@@ -771,7 +779,9 @@ static int measure_hardware_baseline(perf_ctx_t *ctx, const tsd_runtime_config *
         llc_before = 0;
     }
 
+    uint64_t work_before = atomic_load_explicit(&g_tsd_workload_iterations, memory_order_relaxed);
     create_baseline_observation(ctx);
+    uint64_t work_after = atomic_load_explicit(&g_tsd_workload_iterations, memory_order_relaxed);
 
     if (tsd_perf_read_exact(ctx->fd_cycles, &rd_after, sizeof(rd_after)) != 0 || rd_after.nr != 2) {
         return -1;
@@ -801,6 +811,12 @@ static int measure_hardware_baseline(perf_ctx_t *ctx, const tsd_runtime_config *
 
     ctx->baseline_cpi = (delta_cycles * 1000) / delta_insns;
     ctx->calibrated_cpi_reference = ctx->baseline_cpi ? ctx->baseline_cpi : 1;
+    uint64_t baseline_work = work_after >= work_before ? work_after - work_before : 0;
+    ctx->baseline_work_cost_milli = baseline_work
+        ? (uint64_t)(((__uint128_t)delta_cycles * 1000u) / baseline_work)
+        : 0;
+    ctx->calibrated_work_reference = ctx->baseline_work_cost_milli;
+    ctx->hw_last_iterations = work_after;
     uint64_t delta_llc = (ctx->fd_llc_misses >= 0 && llc_after >= llc_before) ? (llc_after - llc_before) : 0;
     ctx->baseline_llc_mpki_milli = (delta_llc * MPKI_SCALE) / delta_insns;
     if (ctx->baseline_llc_mpki_milli == 0) {
@@ -937,7 +953,8 @@ static void try_recover_llc(perf_ctx_t *ctx) {
 }
 
 static int process_measurement(perf_ctx_t *ctx, tsd_thermal_eval_t *out, uint64_t current_cpi,
-                               uint64_t mpki_milli, const tsd_runtime_config *cfg,
+                               uint64_t current_work_cost_milli, uint64_t mpki_milli,
+                               const tsd_runtime_config *cfg,
                                const tsd_telemetry_sample_t *telemetry) {
     if (!ctx) {
         return 0;
@@ -954,14 +971,23 @@ static int process_measurement(perf_ctx_t *ctx, tsd_thermal_eval_t *out, uint64_
     ctx->slow_llc_mpki = tsd_update_ewma(ctx->slow_llc_mpki, mpki_milli, SLOW_EWMA_SHIFT);
 
     uint64_t reference_cpi = ctx->slow_cpi ? ctx->slow_cpi : (ctx->baseline_cpi ? ctx->baseline_cpi : 1);
-    __uint128_t ratio_num = (__uint128_t)current_cpi * 1000u;
-    uint64_t adaptive_ratio_milli = (uint64_t)((ratio_num + reference_cpi / 2) / reference_cpi);
+    __uint128_t cpi_ratio_num = (__uint128_t)current_cpi * 1000u;
+    uint64_t adaptive_ratio_milli = (uint64_t)((cpi_ratio_num + reference_cpi / 2) / reference_cpi);
     uint64_t absolute_reference = ctx->calibrated_cpi_reference ? ctx->calibrated_cpi_reference : reference_cpi;
-    uint64_t absolute_ratio_milli = (uint64_t)((ratio_num + absolute_reference / 2) / absolute_reference);
-    /* A slow EWMA must not normalize sustained degradation back to 1.0. Keep a
-     * frozen live calibration and use the more conservative of the two ratios. */
-    uint64_t ratio_milli = adaptive_ratio_milli > absolute_ratio_milli
-                               ? adaptive_ratio_milli : absolute_ratio_milli;
+    uint64_t absolute_ratio_milli = (uint64_t)((cpi_ratio_num + absolute_reference / 2) / absolute_reference);
+    uint64_t cpi_ratio_milli = adaptive_ratio_milli > absolute_ratio_milli
+                                   ? adaptive_ratio_milli : absolute_ratio_milli;
+
+    uint64_t ratio_milli = cpi_ratio_milli;
+    if (current_work_cost_milli > 0) {
+        if (ctx->calibrated_work_reference == 0) {
+            ctx->calibrated_work_reference = current_work_cost_milli;
+            ctx->baseline_work_cost_milli = current_work_cost_milli;
+        }
+        __uint128_t work_ratio_num = (__uint128_t)current_work_cost_milli * 1000u;
+        ratio_milli = (uint64_t)((work_ratio_num + ctx->calibrated_work_reference / 2) /
+                                 ctx->calibrated_work_reference);
+    }
     if (ctx->ratio_history_count < RATIO_HISTORY) {
         ctx->ratio_history_count++;
     }
@@ -1017,6 +1043,9 @@ static int process_measurement(perf_ctx_t *ctx, tsd_thermal_eval_t *out, uint64_
 
     uint64_t severity = base_severity + thermal_severity;
     if (out) {
+        out->performance_available = 1;
+        out->work_normalized = current_work_cost_milli > 0 ? 1 : 0;
+        out->work_cost_milli = current_work_cost_milli;
         out->cpi_milli = current_cpi;
         out->ratio_milli = (uint32_t)ratio_milli;
         out->trimmed_ratio_milli = ctx->ratio_trimmed_milli;
@@ -1088,7 +1117,7 @@ int tsd_perf_evaluate(perf_ctx_t *ctx, tsd_thermal_eval_t *out, const tsd_runtim
         } else {
             fetch_fused_telemetry(ctx, &scripted_telemetry);
         }
-        return process_measurement(ctx, out, current_cpi, g_test_perf_script.mpki, cfg, &scripted_telemetry);
+        return process_measurement(ctx, out, current_cpi, 0, g_test_perf_script.mpki, cfg, &scripted_telemetry);
     }
 #endif
     if (ctx->mode == TSD_PERF_MODE_SOFTWARE) {
@@ -1121,7 +1150,11 @@ int tsd_perf_evaluate(perf_ctx_t *ctx, tsd_thermal_eval_t *out, const tsd_runtim
         }
         tsd_telemetry_sample_t telemetry = {0};
         fetch_fused_telemetry(ctx, &telemetry);
-        return process_measurement(ctx, out, software_cost_milli, 0, cfg, &telemetry);
+        int software_rc = process_measurement(ctx, out, software_cost_milli, 0, 0, cfg, &telemetry);
+        /* Software mode is a fail-closed observability domain, never an
+         * authority for normal width optimization or predictive history. */
+        if (out) out->performance_available = 0;
+        return software_rc;
     }
 
     if (ctx->mode != TSD_PERF_MODE_HARDWARE || !ctx->hardware_validated) {
@@ -1202,6 +1235,41 @@ int tsd_perf_evaluate(perf_ctx_t *ctx, tsd_thermal_eval_t *out, const tsd_runtim
         return handle_no_running_progress(ctx, out);
     }
     uint64_t current_cpi = (delta_cycles * 1000) / delta_insns;
+    uint64_t now_work = atomic_load_explicit(&g_tsd_workload_iterations, memory_order_relaxed);
+    uint64_t delta_work = now_work >= ctx->hw_last_iterations ? now_work - ctx->hw_last_iterations : 0;
+    ctx->hw_last_iterations = now_work;
+    uint64_t current_work_cost_milli = delta_work
+        ? (uint64_t)(((__uint128_t)delta_cycles * 1000u) / delta_work)
+        : 0;
+
+    if (!ctx->workload && delta_work == 0) {
+        /* In registered-dispatch mode, owner-thread instructions with no
+         * completed registered work are not workload performance evidence.
+         * Advance the perf cursors so idle/unrelated cycles cannot leak into
+         * the next real work sample, while still exporting raw safety telemetry
+         * for the admission gate and emergency-temperature path. */
+        ctx->last_group_read = rd_now;
+        ctx->last_llc_value = llc_now;
+        publish_perf_state(ctx, 1);
+
+        tsd_telemetry_sample_t telemetry = {0};
+        fetch_fused_telemetry(ctx, &telemetry);
+        if (out) {
+            out->performance_available = 0;
+            out->work_normalized = 0;
+            out->work_cost_milli = 0;
+            out->temp_available = telemetry.temp_available;
+            out->freq_ratio_available = telemetry.freq_ratio_available;
+            out->package_temp_millic = telemetry.package_temp_millic;
+            out->freq_ratio_milli = telemetry.freq_ratio_milli;
+            out->filtered_temp_available = telemetry.filtered_temp_available;
+            out->filtered_freq_ratio_available = telemetry.filtered_freq_ratio_available;
+            out->filtered_package_temp_millic = telemetry.filtered_package_temp_millic;
+            out->filtered_freq_ratio_milli = telemetry.filtered_freq_ratio_milli;
+        }
+        return 0;
+    }
+
     uint64_t delta_llc = (ctx->fd_llc_misses >= 0 && llc_now >= ctx->last_llc_value)
                              ? (llc_now - ctx->last_llc_value)
                              : 0;
@@ -1213,7 +1281,7 @@ int tsd_perf_evaluate(perf_ctx_t *ctx, tsd_thermal_eval_t *out, const tsd_runtim
 
     tsd_telemetry_sample_t telemetry = {0};
     fetch_fused_telemetry(ctx, &telemetry);
-    return process_measurement(ctx, out, current_cpi, mpki_milli, cfg, &telemetry);
+    return process_measurement(ctx, out, current_cpi, current_work_cost_milli, mpki_milli, cfg, &telemetry);
 }
 
 tsd_perf_mode_t tsd_perf_get_mode(const perf_ctx_t *ctx) {
@@ -1311,7 +1379,7 @@ void tsd_perf_test_seed_cpi_reference(perf_ctx_t *ctx, uint64_t baseline_cpi) {
 int tsd_perf_test_process_cpi(perf_ctx_t *ctx, uint64_t current_cpi,
                               tsd_thermal_eval_t *out, const tsd_runtime_config *cfg) {
     tsd_telemetry_sample_t telemetry = {0};
-    return process_measurement(ctx, out, current_cpi, 0, cfg, &telemetry);
+    return process_measurement(ctx, out, current_cpi, 0, 0, cfg, &telemetry);
 }
 
 void tsd_test_perf_rewind_mode(perf_ctx_t *ctx, int seconds) {

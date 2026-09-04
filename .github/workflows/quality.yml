@@ -103,6 +103,7 @@ jobs:
       - name: Build focused concurrency targets
         run: |
           cmake --build build-tsan --target \
+            test_telemetry_fusion \
             test_telemetry_fusion_stress \
             test_observability_metrics \
             test_adaptive_dispatch \
@@ -113,7 +114,7 @@ jobs:
           TSAN_OPTIONS: halt_on_error=1:history_size=7
         run: |
           ctest --test-dir build-tsan --output-on-failure \
-            -R "^(telemetry_fusion_stress|observability_metrics|adaptive_dispatch|runtime_lifecycle)$"
+            -R "^(telemetry_fusion_thread|telemetry_fusion_stress|observability_metrics|adaptive_dispatch|runtime_lifecycle)$"
 
   packaging:
     name: Make + install + consumer + container

@@ -107,6 +107,9 @@ void tsd_runtime_config_set_defaults(tsd_runtime_config *cfg) {
     cfg->policy = k_default_policy_config;
     tsd_policy_config_apply_bounds(&cfg->policy);
     cfg->degraded_policy_active = 0;
+}
+
+void tsd_runtime_config_reset_dynamic_state(void) {
     atomic_store_explicit(&g_tsd_degraded_active, 0, memory_order_release);
 }
 
@@ -178,7 +181,7 @@ static void log_policy_change(const tsd_runtime_config *cfg, const char *reason,
 }
 
 void tsd_runtime_config_enter_degraded_mode(tsd_runtime_config *cfg, const char *reason) {
-    if (!cfg) return;
+    if (!cfg || cfg != &g_tsd_config) return;
     int expected = 0;
     if (!atomic_compare_exchange_strong_explicit(&g_tsd_degraded_active, &expected, 1,
                                                   memory_order_acq_rel, memory_order_acquire)) {
@@ -188,7 +191,7 @@ void tsd_runtime_config_enter_degraded_mode(tsd_runtime_config *cfg, const char 
 }
 
 void tsd_runtime_config_exit_degraded_mode(tsd_runtime_config *cfg, const char *reason) {
-    if (!cfg) return;
+    if (!cfg || cfg != &g_tsd_config) return;
     int expected = 1;
     if (!atomic_compare_exchange_strong_explicit(&g_tsd_degraded_active, &expected, 0,
                                                   memory_order_acq_rel, memory_order_acquire)) {

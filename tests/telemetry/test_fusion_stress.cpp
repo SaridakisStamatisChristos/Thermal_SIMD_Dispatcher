@@ -2,6 +2,7 @@
 #include <cassert>
 #include <chrono>
 #include <memory>
+#include <thread>
 
 #include <telemetry/fusion.h>
 
@@ -52,6 +53,24 @@ int main() {
         assert(!snapshot->degraded);
     }
 
+    fusion.stop();
+
+    /* Exercise the class-level lifecycle contract itself, not just the C bridge
+       mutex. Racing start/stop must never leak a joinable worker or terminate
+       during destruction. A start that overlaps stop is allowed to lose. */
+    for (int i = 0; i < 64; ++i) {
+        std::thread starter([&] { fusion.start(); });
+        std::thread stopper([&] { fusion.stop(); });
+        starter.join();
+        stopper.join();
+        fusion.stop();
+    }
+
+    /* The object remains reusable after the race storm. */
+    fusion.start();
+    auto final_snapshot = fusion.wait_for_snapshot(last_generation + 1, std::chrono::milliseconds(200));
+    assert(final_snapshot.has_value());
+    assert(final_snapshot->generation > last_generation);
     fusion.stop();
 
     return 0;

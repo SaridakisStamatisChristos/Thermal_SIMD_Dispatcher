@@ -4,6 +4,8 @@
 #include <memory>
 #include <thread>
 
+#include <observability/telemetry_state.h>
+#include <telemetry/bus.h>
 #include <telemetry/fusion.h>
 #include <thermal/simd/telemetry_fusion.h>
 #include <thermal/simd/thermal_config.h>
@@ -73,6 +75,134 @@ void test_cpp_fusion() {
     fusion.stop();
 }
 
+void test_source_isolation_and_resolution() {
+    using namespace telemetry;
+    auto bus = std::make_shared<TelemetryBus>();
+    const auto now = std::chrono::steady_clock::now();
+
+    TelemetryReading good{};
+    good.value = 73.0;
+    good.valid = true;
+    good.quality = 80;
+    good.timestamp = now;
+    good.source = "msr";
+    bus->publish(TelemetrySignal::kPackageTempC, good);
+
+    TelemetryReading failed{};
+    failed.value = 0.0;
+    failed.valid = false;
+    failed.quality = 100;
+    failed.timestamp = now + std::chrono::milliseconds(1);
+    failed.source = "oem";
+    bus->publish(TelemetrySignal::kPackageTempC, failed);
+
+    auto all = bus->readings(TelemetrySignal::kPackageTempC);
+    assert(all.size() == 2);
+    auto best = bus->latest(TelemetrySignal::kPackageTempC);
+    assert(best.has_value());
+    assert(best->valid);
+    assert(best->source == "msr");
+    assert(best->value == 73.0);
+}
+
+void test_interruptible_shutdown() {
+    using namespace telemetry;
+    TelemetryFusionConfig config;
+    config.poll_interval = std::chrono::seconds(5);
+    config.freshness_window = std::chrono::seconds(10);
+    config.ring_size = 4;
+    auto manager = std::make_shared<TelemetryBusManager>();
+    TelemetryFusion fusion(config, manager);
+    fusion.start();
+    auto first = fusion.wait_for_snapshot(1, std::chrono::milliseconds(500));
+    assert(first.has_value());
+
+    const auto started = std::chrono::steady_clock::now();
+    fusion.stop();
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - started);
+    assert(elapsed < std::chrono::milliseconds(500));
+}
+
+void test_concurrent_stop_waits_for_join() {
+    using namespace telemetry;
+
+    TelemetryFusionConfig config;
+    config.poll_interval = std::chrono::milliseconds(1);
+    config.freshness_window = std::chrono::seconds(1);
+    config.ring_size = 4;
+
+    auto manager = std::make_shared<TelemetryBusManager>();
+    TelemetryFusion fusion(config, manager);
+
+    std::atomic<bool> provider_entered{false};
+    std::atomic<bool> release_provider{false};
+    TemperatureSampleProvider blocking_provider = [&]() {
+        provider_entered.store(true, std::memory_order_release);
+        while (!release_provider.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+        TemperatureSample sample{};
+        sample.package_temp_c = 70.0;
+        sample.valid = true;
+        return sample;
+    };
+    fusion.register_collector(std::make_shared<MsrCollector>(config.poll_interval, blocking_provider, 1));
+    fusion.start();
+
+    const auto provider_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    while (!provider_entered.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < provider_deadline) {
+        std::this_thread::yield();
+    }
+    assert(provider_entered.load(std::memory_order_acquire));
+
+    std::atomic<bool> first_done{false};
+    std::atomic<bool> second_done{false};
+    std::thread first([&]() {
+        fusion.stop();
+        first_done.store(true, std::memory_order_release);
+    });
+
+    const auto stop_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    while (fusion.running() && std::chrono::steady_clock::now() < stop_deadline) {
+        std::this_thread::yield();
+    }
+    assert(!fusion.running());
+
+    std::thread second([&]() {
+        fusion.stop();
+        second_done.store(true, std::memory_order_release);
+    });
+
+    /* Both external stops must remain blocked behind the worker callback. The
+     * pre-fix implementation returned the second stop immediately once another
+     * thread owned the join. */
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    assert(!first_done.load(std::memory_order_acquire));
+    assert(!second_done.load(std::memory_order_acquire));
+
+    /* A start overlapping either stop is ignored; it cannot reopen lifecycle
+     * state while an older stopped publication is still pending. */
+    fusion.start();
+    assert(!fusion.running());
+
+    release_provider.store(true, std::memory_order_release);
+    first.join();
+    second.join();
+    assert(first_done.load(std::memory_order_acquire));
+    assert(second_done.load(std::memory_order_acquire));
+    assert(!fusion.running());
+    assert(!observability::TelemetryState::instance().fusion_snapshot().running);
+
+    /* The join owner must leave a fully reusable stopped object. */
+    fusion.start();
+    assert(fusion.running());
+    fusion.stop();
+    assert(!fusion.running());
+    assert(!observability::TelemetryState::instance().fusion_snapshot().running);
+}
+
 void test_bridge_raw_safety_vs_filtered_control() {
     tsd_runtime_config_set_defaults(&g_tsd_config);
     g_tsd_config.telemetry_interval_ms = 10;
@@ -97,7 +227,6 @@ void test_bridge_raw_safety_vs_filtered_control() {
     assert(first.filtered_temp_available == 1);
     assert(first.filtered_package_temp_millic == 60000);
 
-    /* A thermal spike is immediate on the safety channel, smoothed only for control. */
     sample.package_temp_millic = 100000;
     assert(tsd_telemetry_fusion_publish_sample(&sample) == 0);
     std::this_thread::sleep_for(std::chrono::milliseconds(30));
@@ -111,7 +240,6 @@ void test_bridge_raw_safety_vs_filtered_control() {
     assert(spike.filtered_package_temp_millic < 100000);
     tsd_telemetry_fusion_stop();
 
-    /* alpha=0 is an explicit bypass, never a frozen first sample. */
     g_tsd_config.telemetry_ewma_alpha = 0.0;
     assert(tsd_telemetry_fusion_start_for_cpu(0) == 0);
     sample.package_temp_millic = 60000;
@@ -133,6 +261,9 @@ void test_bridge_raw_safety_vs_filtered_control() {
 
 int main() {
     test_cpp_fusion();
+    test_source_isolation_and_resolution();
+    test_interruptible_shutdown();
+    test_concurrent_stop_waits_for_join();
     test_bridge_raw_safety_vs_filtered_control();
     return 0;
 }
