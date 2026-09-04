@@ -1,8 +1,24 @@
 #include <observability/telemetry_state.h>
 
+#include <chrono>
 #include <mutex>
 
 #include "../runtime_guard_internal.h"
+
+namespace {
+
+class SafetyUpdateGuard {
+public:
+    SafetyUpdateGuard() : locked_(tsd_runtime_safety_write_enter() == 0) {}
+    ~SafetyUpdateGuard() {
+        if (locked_) tsd_runtime_safety_write_leave();
+    }
+    explicit operator bool() const { return locked_; }
+private:
+    bool locked_;
+};
+
+}  // namespace
 
 namespace observability {
 
@@ -24,67 +40,61 @@ void TelemetryState::update_controller(const tsd_controller_telemetry_t *telemet
 
 void TelemetryState::update_fusion(const tsd_fusion_telemetry_t *telemetry) {
     if (!telemetry) return;
-    if (tsd_runtime_safety_write_enter() != 0) return;
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        fusion_.running = telemetry->running != 0;
-        fusion_.degraded = telemetry->degraded != 0;
-        fusion_.temp_available = telemetry->temp_available != 0;
-        fusion_.package_temp_c = telemetry->package_temp_c;
-        fusion_.filtered_temp_available = telemetry->temp_available != 0;
-        fusion_.filtered_package_temp_c = telemetry->package_temp_c;
-        fusion_.freq_available = telemetry->freq_available != 0;
-        fusion_.freq_ratio = telemetry->freq_ratio;
-        fusion_.cpi_available = telemetry->cpi_available != 0;
-        fusion_.thermal_cpi = telemetry->thermal_cpi;
-        fusion_.power_available = telemetry->power_available != 0;
-        fusion_.power_budget_w = telemetry->power_budget_w;
-        fusion_.updated_at = std::chrono::system_clock::now();
-        fusion_.freshness_at = std::chrono::steady_clock::now();
-    }
-    tsd_runtime_safety_write_leave();
+    SafetyUpdateGuard guard;
+    if (!guard) return;
+    std::lock_guard<std::mutex> lock(mutex_);
+    fusion_.running = telemetry->running != 0;
+    fusion_.degraded = telemetry->degraded != 0;
+    fusion_.temp_available = telemetry->temp_available != 0;
+    fusion_.package_temp_c = telemetry->package_temp_c;
+    fusion_.filtered_temp_available = telemetry->temp_available != 0;
+    fusion_.filtered_package_temp_c = telemetry->package_temp_c;
+    fusion_.freq_available = telemetry->freq_available != 0;
+    fusion_.freq_ratio = telemetry->freq_ratio;
+    fusion_.cpi_available = telemetry->cpi_available != 0;
+    fusion_.thermal_cpi = telemetry->thermal_cpi;
+    fusion_.power_available = telemetry->power_available != 0;
+    fusion_.power_budget_w = telemetry->power_budget_w;
+    fusion_.updated_at = std::chrono::system_clock::now();
+    fusion_.freshness_at = std::chrono::steady_clock::now();
 }
 
 void TelemetryState::update_temperature_channels(const tsd_temperature_channels_t *telemetry) {
     if (!telemetry) return;
-    if (tsd_runtime_safety_write_enter() != 0) return;
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        fusion_.raw_temp_available = telemetry->raw_available != 0;
-        fusion_.raw_package_temp_c = telemetry->raw_package_temp_c;
-        if (telemetry->raw_available) {
-            fusion_.raw_temp_freshness_at = std::chrono::steady_clock::now();
-        } else {
-            fusion_.raw_temp_freshness_at = {};
-        }
-        fusion_.filtered_temp_available = telemetry->filtered_available != 0;
-        fusion_.filtered_package_temp_c = telemetry->filtered_package_temp_c;
-        if (telemetry->filtered_available) {
-            fusion_.temp_available = true;
-            fusion_.package_temp_c = telemetry->filtered_package_temp_c;
-        } else if (!telemetry->raw_available) {
-            fusion_.temp_available = false;
-            fusion_.package_temp_c = 0.0;
-        }
-        fusion_.updated_at = std::chrono::system_clock::now();
-        fusion_.freshness_at = std::chrono::steady_clock::now();
+    SafetyUpdateGuard guard;
+    if (!guard) return;
+    std::lock_guard<std::mutex> lock(mutex_);
+    fusion_.raw_temp_available = telemetry->raw_available != 0;
+    fusion_.raw_package_temp_c = telemetry->raw_package_temp_c;
+    if (telemetry->raw_available) {
+        fusion_.raw_temp_freshness_at = std::chrono::steady_clock::now();
+    } else {
+        fusion_.raw_temp_freshness_at = {};
     }
-    tsd_runtime_safety_write_leave();
+    fusion_.filtered_temp_available = telemetry->filtered_available != 0;
+    fusion_.filtered_package_temp_c = telemetry->filtered_package_temp_c;
+    if (telemetry->filtered_available) {
+        fusion_.temp_available = true;
+        fusion_.package_temp_c = telemetry->filtered_package_temp_c;
+    } else if (!telemetry->raw_available) {
+        fusion_.temp_available = false;
+        fusion_.package_temp_c = 0.0;
+    }
+    fusion_.updated_at = std::chrono::system_clock::now();
+    fusion_.freshness_at = std::chrono::steady_clock::now();
 }
 
 void TelemetryState::update_perf(const tsd_perf_telemetry_t *telemetry) {
     if (!telemetry) return;
-    if (tsd_runtime_safety_write_enter() != 0) return;
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        perf_.mode = telemetry->mode;
-        perf_.counters_healthy = telemetry->counters_healthy != 0;
-        perf_.pinned_cpu = telemetry->pinned_cpu;
-        perf_.monitor_cpu = telemetry->monitor_cpu;
-        perf_.updated_at = std::chrono::system_clock::now();
-        perf_.freshness_at = std::chrono::steady_clock::now();
-    }
-    tsd_runtime_safety_write_leave();
+    SafetyUpdateGuard guard;
+    if (!guard) return;
+    std::lock_guard<std::mutex> lock(mutex_);
+    perf_.mode = telemetry->mode;
+    perf_.counters_healthy = telemetry->counters_healthy != 0;
+    perf_.pinned_cpu = telemetry->pinned_cpu;
+    perf_.monitor_cpu = telemetry->monitor_cpu;
+    perf_.updated_at = std::chrono::system_clock::now();
+    perf_.freshness_at = std::chrono::steady_clock::now();
 }
 
 ControllerTelemetrySnapshot TelemetryState::controller_snapshot() const {
@@ -137,18 +147,74 @@ bool TelemetryState::raw_temperature(double &out_temp_c, std::chrono::millisecon
 }  // namespace observability
 
 extern "C" {
-void tsd_observability_update_controller(const tsd_controller_telemetry_t *telemetry) { observability::TelemetryState::instance().update_controller(telemetry); }
-void tsd_observability_update_fusion(const tsd_fusion_telemetry_t *telemetry) { observability::TelemetryState::instance().update_fusion(telemetry); }
-void tsd_observability_update_temperature_channels(const tsd_temperature_channels_t *telemetry) { observability::TelemetryState::instance().update_temperature_channels(telemetry); }
-void tsd_observability_update_perf(const tsd_perf_telemetry_t *telemetry) { observability::TelemetryState::instance().update_perf(telemetry); }
-int tsd_observability_runtime_guard_active(void) { return observability::TelemetryState::instance().runtime_guard_active() ? 1 : 0; }
-int tsd_observability_perf_mode(void) { return observability::TelemetryState::instance().perf_mode(); }
-int tsd_observability_perf_hardware_fresh(void) { return observability::TelemetryState::instance().perf_hardware_fresh(std::chrono::seconds(5)) ? 1 : 0; }
+
+void tsd_observability_update_controller(const tsd_controller_telemetry_t *telemetry) {
+    try {
+        observability::TelemetryState::instance().update_controller(telemetry);
+    } catch (...) {
+        /* Diagnostics are best-effort. */
+    }
+}
+
+void tsd_observability_update_fusion(const tsd_fusion_telemetry_t *telemetry) {
+    try {
+        observability::TelemetryState::instance().update_fusion(telemetry);
+    } catch (...) {
+        tsd_runtime_wide_admission_close();
+    }
+}
+
+void tsd_observability_update_temperature_channels(const tsd_temperature_channels_t *telemetry) {
+    try {
+        observability::TelemetryState::instance().update_temperature_channels(telemetry);
+    } catch (...) {
+        tsd_runtime_wide_admission_close();
+    }
+}
+
+void tsd_observability_update_perf(const tsd_perf_telemetry_t *telemetry) {
+    try {
+        observability::TelemetryState::instance().update_perf(telemetry);
+    } catch (...) {
+        tsd_runtime_wide_admission_close();
+    }
+}
+
+int tsd_observability_runtime_guard_active(void) {
+    try {
+        return observability::TelemetryState::instance().runtime_guard_active() ? 1 : 0;
+    } catch (...) {
+        return 1;
+    }
+}
+
+int tsd_observability_perf_mode(void) {
+    try {
+        return observability::TelemetryState::instance().perf_mode();
+    } catch (...) {
+        return 0;
+    }
+}
+
+int tsd_observability_perf_hardware_fresh(void) {
+    try {
+        return observability::TelemetryState::instance().perf_hardware_fresh(std::chrono::seconds(5)) ? 1 : 0;
+    } catch (...) {
+        return 0;
+    }
+}
+
 int tsd_observability_raw_temperature_c(double *out_temp_c, int max_age_ms) {
     if (!out_temp_c || max_age_ms < 0) return 0;
-    double value = 0.0;
-    if (!observability::TelemetryState::instance().raw_temperature(value, std::chrono::milliseconds(max_age_ms))) return 0;
-    *out_temp_c = value;
-    return 1;
+    try {
+        double value = 0.0;
+        if (!observability::TelemetryState::instance().raw_temperature(
+                value, std::chrono::milliseconds(max_age_ms))) return 0;
+        *out_temp_c = value;
+        return 1;
+    } catch (...) {
+        return 0;
+    }
 }
+
 }  // extern "C"
