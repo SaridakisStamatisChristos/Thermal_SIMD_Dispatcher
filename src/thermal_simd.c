@@ -307,6 +307,14 @@ static void print_configuration(simd_width_t max_width) {
                  g_tsd_config.demo_duration_sec, g_tsd_config.work_iters);
 }
 
+/* append_message is an internal printf-style forwarding helper. Call sites use
+ * literal formats; the helper necessarily forwards its format parameter to
+ * vsnprintf. Keep global -Werror and suppress only Clang's nonliteral warning
+ * around this audited forwarding boundary. */
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wformat-nonliteral"
+#endif
 static void append_message(char *buf, size_t buf_size, size_t *cursor, const char *fmt, ...) {
     if (!buf || buf_size == 0 || !cursor || *cursor >= buf_size) {
         return;
@@ -325,6 +333,9 @@ static void append_message(char *buf, size_t buf_size, size_t *cursor, const cha
         *cursor += (size_t)written;
     }
 }
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#endif
 
 static int evaluate_thermal(perf_ctx_t *ctx, tsd_thermal_eval_t *out) {
     return tsd_perf_evaluate(ctx, out, &g_tsd_config);
