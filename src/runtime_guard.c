@@ -27,6 +27,7 @@ static _Atomic uint64_t g_tsd_active_wide_executions = 0;
 static _Atomic int g_tsd_wide_admission_open = 0;
 static _Atomic int g_tsd_runtime_stopping = 0;
 static _Atomic int g_tsd_runtime_owner_tid = 0;
+static _Thread_local unsigned int g_tsd_wide_execution_depth = 0;
 
 static int current_tid(void) {
     return (int)syscall(SYS_gettid);
@@ -57,7 +58,12 @@ int tsd_runtime_work_accounting_allowed(void) {
     return tsd_runtime_current_thread_is_owner();
 }
 
+int tsd_runtime_current_thread_in_wide_execution(void) {
+    return g_tsd_wide_execution_depth != 0;
+}
+
 static void wide_execution_release(void) {
+    if (g_tsd_wide_execution_depth > 0) --g_tsd_wide_execution_depth;
     uint64_t previous = atomic_fetch_sub_explicit(&g_tsd_active_wide_executions, 1,
                                                   memory_order_acq_rel);
     if (previous == 0) {
@@ -87,6 +93,7 @@ int tsd_runtime_execution_enter(simd_width_t width) {
     }
 
     atomic_fetch_add_explicit(&g_tsd_active_wide_executions, 1, memory_order_acq_rel);
+    ++g_tsd_wide_execution_depth;
     atomic_thread_fence(memory_order_seq_cst);
 
     /* A revoker that raced the first check closes admission before publishing
@@ -108,6 +115,10 @@ void tsd_runtime_execution_leave(simd_width_t width) {
 }
 
 int tsd_runtime_wait_for_wide_quiescence(void) {
+    if (tsd_runtime_current_thread_in_wide_execution()) {
+        errno = EDEADLK;
+        return -1;
+    }
     int rc = pthread_mutex_lock(&g_tsd_wide_drain_lock);
     if (rc != 0) {
         errno = rc;
