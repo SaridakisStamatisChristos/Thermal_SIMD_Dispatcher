@@ -27,8 +27,8 @@ jobs:
           new = '''    tsd_test_set_policy_counts(1, 1);\n    tsd_test_set_timing(1000, 1, 1, 1);\n    /* This scenario intentionally publishes one cool authorization sample.\n     * Keep it fresh for the duration of the deterministic monitor sequence;\n     * production freshness remains unchanged. */\n    g_tsd_config.telemetry_max_skew_ms = 5000;\n'''
           if new in text:
               raise SystemExit(0)
-          if text.count(old) != 1:
-              raise SystemExit(f'fixture insertion mismatch: {text.count(old)}')
+          if old not in text:
+              raise SystemExit('monitor fixture setup not found')
           p.write_text(text.replace(old, new, 1), encoding='utf-8')
           PY
 
