@@ -47,6 +47,14 @@ jobs:
               raise SystemExit('shim prototype pattern not found')
           p.write_text(s.replace(old, new, 1), encoding='utf-8')
 
+          p = Path('src/thermal_perf.c')
+          s = p.read_text(encoding='utf-8')
+          old = 'process_measurement(ctx, out, current_cpi, 0, cfg, &telemetry)'
+          new = 'process_measurement(ctx, out, current_cpi, 0, 0, cfg, &telemetry)'
+          if old not in s:
+              raise SystemExit('perf test helper call not found')
+          p.write_text(s.replace(old, new, 1), encoding='utf-8')
+
           p = Path('src/healthcheck/sandbox.cpp')
           s = p.read_text(encoding='utf-8')
           if '#include <new>' not in s:
