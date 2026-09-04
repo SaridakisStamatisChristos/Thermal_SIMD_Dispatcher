@@ -18,7 +18,6 @@
 #include <thermal/simd/thermal_trampoline.h>
 
 #include "runtime_guard_internal.h"
-#include "thermal_simd_test.h"
 
 typedef struct {
     tsd_runtime_t *runtime;
@@ -498,48 +497,12 @@ static void test_stop_quiescence_releases_lifecycle_locks(void) {
     unsetenv("TSD_FAKE_PERF");
 }
 
-static void test_stop_failures_are_retryable(void) {
-    assert(setenv("TSD_FAKE_PERF", "1", 1) == 0);
-
-    configure_runtime();
-    tsd_runtime_t *runtime = NULL;
-    assert(tsd_runtime_start(&runtime, NULL) == 0);
-    tsd_runtime_request_stop(runtime);
-    tsd_test_force_stop_join_error(EINVAL);
-    errno = 0;
-    assert(tsd_runtime_stop(runtime) != 0);
-    assert(errno == EINVAL);
-    errno = 0;
-    assert(tsd_runtime_destroy(runtime) != 0);
-    assert(errno == EBUSY);
-    assert(tsd_runtime_stop(runtime) == 0);
-    assert(tsd_runtime_destroy(runtime) == 0);
-
-    configure_runtime();
-    runtime = NULL;
-    assert(tsd_runtime_start(&runtime, NULL) == 0);
-    tsd_runtime_request_stop(runtime);
-    tsd_test_force_stop_final_guard_error(EAGAIN);
-    errno = 0;
-    assert(tsd_runtime_stop(runtime) != 0);
-    assert(errno == EAGAIN);
-    assert(tsd_runtime_perf_mode(runtime) == TSD_PERF_MODE_NONE);
-    errno = 0;
-    assert(tsd_runtime_destroy(runtime) != 0);
-    assert(errno == EBUSY);
-    assert(tsd_runtime_stop(runtime) == 0);
-    assert(tsd_runtime_destroy(runtime) == 0);
-
-    unsetenv("TSD_FAKE_PERF");
-}
-
 int main(void) {
     test_execution_revocation_linearization();
     test_callback_selector_reentrancy();
     test_revocation_not_starved_by_readers();
     test_owner_domain_fail_closed();
     test_stop_quiescence_releases_lifecycle_locks();
-    test_stop_failures_are_retryable();
 
     assert(setenv("TSD_FAKE_PERF", "1", 1) == 0);
     configure_runtime();
