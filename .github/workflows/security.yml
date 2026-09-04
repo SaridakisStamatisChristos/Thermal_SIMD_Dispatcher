@@ -7,6 +7,9 @@ on:
   schedule:
     - cron: '17 3 * * 1'
 
+permissions:
+  contents: read
+
 jobs:
   trampoline-security:
     runs-on: ubuntu-latest
