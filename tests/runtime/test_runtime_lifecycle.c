@@ -18,6 +18,7 @@
 #include <thermal/simd/thermal_trampoline.h>
 
 #include "runtime_guard_internal.h"
+#include "thermal_simd_test.h"
 
 typedef struct {
     tsd_runtime_t *runtime;
