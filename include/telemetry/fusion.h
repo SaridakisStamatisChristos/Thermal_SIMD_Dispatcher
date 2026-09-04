@@ -67,8 +67,9 @@ public:
     TelemetryFusion &operator=(const TelemetryFusion &) = delete;
 
     /* start()/stop() are safe to race from different threads. A start that
-     * overlaps an in-progress stop is conservatively ignored; callers may call
-     * start() again after stop() returns. */
+     * overlaps an in-progress stop is conservatively ignored. Every external
+     * stop() returns only after any overlapping join and stopped-state
+     * publication are complete. */
     void start();
     void stop();
     bool running() const;
@@ -94,6 +95,7 @@ private:
     std::atomic<bool> running_;
     std::atomic<uint64_t> generation_;
     mutable std::mutex thread_mutex_;
+    std::condition_variable thread_cv_;
     bool stop_join_in_progress_ = false;
     std::thread thread_;
     mutable std::mutex wake_mutex_;
