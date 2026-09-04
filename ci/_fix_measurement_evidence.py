@@ -2,17 +2,17 @@
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-p = ROOT / "src/thermal_perf.c"
-s = p.read_text(encoding="utf-8")
 
-def replace_once(old, new, label):
-    global s
-    count = s.count(old)
+def replace_once(text, old, new, label):
+    count = text.count(old)
     if count != 1:
         raise RuntimeError(f"{label}: expected one match, found {count}")
-    s = s.replace(old, new, 1)
+    return text.replace(old, new, 1)
 
-replace_once(
+p = ROOT / "src/thermal_perf.c"
+s = p.read_text(encoding="utf-8")
+s = replace_once(
+    s,
 """        tsd_telemetry_sample_t telemetry = {0};
         fetch_fused_telemetry(ctx, &telemetry);
         return process_measurement(ctx, out, software_cost_milli, 0, 0, cfg, &telemetry);
@@ -27,9 +27,10 @@ replace_once(
         return software_rc;
     }
 """,
-"software evidence gate")
+    "software evidence gate")
 
-replace_once(
+s = replace_once(
+    s,
 """    uint64_t current_work_cost_milli = delta_work
         ? (uint64_t)(((__uint128_t)delta_cycles * 1000u) / delta_work)
         : 0;
@@ -69,7 +70,35 @@ replace_once(
 
     uint64_t delta_llc = (ctx->fd_llc_misses >= 0 && llc_now >= ctx->last_llc_value)
 """,
-"registered idle evidence gate")
-
+    "registered idle evidence gate")
 p.write_text(s, encoding="utf-8")
+
+p = ROOT / "tests/test_thermal_simd.c"
+s = p.read_text(encoding="utf-8")
+s = replace_once(
+    s,
+"""    if (triggered != 0 || eval.cpi_milli != 1000 ||
+        tsd_test_perf_get_last_llc_value(ctx) != llc_stable) {
+        fprintf(stderr, "stable partial group read verification failed\n");
+""",
+"""    if (triggered != 0 || eval.performance_available != 0 || eval.cpi_milli != 0 ||
+        tsd_test_perf_get_last_llc_value(ctx) != llc_stable) {
+        fprintf(stderr, "stable no-work group read verification failed\n");
+""",
+    "stable no-work expectation")
+s = replace_once(
+    s,
+"""    if (!tsd_test_perf_get_last_group_valid(ctx) ||
+        tsd_test_perf_get_last_llc_value(ctx) != llc_hot ||
+        eval.cpi_milli != 2000 || triggered == 0) {
+        fprintf(stderr, "hot partial group read verification failed\n");
+""",
+"""    if (!tsd_test_perf_get_last_group_valid(ctx) ||
+        tsd_test_perf_get_last_llc_value(ctx) != llc_hot ||
+        eval.performance_available != 0 || eval.cpi_milli != 0 || triggered != 0) {
+        fprintf(stderr, "hot no-work group read verification failed\n");
+""",
+    "hot no-work expectation")
+p.write_text(s, encoding="utf-8")
+
 print("measurement evidence hardening applied")
