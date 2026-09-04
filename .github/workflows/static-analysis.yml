@@ -1,0 +1,58 @@
+name: Static Analysis
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  strict-compile:
+    name: Strict warnings / Clang
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang cmake ninja-build libssl-dev
+
+      - name: Configure strict warning build
+        env:
+          CC: clang
+          CXX: clang++
+        run: |
+          cmake -S . -B build-strict -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DBUILD_TESTING=ON \
+            -DCMAKE_C_FLAGS="-Wall -Wextra -Wpedantic -Wformat=2 -Wundef -Werror=return-type -Werror=format-security" \
+            -DCMAKE_CXX_FLAGS="-Wall -Wextra -Wpedantic -Wformat=2 -Wundef -Werror=return-type -Werror=format-security"
+
+      - name: Build
+        run: cmake --build build-strict -j2
+
+      - name: Test
+        run: ctest --test-dir build-strict --output-on-failure
+
+  clang-static-analyzer:
+    name: Clang static analyzer
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang clang-tools cmake ninja-build libssl-dev
+
+      - name: Configure
+        env:
+          CC: clang
+          CXX: clang++
+        run: cmake -S . -B build-analyze -G Ninja -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTING=OFF
+
+      - name: Analyze production build
+        run: scan-build --status-bugs --exclude src/third_party cmake --build build-analyze -j2
