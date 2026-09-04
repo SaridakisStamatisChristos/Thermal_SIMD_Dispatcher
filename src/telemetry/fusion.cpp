@@ -99,7 +99,16 @@ void TelemetryFusion::stop() {
 
     std::unique_lock<std::mutex> lock(thread_mutex_);
     ++stop_callers_;
-    running_.store(false, std::memory_order_release);
+
+    /* running_ is the predicate for wake_cv_. Synchronize its stop transition
+     * with wake_mutex_ so notification cannot be lost between the worker's
+     * predicate check and the atomic release performed by condition_variable.
+     * Without this mutex pairing, an interruptible 5-second poll could really
+     * take the full 5 seconds to stop under an unlucky interleaving. */
+    {
+        std::lock_guard<std::mutex> wake_lock(wake_mutex_);
+        running_.store(false, std::memory_order_release);
+    }
     wake_cv_.notify_all();
 
     const bool caller_is_worker = worker_thread_id_ != std::thread::id{} &&
