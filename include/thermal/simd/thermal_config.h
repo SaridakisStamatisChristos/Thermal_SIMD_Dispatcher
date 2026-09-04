@@ -79,12 +79,14 @@ const tsd_runtime_config *tsd_runtime_config_active_snapshot(void);
 /*
  * Private implementation bridge for the historical thermal_simd.c source.
  * Production builds route those legacy lvalue references into the validated
- * generation copy. The copy is semantically immutable after activation; the
- * mutable type exists only because old startup code contains initialization
- * branches that validation makes unreachable. White-box test builds keep the
- * real writable g_tsd_config so their existing mutation hooks remain valid.
+ * generation copy. The mutable type exists only because old startup branches
+ * are written against a mutable lvalue; generation validation makes those
+ * initialization branches unreachable after activation. White-box test builds
+ * keep the real writable g_tsd_config so their mutation hooks remain valid.
  */
-tsd_runtime_config *tsd_runtime_config_active_snapshot_internal(void);
+static inline tsd_runtime_config *tsd_runtime_config_active_snapshot_internal(void) {
+    return (tsd_runtime_config *)(uintptr_t)tsd_runtime_config_active_snapshot();
+}
 #if defined(TSD_RUNTIME_INTERNAL_IMPL) && !defined(TSD_ENABLE_TESTS)
 #define g_tsd_config (*tsd_runtime_config_active_snapshot_internal())
 #endif
