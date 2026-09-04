@@ -6,6 +6,9 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   strict-compile:
     name: Strict warnings / Clang
@@ -27,8 +30,8 @@ jobs:
           cmake -S . -B build-strict -G Ninja \
             -DCMAKE_BUILD_TYPE=Debug \
             -DBUILD_TESTING=ON \
-            -DCMAKE_C_FLAGS="-Wall -Wextra -Wpedantic -Wformat=2 -Wundef -Werror=return-type -Werror=format-security" \
-            -DCMAKE_CXX_FLAGS="-Wall -Wextra -Wpedantic -Wformat=2 -Wundef -Werror=return-type -Werror=format-security"
+            -DCMAKE_C_FLAGS="-Wall -Wextra -Wpedantic -Wformat=2 -Wundef -Werror" \
+            -DCMAKE_CXX_FLAGS="-Wall -Wextra -Wpedantic -Wformat=2 -Wundef -Werror"
 
       - name: Build
         run: cmake --build build-strict -j2
