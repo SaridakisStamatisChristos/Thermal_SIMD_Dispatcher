@@ -7,6 +7,7 @@
 
 #include <thermal/simd/thermal_trampoline.h>
 
+#ifndef TSD_ENABLE_TESTS
 static void tsd_safe_write_buf(int fd, const char *buf, size_t len) {
     while (len > 0) {
         ssize_t written = write(fd, buf, len);
@@ -75,6 +76,7 @@ static void crash_signal_handler(int sig) {
 
     _exit(128 + sig);
 }
+#endif
 
 void tsd_install_patch_signal_handlers(void) {
 #ifndef TSD_ENABLE_TESTS
@@ -87,4 +89,6 @@ void tsd_install_patch_signal_handlers(void) {
 #endif
 }
 
+#ifndef TSD_ENABLE_TESTS
 #undef TSD_SAFE_WRITE_LITERAL
+#endif
