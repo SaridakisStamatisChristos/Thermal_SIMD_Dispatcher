@@ -11,6 +11,16 @@
 
 namespace telemetry {
 
+namespace {
+
+void publish_fusion_running_state(int running) {
+    tsd_fusion_telemetry_t telemetry{};
+    telemetry.running = running ? 1 : 0;
+    tsd_observability_update_fusion(&telemetry);
+}
+
+}  // namespace
+
 TelemetrySnapshotRingBuffer::TelemetrySnapshotRingBuffer(std::size_t capacity)
     : capacity_(capacity ? capacity : 1),
       buffer_(capacity_),
@@ -62,56 +72,90 @@ TelemetryFusion::~TelemetryFusion() {
 
 void TelemetryFusion::start() {
     std::lock_guard<std::mutex> lock(thread_mutex_);
-    if (running_.load(std::memory_order_acquire) || stop_join_in_progress_ || thread_.joinable()) {
+    if (running_.load(std::memory_order_acquire) || stop_callers_ != 0 ||
+        stop_join_in_progress_ || thread_.joinable()) {
         return;
     }
 
     running_.store(true, std::memory_order_release);
     try {
         thread_ = std::thread([this] { run(); });
+        worker_thread_id_ = thread_.get_id();
     } catch (...) {
+        worker_thread_id_ = std::thread::id{};
         running_.store(false, std::memory_order_release);
+        publish_fusion_running_state(0);
         throw;
     }
 
-    tsd_fusion_telemetry_t telemetry{};
-    telemetry.running = 1;
-    tsd_observability_update_fusion(&telemetry);
+    /* Lifecycle observability is published under the same mutex as the thread
+     * state, so an older stop cannot overwrite a newer successful start. */
+    publish_fusion_running_state(1);
 }
 
 void TelemetryFusion::stop() {
     std::thread joiner;
-    bool self_stop = false;
-    {
-        std::lock_guard<std::mutex> lock(thread_mutex_);
-        running_.store(false, std::memory_order_release);
-        wake_cv_.notify_all();
+    const std::thread::id caller = std::this_thread::get_id();
 
-        if (stop_join_in_progress_) return;
-        if (thread_.joinable()) {
-            if (thread_.get_id() == std::this_thread::get_id()) {
-                /* A collector/provider may request stop from the worker itself.
-                 * It cannot join itself; leave the completed thread joinable so
-                 * the next external stop/destructor can reap it safely. */
-                self_stop = true;
-            } else {
-                stop_join_in_progress_ = true;
-                joiner = std::move(thread_);
-            }
+    std::unique_lock<std::mutex> lock(thread_mutex_);
+    ++stop_callers_;
+    running_.store(false, std::memory_order_release);
+    wake_cv_.notify_all();
+
+    const bool caller_is_worker = worker_thread_id_ != std::thread::id{} &&
+                                  worker_thread_id_ == caller;
+
+    if (stop_join_in_progress_) {
+        if (caller_is_worker) {
+            /* An external stop already owns the join and is waiting for this
+             * worker to return. Waiting here would deadlock that join. */
+            --stop_callers_;
+            thread_cv_.notify_all();
+            return;
         }
+
+        thread_cv_.wait(lock, [&] { return !stop_join_in_progress_; });
+        /* The join owner publishes the stopped state before clearing the flag.
+         * stop_callers_ keeps start() closed until every overlapping stop has
+         * observed that completed lifecycle transition. */
+        --stop_callers_;
+        thread_cv_.notify_all();
+        return;
     }
 
-    if (joiner.joinable()) {
-        joiner.join();
-        std::lock_guard<std::mutex> lock(thread_mutex_);
-        stop_join_in_progress_ = false;
+    if (!thread_.joinable()) {
+        publish_fusion_running_state(0);
+        worker_thread_id_ = std::thread::id{};
+        --stop_callers_;
+        thread_cv_.notify_all();
+        return;
     }
 
-    tsd_fusion_telemetry_t telemetry{};
-    telemetry.running = 0;
-    tsd_observability_update_fusion(&telemetry);
+    if (caller_is_worker) {
+        /* A collector/provider may request stop from the worker itself. It
+         * cannot join itself; leave the completed thread joinable so the next
+         * external stop/destructor can reap it safely. */
+        publish_fusion_running_state(0);
+        --stop_callers_;
+        thread_cv_.notify_all();
+        return;
+    }
 
-    (void)self_stop;
+    stop_join_in_progress_ = true;
+    joiner = std::move(thread_);
+    lock.unlock();
+
+    joiner.join();
+
+    lock.lock();
+    worker_thread_id_ = std::thread::id{};
+    /* Publish stopped before reopening lifecycle admission. This closes the
+     * old race where start() could publish running=true and then be overwritten
+     * by the previous stop's delayed running=false publication. */
+    publish_fusion_running_state(0);
+    stop_join_in_progress_ = false;
+    --stop_callers_;
+    thread_cv_.notify_all();
 }
 
 bool TelemetryFusion::running() const { return running_.load(std::memory_order_acquire); }
