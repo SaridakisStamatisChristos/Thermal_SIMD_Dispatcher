@@ -8,6 +8,13 @@ extern "C" {
 #endif
 
 typedef struct {
+    /* Performance control channel. ratio_milli is a degradation ratio where
+     * 1000 == calibrated baseline and lower is better. When owner-thread work
+     * accounting is available it is derived from cycles/work-item; otherwise
+     * hardware CPI (or the isolated software cost domain) is the fallback. */
+    int performance_available;
+    int work_normalized;
+    uint64_t work_cost_milli;
     uint64_t cpi_milli;
     uint32_t ratio_milli;
     uint32_t trimmed_ratio_milli;
