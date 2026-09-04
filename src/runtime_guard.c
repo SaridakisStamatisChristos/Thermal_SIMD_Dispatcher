@@ -162,6 +162,15 @@ int tsd_runtime_is_stopping(void) {
     return atomic_load_explicit(&g_tsd_runtime_stopping, memory_order_acquire) != 0;
 }
 
+static int runtime_temperature_limits_valid(void) {
+    return g_tsd_config.predictive_temp_ceiling_c >= 20 &&
+           g_tsd_config.predictive_temp_ceiling_c <= 125 &&
+           g_tsd_config.predictive_safety_margin_c >= 0 &&
+           g_tsd_config.predictive_safety_margin_c <= 60 &&
+           g_tsd_config.predictive_emergency_margin_c >= 0 &&
+           g_tsd_config.predictive_emergency_margin_c <= 60;
+}
+
 static int raw_temperature_upgrade_allowed(void) {
     if (!tsd_telemetry_temperature_upgrade_allowed()) return 0;
 
@@ -171,11 +180,9 @@ static int raw_temperature_upgrade_allowed(void) {
     double raw_temp_c = 0.0;
     if (!tsd_observability_raw_temperature_c(&raw_temp_c, freshness_ms) || !isfinite(raw_temp_c)) return 0;
 
-    if (g_tsd_config.predictive_temp_ceiling_c < 20 ||
-        g_tsd_config.predictive_temp_ceiling_c > 125 ||
-        g_tsd_config.predictive_safety_margin_c < 0) {
-        return 1;
-    }
+    /* Safety configuration corruption is never an implicit opt-out. */
+    if (!runtime_temperature_limits_valid()) return 0;
+
     const double limit_c = (double)(g_tsd_config.predictive_temp_ceiling_c -
                                     g_tsd_config.predictive_safety_margin_c);
     return raw_temp_c <= limit_c;
