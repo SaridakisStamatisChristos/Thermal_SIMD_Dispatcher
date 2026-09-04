@@ -63,12 +63,25 @@ typedef struct {
 /*
  * Legacy process-global configuration retained for source/ABI compatibility.
  * Configure it before starting the adaptive runtime; callers must not write it
- * concurrently with a live runtime. Safety-critical thermal authorization and
- * controller limits are captured per live runtime/control generation, so later
- * accidental writes cannot relax those already-established safety bounds.
- * Future integrations should treat this object as startup-only configuration.
+ * concurrently with a live runtime. A validated immutable copy is captured for
+ * each runtime generation, and runtime/control code consumes that copy rather
+ * than live-reading this writable compatibility object.
  */
 extern tsd_runtime_config g_tsd_config;
+
+/*
+ * Returns the immutable active runtime-generation configuration when a runtime
+ * is live, otherwise the legacy startup configuration. The returned object is
+ * read-only to callers and remains stable for the live generation.
+ */
+const tsd_runtime_config *tsd_runtime_config_active_snapshot(void);
+
+/* The private runtime implementation is compiled with this definition. Route
+ * its historical g_tsd_config reads through the immutable generation snapshot
+ * without changing the external symbol or legacy source ABI. */
+#ifdef TSD_RUNTIME_INTERNAL_IMPL
+#define g_tsd_config (*tsd_runtime_config_active_snapshot())
+#endif
 
 /* Pure value initializers: these never modify process-global runtime state. */
 void tsd_runtime_config_set_defaults(tsd_runtime_config *cfg);
