@@ -25,9 +25,28 @@ jobs:
 
       - name: Apply exact source transformations
         run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('ci/_apply_final_hardening.py')
+          s = p.read_text(encoding='utf-8')
+          old = 'out, count = re.subn(pattern, repl, text, count=1, flags=re.S)'
+          new = 'out, count = re.subn(pattern, lambda _match: repl, text, count=1, flags=re.S)'
+          if old not in s:
+              raise SystemExit('regex helper pattern not found')
+          p.write_text(s.replace(old, new, 1), encoding='utf-8')
+          PY
           python3 ci/_apply_final_hardening.py
           python3 - <<'PY'
           from pathlib import Path
+          p = Path('src/thermal_simd.c')
+          s = p.read_text(encoding='utf-8')
+          old = 'static int32_t simd_shim_unlocked(int32_t a, int32_t b);'
+          new = ('static int32_t simd_shim_unlocked(int32_t a, int32_t b, '
+                 'tsd_patch_slot_t *target, simd_width_t selected);')
+          if old not in s:
+              raise SystemExit('shim prototype pattern not found')
+          p.write_text(s.replace(old, new, 1), encoding='utf-8')
+
           p = Path('src/healthcheck/sandbox.cpp')
           s = p.read_text(encoding='utf-8')
           if '#include <new>' not in s:
@@ -62,5 +81,3 @@ jobs:
           fi
           git commit -m "Complete final safety and liveness hardening"
           git push origin HEAD:fix/final-safety-liveness-hardening
-
-# Existing-before-push trigger marker.
