@@ -192,10 +192,18 @@ if(BUILD_TESTING)
     target_compile_options(test_runtime_config_cli PRIVATE -Wall -Wextra)
     add_test(NAME runtime_config_cli COMMAND test_runtime_config_cli)
 
-    add_executable(test_runtime_lifecycle tests/runtime/test_runtime_lifecycle.c)
-    target_link_libraries(test_runtime_lifecycle PRIVATE thermal_simd_core Threads::Threads)
-    target_compile_options(test_runtime_lifecycle PRIVATE -Wall -Wextra -pthread)
+    # Lifecycle fault-injection hooks live only in the white-box build. Compile
+    # the public wrapper plus private runtime implementation into this test so
+    # production thermal_simd_core remains free of test-only symbols.
+    add_executable(test_runtime_lifecycle
+        tests/runtime/test_runtime_lifecycle.c
+        src/runtime_api.c
+        src/thermal_simd.c)
+    target_link_libraries(test_runtime_lifecycle PRIVATE thermal_simd_core_tests Threads::Threads m ${TSD_CXX_RUNTIME_LIBRARIES})
+    target_compile_definitions(test_runtime_lifecycle PRIVATE TSD_ENABLE_TESTS)
+    target_compile_options(test_runtime_lifecycle PRIVATE -Wall -Wextra -pthread -fPIC -mno-avx ${THERMAL_SIMD_DISPATCHER_CPU_FLAGS})
     target_include_directories(test_runtime_lifecycle PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    set_target_properties(test_runtime_lifecycle PROPERTIES LINKER_LANGUAGE CXX)
     add_test(NAME runtime_lifecycle COMMAND test_runtime_lifecycle)
 
     add_executable(test_thermal_simd tests/test_thermal_simd.c src/thermal_simd.c)
