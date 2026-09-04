@@ -29,6 +29,10 @@ constexpr std::chrono::milliseconds kDefaultStalenessWindow{500};
 
 inline int widthIndex(simd_width_t width) { return static_cast<int>(width); }
 
+const tsd_runtime_config &runtimeConfig() {
+    return *tsd_runtime_config_active_snapshot();
+}
+
 #ifdef TSD_INSTALLED_COEFF_PATH
 bool fileReadable(const char *path) {
     if (!path || !*path) return false;
@@ -38,7 +42,7 @@ bool fileReadable(const char *path) {
 #endif
 
 double runtimeTrendWeight() {
-    double alpha = g_tsd_config.predictive_alpha;
+    double alpha = runtimeConfig().predictive_alpha;
     if (!std::isfinite(alpha) || alpha < 0.0 || alpha > 1.0) return kDefaultRatioTrendWeight;
     return alpha;
 }
@@ -46,7 +50,8 @@ double runtimeTrendWeight() {
 std::string resolveCoefficientPath() {
     const char *env = std::getenv("TSD_PREDICTIVE_COEFF_PATH");
     if (env && *env) return std::string(env);
-    if (g_tsd_config.predictive_coeff_path[0] != '\0') return std::string(g_tsd_config.predictive_coeff_path);
+    const auto &runtime = runtimeConfig();
+    if (runtime.predictive_coeff_path[0] != '\0') return std::string(runtime.predictive_coeff_path);
 #ifdef TSD_INSTALLED_COEFF_PATH
     if (fileReadable(TSD_INSTALLED_COEFF_PATH)) return std::string(TSD_INSTALLED_COEFF_PATH);
 #endif
@@ -170,6 +175,13 @@ double MPCController::scoreWidth(simd_width_t candidate,
     double cost = 0.0;
     double discount = 1.0;
     const size_t rollout = std::max<std::size_t>(1, horizon);
+    const auto &runtime = runtimeConfig();
+    const bool hard_limit_valid = runtime.predictive_temp_ceiling_c >= 20 &&
+                                  runtime.predictive_temp_ceiling_c <= 125;
+    const double hard_limit = hard_limit_valid
+                                  ? static_cast<double>(runtime.predictive_temp_ceiling_c) * 1000.0
+                                  : -std::numeric_limits<double>::infinity();
+
     for (size_t step = 1; step <= rollout; ++step) {
         /* First-order actuator response: 50%, 75%, 87.5%, ... of the fitted
          * steady width effect. This creates an actual finite-horizon rollout
@@ -195,13 +207,16 @@ double MPCController::scoreWidth(simd_width_t candidate,
                 const double excess = temp_projection - static_cast<double>(config_.slo_temp_millic);
                 if (excess > 0.0) temp_cost += excess * kTemperatureWeight;
             }
-            if (g_tsd_config.predictive_temp_ceiling_c >= 20 &&
-                g_tsd_config.predictive_temp_ceiling_c <= 125) {
-                const double hard_limit = static_cast<double>(g_tsd_config.predictive_temp_ceiling_c) * 1000.0;
-                if (temp_projection > hard_limit) {
-                    temp_cost += kHardConstraintCost + (temp_projection - hard_limit);
-                }
+            /* Invalid hard-limit configuration fails closed inside scoring: a
+             * wide candidate receives the hard constraint cost rather than
+             * silently losing the thermal ceiling. */
+            if (!hard_limit_valid && candidate > SIMD_SSE41) {
+                temp_cost += kHardConstraintCost;
+            } else if (hard_limit_valid && temp_projection > hard_limit) {
+                temp_cost += kHardConstraintCost + (temp_projection - hard_limit);
             }
+        } else if (!hard_limit_valid && candidate > SIMD_SSE41) {
+            temp_cost += kHardConstraintCost;
         }
 
         cost += discount * (ratio_cost + temp_cost);
