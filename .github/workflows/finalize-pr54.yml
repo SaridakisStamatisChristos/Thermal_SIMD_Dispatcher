@@ -1,0 +1,109 @@
+name: Finalize PR 54 audit fixes
+
+on:
+  pull_request:
+    types: [synchronize]
+
+permissions:
+  contents: write
+
+jobs:
+  finalize:
+    if: github.event.pull_request.head.ref == 'deep-audit-fixes-v0.4.2' && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout PR head branch
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+
+      - name: Apply exact final audit repairs
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def replace_once(path, old, new):
+              p = Path(path)
+              text = p.read_text(encoding='utf-8')
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f'{path}: expected exactly one match, found {count}')
+              p.write_text(text.replace(old, new, 1), encoding='utf-8')
+
+          replace_once(
+              'src/thermal_simd.c',
+              '''static pthread_mutex_t g_tsd_runtime_lock = PTHREAD_MUTEX_INITIALIZER;\nstatic tsd_runtime_t *g_tsd_active_runtime = NULL;\n''',
+              '''static pthread_mutex_t g_tsd_runtime_lock = PTHREAD_MUTEX_INITIALIZER;\nstatic tsd_runtime_t *g_tsd_active_runtime = NULL;\n\n#ifdef TSD_ENABLE_TESTS\nstatic _Atomic int g_tsd_test_stop_join_error = 0;\nstatic _Atomic int g_tsd_test_stop_final_guard_error = 0;\n#endif\n\nstatic int runtime_join_monitor(pthread_t monitor) {\n#ifdef TSD_ENABLE_TESTS\n    int forced = atomic_exchange_explicit(&g_tsd_test_stop_join_error, 0, memory_order_acq_rel);\n    if (forced != 0) return forced;\n#endif\n    return pthread_join(monitor, NULL);\n}\n\nstatic int runtime_final_guard_enter(void) {\n#ifdef TSD_ENABLE_TESTS\n    int forced = atomic_exchange_explicit(&g_tsd_test_stop_final_guard_error, 0, memory_order_acq_rel);\n    if (forced != 0) {\n        errno = forced;\n        return -1;\n    }\n#endif\n    return tsd_runtime_safety_write_enter();\n}\n''')
+
+          replace_once(
+              'src/thermal_simd.c',
+              '''    if (g_tsd_config.predictive_temp_ceiling_c < 20 ||\n        g_tsd_config.predictive_temp_ceiling_c > 125 ||\n        g_tsd_config.predictive_safety_margin_c < 0) {\n        return 1;\n    }\n''',
+              '''    if (g_tsd_config.predictive_temp_ceiling_c < 20 ||\n        g_tsd_config.predictive_temp_ceiling_c > 125 ||\n        g_tsd_config.predictive_safety_margin_c < 0 ||\n        g_tsd_config.predictive_safety_margin_c > 60) {\n        return 0;\n    }\n''')
+
+          replace_once(
+              'src/thermal_simd.c',
+              '''    if (g_tsd_config.predictive_temp_ceiling_c < 20 ||\n        g_tsd_config.predictive_temp_ceiling_c > 125 ||\n        g_tsd_config.predictive_emergency_margin_c < 0) {\n        return 0;\n    }\n''',
+              '''    if (g_tsd_config.predictive_temp_ceiling_c < 20 ||\n        g_tsd_config.predictive_temp_ceiling_c > 125 ||\n        g_tsd_config.predictive_emergency_margin_c < 0 ||\n        g_tsd_config.predictive_emergency_margin_c > 60) {\n        return 1;\n    }\n''')
+
+          replace_once(
+              'src/thermal_simd.c',
+              '''        if (emergency) {\n            evaluation_rc = 1;\n            if (eval.severity_milli == 0) eval.severity_milli = 1;\n        }\n\n''',
+              '')
+
+          replace_once(
+              'src/thermal_simd.c',
+              '''    if (runtime->monitor_started) {\n        pthread_join(runtime->monitor, NULL);\n        runtime->monitor_started = 0;\n    }\n''',
+              '''    if (runtime->monitor_started) {\n        int join_rc = runtime_join_monitor(runtime->monitor);\n        if (join_rc != 0) {\n            int lock_rc = pthread_mutex_lock(&g_tsd_runtime_lock);\n            if (lock_rc == 0) {\n                if (runtime == g_tsd_active_runtime) runtime->stop_in_progress = 0;\n                (void)pthread_mutex_unlock(&g_tsd_runtime_lock);\n            }\n            errno = lock_rc != 0 ? lock_rc : join_rc;\n            return -1;\n        }\n        runtime->monitor_started = 0;\n    }\n''')
+
+          replace_once(
+              'src/thermal_simd.c',
+              '''    tsd_perf_cleanup(runtime->perf);\n    runtime->perf = NULL;\n    g_tsd_active_runtime = NULL;\n    free(runtime);\n\n    if (tsd_runtime_safety_write_enter() == 0) {\n        tsd_runtime_set_owner_tid_locked(0);\n        tsd_runtime_set_stopping_locked(0);\n        tsd_runtime_config_reset_dynamic_state();\n        tsd_runtime_safety_write_leave();\n    }\n    pthread_mutex_unlock(&g_tsd_runtime_lock);\n    return 0;\n''',
+              '''    if (runtime->perf) {\n        tsd_perf_cleanup(runtime->perf);\n        runtime->perf = NULL;\n    }\n\n    /* Do not destroy the private runtime until the final guard-state reset is\n     * guaranteed to be publishable. If guard acquisition fails, retain a\n     * retryable stopping tombstone instead of reporting false-success cleanup. */\n    if (runtime_final_guard_enter() != 0) {\n        int saved_errno = errno ? errno : EIO;\n        runtime->stop_in_progress = 0;\n        (void)pthread_mutex_unlock(&g_tsd_runtime_lock);\n        errno = saved_errno;\n        return -1;\n    }\n    tsd_runtime_set_owner_tid_locked(0);\n    tsd_runtime_config_reset_dynamic_state();\n    g_tsd_active_runtime = NULL;\n    free(runtime);\n    tsd_runtime_set_stopping_locked(0);\n    tsd_runtime_safety_write_leave();\n\n    (void)pthread_mutex_unlock(&g_tsd_runtime_lock);\n    return 0;\n''')
+
+          replace_once(
+              'src/thermal_simd.c',
+              '''void tsd_test_reset_workload_counter(void) { atomic_store_explicit(&g_tsd_workload_iterations, 0, memory_order_relaxed); }\n''',
+              '''void tsd_test_reset_workload_counter(void) { atomic_store_explicit(&g_tsd_workload_iterations, 0, memory_order_relaxed); }\nvoid tsd_test_force_stop_join_error(int err) { atomic_store_explicit(&g_tsd_test_stop_join_error, err, memory_order_release); }\nvoid tsd_test_force_stop_final_guard_error(int err) { atomic_store_explicit(&g_tsd_test_stop_final_guard_error, err, memory_order_release); }\n''')
+
+          replace_once(
+              'src/thermal_simd_test.h',
+              '''void tsd_test_reset_workload_counter(void);\n''',
+              '''void tsd_test_reset_workload_counter(void);\nvoid tsd_test_force_stop_join_error(int err);\nvoid tsd_test_force_stop_final_guard_error(int err);\n''')
+
+          replace_once(
+              'tests/runtime/test_runtime_lifecycle.c',
+              '''int main(void) {\n''',
+              '''static void test_stop_failures_are_retryable(void) {\n    assert(setenv("TSD_FAKE_PERF", "1", 1) == 0);\n\n    configure_runtime();\n    tsd_runtime_t *runtime = NULL;\n    assert(tsd_runtime_start(&runtime, NULL) == 0);\n    tsd_runtime_request_stop(runtime);\n    tsd_test_force_stop_join_error(EINVAL);\n    errno = 0;\n    assert(tsd_runtime_stop(runtime) != 0);\n    assert(errno == EINVAL);\n    errno = 0;\n    assert(tsd_runtime_destroy(runtime) != 0);\n    assert(errno == EBUSY);\n    assert(tsd_runtime_stop(runtime) == 0);\n    assert(tsd_runtime_destroy(runtime) == 0);\n\n    configure_runtime();\n    runtime = NULL;\n    assert(tsd_runtime_start(&runtime, NULL) == 0);\n    tsd_runtime_request_stop(runtime);\n    tsd_test_force_stop_final_guard_error(EAGAIN);\n    errno = 0;\n    assert(tsd_runtime_stop(runtime) != 0);\n    assert(errno == EAGAIN);\n    assert(tsd_runtime_perf_mode(runtime) == TSD_PERF_MODE_NONE);\n    errno = 0;\n    assert(tsd_runtime_destroy(runtime) != 0);\n    assert(errno == EBUSY);\n    assert(tsd_runtime_stop(runtime) == 0);\n    assert(tsd_runtime_destroy(runtime) == 0);\n\n    unsetenv("TSD_FAKE_PERF");\n}\n\nint main(void) {\n''')
+
+          replace_once(
+              'tests/runtime/test_runtime_lifecycle.c',
+              '''    test_stop_quiescence_releases_lifecycle_locks();\n\n    assert(setenv("TSD_FAKE_PERF", "1", 1) == 0);\n''',
+              '''    test_stop_quiescence_releases_lifecycle_locks();\n    test_stop_failures_are_retryable();\n\n    assert(setenv("TSD_FAKE_PERF", "1", 1) == 0);\n''')
+
+          replace_once(
+              'src/thermal_perf.c',
+              '''        measure_hardware_baseline(ctx, &g_tsd_config) != 0) {\n''',
+              '''        measure_hardware_baseline(ctx, tsd_runtime_config_active_snapshot()) != 0) {\n''')
+
+          replace_once(
+              'README.md',
+              '''- while the adaptive runtime is active, wider selections also require live transition permission, fresh/healthy perf state (or explicit software-upgrade opt-in), and current raw-temperature authorization;\n''',
+              '''- while the adaptive runtime is active, wider selections also require live transition permission, fresh/healthy hardware-perf state, and current raw-temperature authorization; software/degraded mode cannot authorize wider SIMD;\n''')
+
+          replace_once(
+              'include/thermal/simd/runtime.h',
+              ''' * Stops the monitor, restores perf-owner affinity and releases telemetry.\n * The handle becomes an inert tombstone and must later be released with\n * tsd_runtime_destroy().\n''',
+              ''' * Stops the monitor, restores perf-owner affinity and releases telemetry.\n * The handle becomes an inert tombstone and must later be released with\n * tsd_runtime_destroy(). If monitor join, quiescence, conservative selector\n * publication, or final guard reset fails, stop returns an error and retains a\n * retryable active/stopping tombstone rather than reporting partial success.\n''')
+          PY
+
+      - name: Commit exact repairs
+        run: |
+          if git diff --quiet; then
+            echo "No changes required"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/thermal_simd.c src/thermal_simd_test.h src/thermal_perf.c tests/runtime/test_runtime_lifecycle.c README.md include/thermal/simd/runtime.h
+          git commit -m "Finish deep-audit shutdown and runtime consistency fixes"
+          git push origin HEAD:${{ github.event.pull_request.head.ref }}
