@@ -80,7 +80,9 @@ void tsd_runtime_request_stop(tsd_runtime_t *runtime);
 /*
  * Stops the monitor, restores perf-owner affinity and releases telemetry.
  * The handle becomes an inert tombstone and must later be released with
- * tsd_runtime_destroy().
+ * tsd_runtime_destroy(). If monitor join, quiescence, conservative selector
+ * publication, or final guard reset fails, stop returns an error and retains a
+ * retryable active/stopping tombstone rather than reporting partial success.
  */
 int tsd_runtime_stop(tsd_runtime_t *runtime);
 

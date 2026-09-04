@@ -228,7 +228,7 @@ Runtime transitions publish only an immutable slot pointer. There is no normal r
 The compatibility API `tsd_trampoline_patch(width)` is now safety checked in production:
 
 - host ISA and configured AVX-512 policy are always enforced;
-- while the adaptive runtime is active, wider selections also require live transition permission, fresh/healthy perf state (or explicit software-upgrade opt-in), and current raw-temperature authorization;
+- while the adaptive runtime is active, wider selections also require live transition permission, fresh/healthy hardware-perf state, and current raw-temperature authorization; software/degraded mode cannot authorize wider SIMD;
 - SSE4.1 remains the unconditional fail-closed width.
 
 White-box test builds retain controlled override hooks for deterministic executable-memory fault testing.

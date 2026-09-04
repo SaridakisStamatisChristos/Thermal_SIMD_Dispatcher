@@ -913,7 +913,7 @@ static int try_recover_hardware(perf_ctx_t *ctx) {
     }
 
     if (enable_perf_events_strict(ctx, "reprobe") != 0 ||
-        measure_hardware_baseline(ctx, &g_tsd_config) != 0) {
+        measure_hardware_baseline(ctx, tsd_runtime_config_active_snapshot()) != 0) {
         tsd_log_warn(LOG_COMPONENT, "event=perf_reprobe state=rejected reason=validation");
         close_perf_events(ctx);
         ctx->hardware_validated = 0;
