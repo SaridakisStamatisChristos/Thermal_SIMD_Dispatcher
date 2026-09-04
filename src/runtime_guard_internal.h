@@ -24,6 +24,7 @@ int tsd_runtime_execution_enter(simd_width_t width);
 void tsd_runtime_execution_leave(simd_width_t width);
 int tsd_runtime_wide_admission_is_open(void);
 void tsd_runtime_wide_admission_close(void);
+int tsd_runtime_current_thread_in_wide_execution(void);
 int tsd_runtime_wait_for_wide_quiescence(void);
 
 /*
