@@ -23,11 +23,15 @@ struct DispatcherPolicyState {
     bool last_temp_available;
     int32_t last_temp_millic;
     bool have_sample;
+    int temp_ceiling_c;
+    int safety_margin_c;
+    int emergency_margin_c;
     std::unique_ptr<tsd::policy::MPCController> controller;
 
     DispatcherPolicyState()
         : config{}, fallback_active(false), last_temp_available(false), last_temp_millic(0),
-          have_sample(false), controller(nullptr) {}
+          have_sample(false), temp_ceiling_c(0), safety_margin_c(0), emergency_margin_c(0),
+          controller(nullptr) {}
 };
 
 void publish_state(const DispatcherPolicyState &state,
@@ -52,41 +56,31 @@ void enter_fail_closed(DispatcherPolicyState *state,
     publish_state(*state, current, target, target != current);
 }
 
-bool runtime_temperature_limits_valid() {
-    return g_tsd_config.predictive_temp_ceiling_c >= 20 &&
-           g_tsd_config.predictive_temp_ceiling_c <= 125 &&
-           g_tsd_config.predictive_safety_margin_c >= 0 &&
-           g_tsd_config.predictive_safety_margin_c <= 60 &&
-           g_tsd_config.predictive_emergency_margin_c >= 0 &&
-           g_tsd_config.predictive_emergency_margin_c <= 60;
+void snapshot_runtime_limits(DispatcherPolicyState &state) noexcept {
+    state.temp_ceiling_c = g_tsd_config.predictive_temp_ceiling_c;
+    state.safety_margin_c = g_tsd_config.predictive_safety_margin_c;
+    state.emergency_margin_c = g_tsd_config.predictive_emergency_margin_c;
 }
 
-int64_t upgrade_temperature_limit_millic() {
-    if (!runtime_temperature_limits_valid()) {
-        return INT64_MIN;
-    }
-    return static_cast<int64_t>(g_tsd_config.predictive_temp_ceiling_c -
-                                g_tsd_config.predictive_safety_margin_c) * 1000;
+bool runtime_temperature_limits_valid(const DispatcherPolicyState &state) {
+    return state.temp_ceiling_c >= 20 && state.temp_ceiling_c <= 125 &&
+           state.safety_margin_c >= 0 && state.safety_margin_c <= 60 &&
+           state.emergency_margin_c >= 0 && state.emergency_margin_c <= 60;
 }
 
-int64_t emergency_temperature_limit_millic() {
-    if (!runtime_temperature_limits_valid()) {
-        return INT64_MIN;
-    }
-    return (static_cast<int64_t>(g_tsd_config.predictive_temp_ceiling_c) +
-            static_cast<int64_t>(g_tsd_config.predictive_emergency_margin_c)) * 1000;
+int64_t upgrade_temperature_limit_millic(const DispatcherPolicyState &state) {
+    if (!runtime_temperature_limits_valid(state)) return INT64_MIN;
+    return static_cast<int64_t>(state.temp_ceiling_c - state.safety_margin_c) * 1000;
+}
+
+int64_t emergency_temperature_limit_millic(const DispatcherPolicyState &state) {
+    if (!runtime_temperature_limits_valid(state)) return INT64_MIN;
+    return (static_cast<int64_t>(state.temp_ceiling_c) +
+            static_cast<int64_t>(state.emergency_margin_c)) * 1000;
 }
 
 #ifdef TSD_ENABLE_TESTS
 std::atomic<int> g_test_throw_stage{0};
-
-enum : int {
-    TSD_POLICY_THROW_CREATE = 1,
-    TSD_POLICY_THROW_RESET = 2,
-    TSD_POLICY_THROW_RECORD = 3,
-    TSD_POLICY_THROW_RECOMMEND = 4,
-    TSD_POLICY_THROW_RELOAD = 5,
-};
 
 void maybe_throw_for_test(int stage) {
     int expected = stage;
@@ -114,6 +108,7 @@ tsd_dispatcher_policy_state* tsd_dispatcher_policy_create(const tsd_policy_confi
             tsd_policy_config_set_defaults(&defaults);
             state->config = defaults;
         }
+        snapshot_runtime_limits(*state);
         state->controller = std::make_unique<tsd::policy::MPCController>(state->config);
         state->fallback_active = false;
         publish_state(*state, SIMD_SSE41, SIMD_SSE41, false);
@@ -148,9 +143,8 @@ void tsd_dispatcher_policy_reset(tsd_dispatcher_policy_state *opaque, const tsd_
     auto *state = reinterpret_cast<DispatcherPolicyState*>(opaque);
     try {
         maybe_throw_for_test(2);
-        if (config) {
-            state->config = *config;
-        }
+        if (config) state->config = *config;
+        snapshot_runtime_limits(*state);
         if (!state->controller) {
             state->controller = std::make_unique<tsd::policy::MPCController>(state->config);
         }
@@ -214,7 +208,7 @@ int tsd_dispatcher_policy_recommend(tsd_dispatcher_policy_state *opaque,
         }
 
         if (state->have_sample && state->last_temp_available && current_width > SIMD_SSE41 &&
-            static_cast<int64_t>(state->last_temp_millic) >= emergency_temperature_limit_millic()) {
+            static_cast<int64_t>(state->last_temp_millic) >= emergency_temperature_limit_millic(*state)) {
             if (out_width) *out_width = SIMD_SSE41;
             publish_state(*state, current_width, SIMD_SSE41, true);
             return 1;
@@ -238,7 +232,7 @@ int tsd_dispatcher_policy_recommend(tsd_dispatcher_policy_state *opaque,
          */
         if (target > current_width &&
             (!state->have_sample || !state->last_temp_available ||
-             static_cast<int64_t>(state->last_temp_millic) > upgrade_temperature_limit_millic())) {
+             static_cast<int64_t>(state->last_temp_millic) > upgrade_temperature_limit_millic(*state))) {
             publish_state(*state, current_width, current_width, false);
             return 0;
         }
