@@ -17,6 +17,13 @@ extern "C" {
  * clamped to the host ISA, then resolved to the widest registered variant at
  * or below that width. SSE4.1 is mandatory because it is the runtime's
  * conservative baseline.
+ *
+ * Callbacks may terminate their thread normally (including pthread_exit) and
+ * dispatch admission accounting will be cleaned up. pthread cancellation is
+ * disabled while callback code is executing and restored only after admission
+ * accounting has been released. Callbacks must not escape with longjmp across
+ * the dispatcher frame: C longjmp bypasses cleanup handlers and is therefore
+ * outside this API's supported control-flow contract.
  */
 typedef void (*tsd_kernel_fn)(void *context, size_t work_items);
 
