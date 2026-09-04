@@ -92,6 +92,8 @@ private:
     std::atomic<uint64_t> generation_;
     mutable std::mutex thread_mutex_;
     std::thread thread_;
+    mutable std::mutex wake_mutex_;
+    std::condition_variable wake_cv_;
 };
 
 }  // namespace telemetry
