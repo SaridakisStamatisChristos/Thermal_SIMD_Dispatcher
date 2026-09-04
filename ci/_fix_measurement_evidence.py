@@ -78,26 +78,18 @@ s = p.read_text(encoding="utf-8")
 s = replace_once(
     s,
 """    if (triggered != 0 || eval.cpi_milli != 1000 ||
-        tsd_test_perf_get_last_llc_value(ctx) != llc_stable) {
-        fprintf(stderr, "stable partial group read verification failed\n");
-""",
+        tsd_test_perf_get_last_llc_value(ctx) != llc_stable) {""",
 """    if (triggered != 0 || eval.performance_available != 0 || eval.cpi_milli != 0 ||
-        tsd_test_perf_get_last_llc_value(ctx) != llc_stable) {
-        fprintf(stderr, "stable no-work group read verification failed\n");
-""",
+        tsd_test_perf_get_last_llc_value(ctx) != llc_stable) {""",
     "stable no-work expectation")
 s = replace_once(
     s,
 """    if (!tsd_test_perf_get_last_group_valid(ctx) ||
         tsd_test_perf_get_last_llc_value(ctx) != llc_hot ||
-        eval.cpi_milli != 2000 || triggered == 0) {
-        fprintf(stderr, "hot partial group read verification failed\n");
-""",
+        eval.cpi_milli != 2000 || triggered == 0) {""",
 """    if (!tsd_test_perf_get_last_group_valid(ctx) ||
         tsd_test_perf_get_last_llc_value(ctx) != llc_hot ||
-        eval.performance_available != 0 || eval.cpi_milli != 0 || triggered != 0) {
-        fprintf(stderr, "hot no-work group read verification failed\n");
-""",
+        eval.performance_available != 0 || eval.cpi_milli != 0 || triggered != 0) {""",
     "hot no-work expectation")
 p.write_text(s, encoding="utf-8")
 
