@@ -16,6 +16,9 @@ on:
         required: false
         default: "30"
 
+permissions:
+  contents: read
+
 jobs:
   hardware-smoke:
     runs-on:
@@ -96,4 +99,4 @@ jobs:
           name: thermal-simd-hil-${{ inputs.target_isa }}-${{ github.sha }}
           path: hil-artifacts/
           if-no-files-found: warn
-          retention-days: 30
+          retention-days: 90

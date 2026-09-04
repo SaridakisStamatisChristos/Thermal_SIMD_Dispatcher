@@ -29,6 +29,8 @@ int tsd_test_refresh_ticks(void);
 void tsd_test_set_running(int value);
 void tsd_test_run_workload(int iterations);
 void tsd_test_reset_workload_counter(void);
+void tsd_test_force_stop_join_error(int err);
+void tsd_test_force_stop_final_guard_error(int err);
 void tsd_test_set_detect_override(simd_width_t (*fn)(void));
 void tsd_test_clear_detect_override(void);
 void tsd_test_override_patch(simd_width_t width, const uint8_t *bytes, size_t len);

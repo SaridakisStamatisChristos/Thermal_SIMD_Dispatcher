@@ -1,10 +1,15 @@
 #include <assert.h>
+#include <pthread.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdatomic.h>
+#include <unistd.h>
 
 #include <config/runtime_flags.h>
 #include <thermal/simd/adaptive_dispatch.h>
 #include <thermal/simd/thermal_trampoline.h>
+
+#include "../../src/runtime_guard_internal.h"
 
 struct counters {
     uint64_t sse;
@@ -43,6 +48,89 @@ static int run_v2(void *context, size_t offset, size_t work_items) {
     state->sse += work_items;
     state->calls++;
     return 0;
+}
+
+struct exit_case {
+    tsd_kernel_dispatch_t *dispatch;
+    _Atomic int entered;
+    int cancel_loop;
+};
+
+static void callback_pthread_exit(void *context, size_t work_items) {
+    (void)work_items;
+    struct exit_case *state = (struct exit_case *)context;
+    atomic_store_explicit(&state->entered, 1, memory_order_release);
+    pthread_exit((void *)(uintptr_t)0x1234u);
+}
+
+static void callback_cancelable(void *context, size_t work_items) {
+    (void)work_items;
+    struct exit_case *state = (struct exit_case *)context;
+    atomic_store_explicit(&state->entered, 1, memory_order_release);
+    while (state->cancel_loop) {
+        pthread_testcancel();
+        usleep(1000);
+    }
+}
+
+static void *execute_thread(void *opaque) {
+    struct exit_case *state = (struct exit_case *)opaque;
+    simd_width_t used = SIMD_SSE41;
+    int rc = tsd_kernel_dispatch_execute(state->dispatch, 1, &used);
+    return (void *)(intptr_t)rc;
+}
+
+static void wait_until_entered(struct exit_case *state) {
+    for (int i = 0; i < 5000; ++i) {
+        if (atomic_load_explicit(&state->entered, memory_order_acquire)) return;
+        usleep(1000);
+    }
+    assert(!"callback did not start");
+}
+
+static void test_pthread_exit_cleanup(void) {
+    struct exit_case state = {.dispatch = NULL, .entered = 0, .cancel_loop = 0};
+    tsd_kernel_variants_t variants = {
+        .sse41 = callback_pthread_exit,
+        .avx2 = callback_pthread_exit,
+        .avx512 = callback_pthread_exit,
+        .context = &state,
+    };
+    assert(tsd_kernel_dispatch_create(&variants, &state.dispatch) == 0);
+    assert(tsd_trampoline_patch(SIMD_AVX2) == 0);
+
+    pthread_t thread;
+    assert(pthread_create(&thread, NULL, execute_thread, &state) == 0);
+    void *result = NULL;
+    assert(pthread_join(thread, &result) == 0);
+    assert(result == (void *)(uintptr_t)0x1234u);
+    assert(atomic_load_explicit(&state.entered, memory_order_acquire) == 1);
+    assert(tsd_runtime_wait_for_wide_quiescence() == 0);
+
+    tsd_kernel_dispatch_destroy(state.dispatch);
+}
+
+static void test_deferred_cancellation_cleanup(void) {
+    struct exit_case state = {.dispatch = NULL, .entered = 0, .cancel_loop = 1};
+    tsd_kernel_variants_t variants = {
+        .sse41 = callback_cancelable,
+        .avx2 = callback_cancelable,
+        .avx512 = callback_cancelable,
+        .context = &state,
+    };
+    assert(tsd_kernel_dispatch_create(&variants, &state.dispatch) == 0);
+    assert(tsd_trampoline_patch(SIMD_AVX2) == 0);
+
+    pthread_t thread;
+    assert(pthread_create(&thread, NULL, execute_thread, &state) == 0);
+    wait_until_entered(&state);
+    assert(pthread_cancel(thread) == 0);
+    void *result = NULL;
+    assert(pthread_join(thread, &result) == 0);
+    assert(result == PTHREAD_CANCELED);
+    assert(tsd_runtime_wait_for_wide_quiescence() == 0);
+
+    tsd_kernel_dispatch_destroy(state.dispatch);
 }
 
 int main(void) {
@@ -129,5 +217,8 @@ int main(void) {
     assert(counters.calls == 4);
     assert(tsd_kernel_dispatch_v2_execute_chunked(dispatch_v2, SIZE_MAX, 1, 1, &used) != 0);
     tsd_kernel_dispatch_v2_destroy(dispatch_v2);
+
+    test_pthread_exit_cleanup();
+    test_deferred_cancellation_cleanup();
     return 0;
 }

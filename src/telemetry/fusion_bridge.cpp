@@ -48,8 +48,12 @@ std::atomic<bool> g_temperature_upgrade_allowed{true};
 bool g_test_disable_direct_helper = false;
 #endif
 
+const tsd_runtime_config &runtime_config() {
+    return *tsd_runtime_config_active_snapshot();
+}
+
 bool runtime_config_initialized() {
-    return g_tsd_config.check_interval_us > 0;
+    return runtime_config().check_interval_us > 0;
 }
 
 bool direct_helper_enabled() {
@@ -62,7 +66,7 @@ bool direct_helper_enabled() {
 
 std::chrono::milliseconds freshness_window() {
     const bool initialized = runtime_config_initialized();
-    int freshness_ms = initialized ? g_tsd_config.telemetry_max_skew_ms : 150;
+    int freshness_ms = initialized ? runtime_config().telemetry_max_skew_ms : 150;
     if (freshness_ms < 0) freshness_ms = 150;
     return std::chrono::milliseconds(freshness_ms);
 }
@@ -70,8 +74,8 @@ std::chrono::milliseconds freshness_window() {
 telemetry::TelemetryFusionConfig default_config() {
     telemetry::TelemetryFusionConfig config;
     const bool initialized = runtime_config_initialized();
-    int interval_ms = initialized && g_tsd_config.telemetry_interval_ms > 0
-                          ? g_tsd_config.telemetry_interval_ms
+    int interval_ms = initialized && runtime_config().telemetry_interval_ms > 0
+                          ? runtime_config().telemetry_interval_ms
                           : 50;
     config.poll_interval = std::chrono::milliseconds(interval_ms);
     config.freshness_window = freshness_window();
@@ -81,7 +85,7 @@ telemetry::TelemetryFusionConfig default_config() {
 
 double smoothing_alpha() {
     if (!runtime_config_initialized()) return 1.0;
-    double alpha = g_tsd_config.telemetry_ewma_alpha;
+    double alpha = runtime_config().telemetry_ewma_alpha;
     if (!std::isfinite(alpha) || alpha < 0.0 || alpha > 1.0) return 1.0;
     /* alpha == 0 means explicit filter bypass, never a frozen signal. */
     return alpha == 0.0 ? 1.0 : alpha;
@@ -264,10 +268,10 @@ int start_unlocked(int cpu) {
         return -1;
     }
 
-    if (runtime_config_initialized() && g_tsd_config.telemetry_profile_path[0] != '\0') {
+    if (runtime_config_initialized() && runtime_config().telemetry_profile_path[0] != '\0') {
         tsd_log_error("telemetry",
                       "telemetry profile manifests are not implemented; refusing fusion startup for profile=%s",
-                      g_tsd_config.telemetry_profile_path);
+                      runtime_config().telemetry_profile_path);
         errno = ENOTSUP;
         return -1;
     }

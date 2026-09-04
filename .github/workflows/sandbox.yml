@@ -7,6 +7,9 @@ on:
   schedule:
     - cron: '41 3 * * 3'
 
+permissions:
+  contents: read
+
 jobs:
   degraded-runtime:
     runs-on: ubuntu-latest

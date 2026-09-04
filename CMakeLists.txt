@@ -198,6 +198,20 @@ if(BUILD_TESTING)
     target_include_directories(test_runtime_lifecycle PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME runtime_lifecycle COMMAND test_runtime_lifecycle)
 
+    # Deterministic shutdown-failure injection belongs in an isolated white-box
+    # target so the production lifecycle suite continues exercising the exact
+    # installed runtime/trampoline semantics.
+    add_executable(test_runtime_stop_faults
+        tests/runtime/test_runtime_stop_faults.c
+        src/runtime_api.c
+        src/thermal_simd.c)
+    target_link_libraries(test_runtime_stop_faults PRIVATE thermal_simd_core_tests Threads::Threads m ${TSD_CXX_RUNTIME_LIBRARIES})
+    target_compile_definitions(test_runtime_stop_faults PRIVATE TSD_ENABLE_TESTS)
+    target_compile_options(test_runtime_stop_faults PRIVATE -Wall -Wextra -pthread -fPIC -mno-avx ${THERMAL_SIMD_DISPATCHER_CPU_FLAGS})
+    target_include_directories(test_runtime_stop_faults PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    set_target_properties(test_runtime_stop_faults PROPERTIES LINKER_LANGUAGE CXX)
+    add_test(NAME runtime_stop_faults COMMAND test_runtime_stop_faults)
+
     add_executable(test_thermal_simd tests/test_thermal_simd.c src/thermal_simd.c)
     target_compile_definitions(test_thermal_simd PRIVATE TSD_ENABLE_TESTS)
     target_link_libraries(test_thermal_simd PRIVATE thermal_simd_core_tests Threads::Threads)

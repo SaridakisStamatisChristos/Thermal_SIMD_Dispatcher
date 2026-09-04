@@ -95,6 +95,18 @@ static void write_log_line(tsd_log_level_t level, const char *component, const c
     pthread_mutex_unlock(&g_tsd_log_lock);
 }
 
+/*
+ * tsd_log() is the one audited printf-style forwarding boundary in the C
+ * logger. Its public declaration carries printf-format checking, so callers are
+ * checked at compile time. Inside this implementation the format is necessarily
+ * a parameter when forwarded to vsnprintf(); suppress only Clang's
+ * -Wformat-nonliteral diagnostic for this wrapper while retaining global
+ * -Werror for every other warning.
+ */
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wformat-nonliteral"
+#endif
 void tsd_log(tsd_log_level_t level, const char *component, const char *fmt, ...) {
     if (!tsd_log_should_log(level)) {
         return;
@@ -128,6 +140,9 @@ void tsd_log(tsd_log_level_t level, const char *component, const char *fmt, ...)
         free(msg);
     }
 }
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#endif
 
 int tsd_log_level_from_string(const char *level_str, tsd_log_level_t *out_level) {
     if (!level_str || !out_level) {

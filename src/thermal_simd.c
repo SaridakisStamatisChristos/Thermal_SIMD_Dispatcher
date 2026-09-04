@@ -47,6 +47,30 @@ struct tsd_runtime {
 static pthread_mutex_t g_tsd_runtime_lock = PTHREAD_MUTEX_INITIALIZER;
 static tsd_runtime_t *g_tsd_active_runtime = NULL;
 
+#ifdef TSD_ENABLE_TESTS
+static _Atomic int g_tsd_test_stop_join_error = 0;
+static _Atomic int g_tsd_test_stop_final_guard_error = 0;
+#endif
+
+static int runtime_join_monitor(pthread_t monitor) {
+#ifdef TSD_ENABLE_TESTS
+    int forced = atomic_exchange_explicit(&g_tsd_test_stop_join_error, 0, memory_order_acq_rel);
+    if (forced != 0) return forced;
+#endif
+    return pthread_join(monitor, NULL);
+}
+
+static int runtime_final_guard_enter(void) {
+#ifdef TSD_ENABLE_TESTS
+    int forced = atomic_exchange_explicit(&g_tsd_test_stop_final_guard_error, 0, memory_order_acq_rel);
+    if (forced != 0) {
+        errno = forced;
+        return -1;
+    }
+#endif
+    return tsd_runtime_safety_write_enter();
+}
+
 static void tsd_handle_sighup(int sig) {
     (void)sig;
     g_tsd_reload_requested = 1;
@@ -89,8 +113,9 @@ static int temperature_upgrade_allowed(const tsd_thermal_eval_t *eval) {
     }
     if (g_tsd_config.predictive_temp_ceiling_c < 20 ||
         g_tsd_config.predictive_temp_ceiling_c > 125 ||
-        g_tsd_config.predictive_safety_margin_c < 0) {
-        return 1;
+        g_tsd_config.predictive_safety_margin_c < 0 ||
+        g_tsd_config.predictive_safety_margin_c > 60) {
+        return 0;
     }
     int64_t limit = (int64_t)(g_tsd_config.predictive_temp_ceiling_c -
                               g_tsd_config.predictive_safety_margin_c) * 1000;
@@ -103,8 +128,9 @@ static int emergency_temperature_exceeded(const tsd_thermal_eval_t *eval) {
     }
     if (g_tsd_config.predictive_temp_ceiling_c < 20 ||
         g_tsd_config.predictive_temp_ceiling_c > 125 ||
-        g_tsd_config.predictive_emergency_margin_c < 0) {
-        return 0;
+        g_tsd_config.predictive_emergency_margin_c < 0 ||
+        g_tsd_config.predictive_emergency_margin_c > 60) {
+        return 1;
     }
     int64_t limit = (int64_t)(g_tsd_config.predictive_temp_ceiling_c +
                               g_tsd_config.predictive_emergency_margin_c) * 1000;
@@ -281,6 +307,14 @@ static void print_configuration(simd_width_t max_width) {
                  g_tsd_config.demo_duration_sec, g_tsd_config.work_iters);
 }
 
+/* append_message is an internal printf-style forwarding helper. Call sites use
+ * literal formats; the helper necessarily forwards its format parameter to
+ * vsnprintf. Keep global -Werror and suppress only Clang's nonliteral warning
+ * around this audited forwarding boundary. */
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wformat-nonliteral"
+#endif
 static void append_message(char *buf, size_t buf_size, size_t *cursor, const char *fmt, ...) {
     if (!buf || buf_size == 0 || !cursor || *cursor >= buf_size) {
         return;
@@ -299,6 +333,9 @@ static void append_message(char *buf, size_t buf_size, size_t *cursor, const cha
         *cursor += (size_t)written;
     }
 }
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#endif
 
 static int evaluate_thermal(perf_ctx_t *ctx, tsd_thermal_eval_t *out) {
     return tsd_perf_evaluate(ctx, out, &g_tsd_config);
@@ -406,11 +443,6 @@ void* thermal_monitor_thread(void *arg) {
                 cooldown_until_ms = 0;
             }
             continue;
-        }
-
-        if (emergency) {
-            evaluation_rc = 1;
-            if (eval.severity_milli == 0) eval.severity_milli = 1;
         }
 
         /* Lack of measured owner-thread work/performance is not evidence of
@@ -736,7 +768,16 @@ int tsd_runtime_stop(tsd_runtime_t *runtime) {
     pthread_mutex_unlock(&g_tsd_runtime_lock);
 
     if (runtime->monitor_started) {
-        pthread_join(runtime->monitor, NULL);
+        int join_rc = runtime_join_monitor(runtime->monitor);
+        if (join_rc != 0) {
+            int lock_rc = pthread_mutex_lock(&g_tsd_runtime_lock);
+            if (lock_rc == 0) {
+                if (runtime == g_tsd_active_runtime) runtime->stop_in_progress = 0;
+                (void)pthread_mutex_unlock(&g_tsd_runtime_lock);
+            }
+            errno = lock_rc != 0 ? lock_rc : join_rc;
+            return -1;
+        }
         runtime->monitor_started = 0;
     }
 
@@ -772,18 +813,29 @@ int tsd_runtime_stop(tsd_runtime_t *runtime) {
         return -1;
     }
 
-    tsd_perf_cleanup(runtime->perf);
-    runtime->perf = NULL;
+    if (runtime->perf) {
+        tsd_perf_cleanup(runtime->perf);
+        runtime->perf = NULL;
+    }
+
+    /* Do not destroy the private runtime until the final guard-state reset is
+     * guaranteed to be publishable. If guard acquisition fails, retain a
+     * retryable stopping tombstone instead of reporting false-success cleanup. */
+    if (runtime_final_guard_enter() != 0) {
+        int saved_errno = errno ? errno : EIO;
+        runtime->stop_in_progress = 0;
+        (void)pthread_mutex_unlock(&g_tsd_runtime_lock);
+        errno = saved_errno;
+        return -1;
+    }
+    tsd_runtime_set_owner_tid_locked(0);
+    tsd_runtime_config_reset_dynamic_state();
     g_tsd_active_runtime = NULL;
     free(runtime);
+    tsd_runtime_set_stopping_locked(0);
+    tsd_runtime_safety_write_leave();
 
-    if (tsd_runtime_safety_write_enter() == 0) {
-        tsd_runtime_set_owner_tid_locked(0);
-        tsd_runtime_set_stopping_locked(0);
-        tsd_runtime_config_reset_dynamic_state();
-        tsd_runtime_safety_write_leave();
-    }
-    pthread_mutex_unlock(&g_tsd_runtime_lock);
+    (void)pthread_mutex_unlock(&g_tsd_runtime_lock);
     return 0;
 }
 
@@ -1001,6 +1053,8 @@ int tsd_test_refresh_ticks(void) { return tsd_runtime_config_refresh_ticks(&g_ts
 void tsd_test_set_running(int value) { atomic_store_explicit(&g_tsd_running, value, memory_order_release); }
 void tsd_test_run_workload(int iterations) { if (iterations >= 0) workload_loop(iterations); }
 void tsd_test_reset_workload_counter(void) { atomic_store_explicit(&g_tsd_workload_iterations, 0, memory_order_relaxed); }
+void tsd_test_force_stop_join_error(int err) { atomic_store_explicit(&g_tsd_test_stop_join_error, err, memory_order_release); }
+void tsd_test_force_stop_final_guard_error(int err) { atomic_store_explicit(&g_tsd_test_stop_final_guard_error, err, memory_order_release); }
 void tsd_test_set_detect_override(simd_width_t (*fn)(void)) { tsd_cpu_set_detect_override(fn); }
 void tsd_test_clear_detect_override(void) { tsd_cpu_clear_detect_override(); }
 void tsd_test_override_patch(simd_width_t width, const uint8_t *bytes, size_t len) { tsd_trampoline_override_patch(width, bytes, len); }

@@ -63,12 +63,33 @@ typedef struct {
 /*
  * Legacy process-global configuration retained for source/ABI compatibility.
  * Configure it before starting the adaptive runtime; callers must not write it
- * concurrently with a live runtime. Safety-critical thermal authorization and
- * controller limits are captured per live runtime/control generation, so later
- * accidental writes cannot relax those already-established safety bounds.
- * Future integrations should treat this object as startup-only configuration.
+ * concurrently with a live runtime. A validated immutable copy is captured for
+ * each runtime generation, and runtime/control code consumes that copy rather
+ * than live-reading this writable compatibility object.
  */
 extern tsd_runtime_config g_tsd_config;
+
+/*
+ * Returns the immutable active runtime-generation configuration when a runtime
+ * is live, otherwise the legacy startup configuration. The returned object is
+ * read-only to callers and remains stable for the live generation.
+ */
+const tsd_runtime_config *tsd_runtime_config_active_snapshot(void);
+
+/*
+ * Private implementation bridge for the historical thermal_simd.c source.
+ * Production builds route those legacy lvalue references into the validated
+ * generation copy. The mutable type exists only because old startup branches
+ * are written against a mutable lvalue; generation validation makes those
+ * initialization branches unreachable after activation. White-box test builds
+ * keep the real writable g_tsd_config so their mutation hooks remain valid.
+ */
+#if defined(TSD_RUNTIME_INTERNAL_IMPL) && !defined(TSD_ENABLE_TESTS)
+static inline tsd_runtime_config *tsd_runtime_config_active_snapshot_internal(void) {
+    return (tsd_runtime_config *)(uintptr_t)tsd_runtime_config_active_snapshot();
+}
+#define g_tsd_config (*tsd_runtime_config_active_snapshot_internal())
+#endif
 
 /* Pure value initializers: these never modify process-global runtime state. */
 void tsd_runtime_config_set_defaults(tsd_runtime_config *cfg);

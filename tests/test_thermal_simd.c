@@ -35,6 +35,10 @@ static int run_monitor_thread_scenario(void) {
     tsd_test_reset_runtime();
     tsd_test_set_policy_counts(1, 1);
     tsd_test_set_timing(1000, 1, 1, 1);
+    /* This scenario intentionally publishes one cool authorization sample.
+     * Keep it fresh for the duration of the deterministic monitor sequence;
+     * production freshness remains unchanged. */
+    g_tsd_config.telemetry_max_skew_ms = 5000;
     if (tsd_test_refresh_ticks() != 0) {
         fprintf(stderr, "failed to refresh ticks\n");
         rc = 1;

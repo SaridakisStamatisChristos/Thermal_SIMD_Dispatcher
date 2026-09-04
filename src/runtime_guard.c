@@ -29,6 +29,10 @@ static _Atomic int g_tsd_runtime_stopping = 0;
 static _Atomic int g_tsd_runtime_owner_tid = 0;
 static _Thread_local unsigned int g_tsd_wide_execution_depth = 0;
 
+/* 0=inactive, 1=publishing, 2=immutable active generation. */
+static _Atomic int g_tsd_runtime_config_snapshot_state = 0;
+static tsd_runtime_config g_tsd_runtime_config_snapshot;
+
 typedef struct {
     int telemetry_max_skew_ms;
     int predictive_temp_ceiling_c;
@@ -44,6 +48,77 @@ static int current_tid(void) {
     return (int)syscall(SYS_gettid);
 }
 
+static int validate_generation_config(tsd_runtime_config *cfg) {
+    if (!cfg || cfg->check_interval_us <= 0 || cfg->down_count <= 0 || cfg->up_count <= 0 ||
+        !isfinite(cfg->down_ratio) || cfg->down_ratio <= 0.0 ||
+        cfg->cooldown_down_ms < 0 || cfg->cooldown_up_ms < 0 || cfg->min_dwell_ms < 0 ||
+        cfg->memory_guard_divisor <= 0 || cfg->degraded_timeout_sec <= 0 ||
+        cfg->telemetry_interval_ms < 10 || cfg->telemetry_interval_ms > 60000 ||
+        cfg->telemetry_max_skew_ms < 0 || cfg->telemetry_max_skew_ms > 60000 ||
+        !isfinite(cfg->telemetry_ewma_alpha) || cfg->telemetry_ewma_alpha < 0.0 ||
+        cfg->telemetry_ewma_alpha > 1.0 ||
+        cfg->predictive_temp_ceiling_c < 20 || cfg->predictive_temp_ceiling_c > 125 ||
+        cfg->predictive_safety_margin_c < 0 || cfg->predictive_safety_margin_c > 60 ||
+        cfg->predictive_emergency_margin_c < 0 || cfg->predictive_emergency_margin_c > 60 ||
+        !isfinite(cfg->predictive_alpha) || cfg->predictive_alpha < 0.0 || cfg->predictive_alpha > 1.0) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (cfg->down_ratio_milli == 0) {
+        double scaled = cfg->down_ratio * 1000.0;
+        if (!isfinite(scaled) || scaled < 1.0 || scaled > (double)UINT64_MAX) {
+            errno = EINVAL;
+            return -1;
+        }
+        cfg->down_ratio_milli = (uint64_t)(scaled + 0.5);
+    }
+    tsd_policy_config_apply_bounds(&cfg->policy);
+    if (tsd_runtime_config_refresh_ticks(cfg) != 0) {
+        if (errno == 0) errno = EINVAL;
+        return -1;
+    }
+    return 0;
+}
+
+int tsd_runtime_config_activate_snapshot(const tsd_runtime_config *config) {
+    if (!config) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    tsd_runtime_config snapshot = *config;
+    if (validate_generation_config(&snapshot) != 0) return -1;
+
+    int expected = 0;
+    if (!atomic_compare_exchange_strong_explicit(&g_tsd_runtime_config_snapshot_state,
+                                                  &expected, 1,
+                                                  memory_order_acq_rel,
+                                                  memory_order_acquire)) {
+        errno = EBUSY;
+        return -1;
+    }
+    g_tsd_runtime_config_snapshot = snapshot;
+    atomic_store_explicit(&g_tsd_runtime_config_snapshot_state, 2, memory_order_release);
+    atomic_store_explicit(&g_tsd_safety_config_snapshot_state, 0, memory_order_release);
+    return 0;
+}
+
+void tsd_runtime_config_deactivate_snapshot(void) {
+    atomic_store_explicit(&g_tsd_safety_config_snapshot_state, 0, memory_order_release);
+    atomic_store_explicit(&g_tsd_runtime_config_snapshot_state, 0, memory_order_release);
+}
+
+int tsd_runtime_config_snapshot_is_active(void) {
+    return atomic_load_explicit(&g_tsd_runtime_config_snapshot_state, memory_order_acquire) == 2;
+}
+
+const tsd_runtime_config *tsd_runtime_config_active_snapshot(void) {
+    if (atomic_load_explicit(&g_tsd_runtime_config_snapshot_state, memory_order_acquire) == 2) {
+        return &g_tsd_runtime_config_snapshot;
+    }
+    return &g_tsd_config;
+}
+
 static int safety_config_snapshot(tsd_safety_config_snapshot_t *out) {
     if (!out) return 0;
 
@@ -54,11 +129,12 @@ static int safety_config_snapshot(tsd_safety_config_snapshot_t *out) {
                                                     &expected, 1,
                                                     memory_order_acq_rel,
                                                     memory_order_acquire)) {
+            const tsd_runtime_config *runtime_cfg = tsd_runtime_config_active_snapshot();
             tsd_safety_config_snapshot_t snapshot = {
-                .telemetry_max_skew_ms = g_tsd_config.telemetry_max_skew_ms,
-                .predictive_temp_ceiling_c = g_tsd_config.predictive_temp_ceiling_c,
-                .predictive_safety_margin_c = g_tsd_config.predictive_safety_margin_c,
-                .predictive_emergency_margin_c = g_tsd_config.predictive_emergency_margin_c,
+                .telemetry_max_skew_ms = runtime_cfg->telemetry_max_skew_ms,
+                .predictive_temp_ceiling_c = runtime_cfg->predictive_temp_ceiling_c,
+                .predictive_safety_margin_c = runtime_cfg->predictive_safety_margin_c,
+                .predictive_emergency_margin_c = runtime_cfg->predictive_emergency_margin_c,
             };
             g_tsd_safety_config_snapshot = snapshot;
             atomic_store_explicit(&g_tsd_safety_config_snapshot_state, 2, memory_order_release);
@@ -113,9 +189,11 @@ static void wide_execution_release(void) {
         return;
     }
     if (previous == 1) {
-        pthread_mutex_lock(&g_tsd_wide_drain_lock);
-        pthread_cond_broadcast(&g_tsd_wide_drain_cv);
-        pthread_mutex_unlock(&g_tsd_wide_drain_lock);
+        int rc = pthread_mutex_lock(&g_tsd_wide_drain_lock);
+        if (rc == 0) {
+            (void)pthread_cond_broadcast(&g_tsd_wide_drain_cv);
+            (void)pthread_mutex_unlock(&g_tsd_wide_drain_lock);
+        }
     }
 }
 
@@ -168,12 +246,16 @@ int tsd_runtime_wait_for_wide_quiescence(void) {
     while (atomic_load_explicit(&g_tsd_active_wide_executions, memory_order_acquire) != 0) {
         rc = pthread_cond_wait(&g_tsd_wide_drain_cv, &g_tsd_wide_drain_lock);
         if (rc != 0) {
-            pthread_mutex_unlock(&g_tsd_wide_drain_lock);
+            (void)pthread_mutex_unlock(&g_tsd_wide_drain_lock);
             errno = rc;
             return -1;
         }
     }
-    pthread_mutex_unlock(&g_tsd_wide_drain_lock);
+    rc = pthread_mutex_unlock(&g_tsd_wide_drain_lock);
+    if (rc != 0) {
+        errno = rc;
+        return -1;
+    }
     return 0;
 }
 

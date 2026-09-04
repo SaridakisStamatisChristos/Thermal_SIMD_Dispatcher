@@ -57,9 +57,10 @@ void enter_fail_closed(DispatcherPolicyState *state,
 }
 
 void snapshot_runtime_limits(DispatcherPolicyState &state) noexcept {
-    state.temp_ceiling_c = g_tsd_config.predictive_temp_ceiling_c;
-    state.safety_margin_c = g_tsd_config.predictive_safety_margin_c;
-    state.emergency_margin_c = g_tsd_config.predictive_emergency_margin_c;
+    const tsd_runtime_config *runtime = tsd_runtime_config_active_snapshot();
+    state.temp_ceiling_c = runtime->predictive_temp_ceiling_c;
+    state.safety_margin_c = runtime->predictive_safety_margin_c;
+    state.emergency_margin_c = runtime->predictive_emergency_margin_c;
 }
 
 bool runtime_temperature_limits_valid(const DispatcherPolicyState &state) {

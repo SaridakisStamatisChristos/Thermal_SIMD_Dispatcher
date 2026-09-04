@@ -18,12 +18,15 @@ extern "C" {
  * or below that width. SSE4.1 is mandatory because it is the runtime's
  * conservative baseline.
  *
- * Callbacks may terminate their thread normally (including pthread_exit) and
- * dispatch admission accounting will be cleaned up. pthread cancellation is
- * disabled while callback code is executing and restored only after admission
- * accounting has been released. Callbacks must not escape with longjmp across
- * the dispatcher frame: C longjmp bypasses cleanup handlers and is therefore
- * outside this API's supported control-flow contract.
+ * Callback admission is installed while thread cancellation is temporarily
+ * disabled, then the caller's cancellation state is restored before user code
+ * executes. This means deferred/asynchronous cancellation behaves according to
+ * the caller's pthread settings while a cleanup handler guarantees admission
+ * accounting is released on cancellation or pthread_exit(). The cleanup
+ * handler itself never changes cancellation state, as required by POSIX.
+ * Callbacks must not escape with longjmp across the dispatcher frame: C
+ * longjmp bypasses pthread cleanup handlers and is therefore outside this
+ * API's supported control-flow contract.
  */
 typedef void (*tsd_kernel_fn)(void *context, size_t work_items);
 
