@@ -2,6 +2,7 @@
 #define TSD_RUNTIME_GUARD_INTERNAL_H
 
 #include <thermal/simd/simd_width.h>
+#include <thermal/simd/thermal_config.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -38,6 +39,16 @@ void tsd_runtime_safety_write_leave(void);
 /* Runtime lifecycle state participates in wide-width authorization. */
 void tsd_runtime_set_stopping_locked(int stopping);
 int tsd_runtime_is_stopping(void);
+
+/*
+ * One validated immutable configuration is published for each live runtime
+ * generation. Runtime subsystems must read this snapshot rather than the
+ * legacy writable g_tsd_config object. Activation copies and validates the
+ * input; deactivation is valid only after runtime readers have stopped.
+ */
+int tsd_runtime_config_activate_snapshot(const tsd_runtime_config *config);
+void tsd_runtime_config_deactivate_snapshot(void);
+int tsd_runtime_config_snapshot_is_active(void);
 
 /*
  * Hardware perf authority is bound to the thread that started the runtime.
