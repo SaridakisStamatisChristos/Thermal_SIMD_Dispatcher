@@ -1,6 +1,8 @@
 #include <healthcheck/sandbox.h>
 
+#include <cerrno>
 #include <cstdio>
+#include <exception>
 #include <sstream>
 
 #include <thermal/simd/logging.h>
@@ -29,9 +31,7 @@ SandboxResult RunSandbox() {
         result.patch_ok = false;
         result.success = false;
         diag << "trampoline validation failed";
-        if (reason[0] != '\0') {
-            diag << ": " << reason;
-        }
+        if (reason[0] != '\0') diag << ": " << reason;
     } else {
         result.patch_ok = true;
     }
@@ -40,9 +40,7 @@ SandboxResult RunSandbox() {
     if (!ctx) {
         result.success = false;
         result.telemetry_ok = false;
-        if (!diag.str().empty()) {
-            diag << "; ";
-        }
+        if (!diag.str().empty()) diag << "; ";
         diag << "perf subsystem unavailable";
     } else {
         result.telemetry_ok = true;
@@ -50,9 +48,7 @@ SandboxResult RunSandbox() {
         if (mode != TSD_PERF_MODE_HARDWARE) {
             result.success = false;
             result.telemetry_ok = false;
-            if (!diag.str().empty()) {
-                diag << "; ";
-            }
+            if (!diag.str().empty()) diag << "; ";
             diag << "expected hardware counters but running in "
                  << (mode == TSD_PERF_MODE_SOFTWARE ? "software" : "unknown")
                  << " mode";
@@ -63,25 +59,19 @@ SandboxResult RunSandbox() {
             tsd_telemetry_helper_init(&telemetry, tsd_perf_get_monitor_cpu(ctx)) != 0) {
             result.success = false;
             result.telemetry_ok = false;
-            if (!diag.str().empty()) {
-                diag << "; ";
-            }
+            if (!diag.str().empty()) diag << "; ";
             diag << "telemetry helper init failed";
         } else {
             tsd_telemetry_sample_t sample{};
             if (tsd_telemetry_helper_sample(&telemetry, &sample) != 0) {
                 result.success = false;
                 result.telemetry_ok = false;
-                if (!diag.str().empty()) {
-                    diag << "; ";
-                }
+                if (!diag.str().empty()) diag << "; ";
                 diag << "telemetry sampling failed";
             } else if (!sample.temp_available && !sample.freq_ratio_available) {
                 result.success = false;
                 result.telemetry_ok = false;
-                if (!diag.str().empty()) {
-                    diag << "; ";
-                }
+                if (!diag.str().empty()) diag << "; ";
                 diag << "no telemetry sources available";
             }
             tsd_telemetry_helper_destroy(&telemetry);
@@ -94,9 +84,7 @@ SandboxResult RunSandbox() {
         tsd_log_info(kLogComponent, "startup sandbox succeeded");
     } else {
         result.message = diag.str();
-        if (result.message.empty()) {
-            result.message = "sandbox failed";
-        }
+        if (result.message.empty()) result.message = "sandbox failed";
         tsd_log_warn(kLogComponent, "startup sandbox reported: %s", result.message.c_str());
         tsd_metrics_increment(TSD_METRIC_HEALTH_CHECK_FAILURES);
     }
@@ -107,13 +95,24 @@ SandboxResult RunSandbox() {
 } // namespace healthcheck
 
 extern "C" int tsd_sandbox_run(char *message, size_t message_len) {
-    auto result = healthcheck::RunSandbox();
-    if (message && message_len > 0) {
-        if (result.message.empty()) {
-            message[0] = '\0';
-        } else {
-            std::snprintf(message, message_len, "%s", result.message.c_str());
+    try {
+        auto result = healthcheck::RunSandbox();
+        if (message && message_len > 0) {
+            if (result.message.empty()) message[0] = '\0';
+            else std::snprintf(message, message_len, "%s", result.message.c_str());
         }
+        return result.success ? 0 : -1;
+    } catch (const std::bad_alloc &) {
+        errno = ENOMEM;
+    } catch (const std::exception &ex) {
+        errno = EIO;
+        tsd_log_error("sandbox", "sandbox C ABI failure: %s", ex.what());
+    } catch (...) {
+        errno = EIO;
+        tsd_log_error("sandbox", "sandbox C ABI failure: unknown exception");
     }
-    return result.success ? 0 : -1;
+    if (message && message_len > 0) {
+        std::snprintf(message, message_len, "%s", "sandbox internal failure");
+    }
+    return -1;
 }
