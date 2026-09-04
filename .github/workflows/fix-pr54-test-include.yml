@@ -1,0 +1,42 @@
+name: Fix PR 54 test include
+
+on:
+  pull_request:
+    types: [synchronize]
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    if: github.event.pull_request.head.ref == 'deep-audit-fixes-v0.4.2' && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout PR head branch
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+
+      - name: Add white-box test declarations
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('tests/runtime/test_runtime_lifecycle.c')
+          text = p.read_text(encoding='utf-8')
+          old = '#include "runtime_guard_internal.h"\n'
+          new = '#include "runtime_guard_internal.h"\n#include "thermal_simd_test.h"\n'
+          if new in text:
+              raise SystemExit(0)
+          if text.count(old) != 1:
+              raise SystemExit('unexpected runtime lifecycle include layout')
+          p.write_text(text.replace(old, new, 1), encoding='utf-8')
+          PY
+
+      - name: Commit include fix
+        run: |
+          if git diff --quiet; then exit 0; fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add tests/runtime/test_runtime_lifecycle.c
+          git commit -m "Declare shutdown failure injection hooks in lifecycle test"
+          git push origin HEAD:${{ github.event.pull_request.head.ref }}
