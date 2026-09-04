@@ -26,7 +26,6 @@ extern "C" {
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
-#include <mutex>
 #include <vector>
 
 #include <openssl/sha.h>
@@ -82,7 +81,7 @@ static_assert(kSlotStride >= TSD_TRAMPOLINE_SLOT_SIZE, "slot alignment must cove
 std::array<tsd_patch_slot_t*, kWidthCount> g_slots{nullptr, nullptr, nullptr};
 std::array<uint8_t, TSD_ATTESTATION_HASH_SIZE> g_active_hash{};
 std::atomic<bool> g_active_hash_valid{false};
-std::mutex g_attestation_mutex;
+pthread_mutex_t g_attestation_lock = PTHREAD_MUTEX_INITIALIZER;
 thread_local char g_attestation_last_error[256] = {0};
 
 #ifdef TSD_ENABLE_TESTS
@@ -95,14 +94,24 @@ int g_test_force_failure_stage = TSD_PATCH_FAIL_NONE;
 
 class PthreadLockGuard {
 public:
-    explicit PthreadLockGuard(pthread_mutex_t *mutex) : mutex_(mutex) {
-        pthread_mutex_lock(mutex_);
+    explicit PthreadLockGuard(pthread_mutex_t *mutex) noexcept
+        : mutex_(mutex), locked_(false), error_(EINVAL) {
+        if (mutex_) {
+            error_ = pthread_mutex_lock(mutex_);
+            locked_ = error_ == 0;
+        }
     }
-    ~PthreadLockGuard() { pthread_mutex_unlock(mutex_); }
+    ~PthreadLockGuard() noexcept {
+        if (locked_) (void)pthread_mutex_unlock(mutex_);
+    }
+    bool locked() const noexcept { return locked_; }
+    int error() const noexcept { return error_; }
     PthreadLockGuard(const PthreadLockGuard &) = delete;
     PthreadLockGuard &operator=(const PthreadLockGuard &) = delete;
 private:
     pthread_mutex_t *mutex_;
+    bool locked_;
+    int error_;
 };
 
 const std::array<uint8_t, TSD_TRAMPOLINE_SLOT_SIZE>* canonical_patch(simd_width_t width) {
@@ -120,9 +129,7 @@ const std::array<uint8_t, TSD_TRAMPOLINE_SLOT_SIZE>* selected_patch(simd_width_t
         static std::array<uint8_t, TSD_TRAMPOLINE_SLOT_SIZE> override{};
         override.fill(0x90);
         size_t len = g_test_patch_override_size[width];
-        if (len > override.size()) {
-            len = override.size();
-        }
+        if (len > override.size()) len = override.size();
         std::memcpy(override.data(), g_test_patch_override[width], len);
         return &override;
     }
@@ -131,9 +138,7 @@ const std::array<uint8_t, TSD_TRAMPOLINE_SLOT_SIZE>* selected_patch(simd_width_t
 }
 
 bool has_enbr64_prefix(const uint8_t *bytes, size_t len) {
-    if (!bytes || len < sizeof(uint32_t)) {
-        return false;
-    }
+    if (!bytes || len < sizeof(uint32_t)) return false;
     uint32_t prefix = static_cast<uint32_t>(bytes[0]) |
                       (static_cast<uint32_t>(bytes[1]) << 8) |
                       (static_cast<uint32_t>(bytes[2]) << 16) |
@@ -152,12 +157,8 @@ void serialize_instruction_stream() {
 }
 
 void set_error(const char *message, int err) {
-    if (!message) {
-        message = "patch error";
-    }
-    if (err != 0) {
-        errno = err;
-    }
+    if (!message) message = "patch error";
+    if (err != 0) errno = err;
     char errbuf[128] = {0};
     const char *detail = err ? tsd_log_strerror(err, errbuf, sizeof(errbuf)) : nullptr;
     if (detail) {
@@ -174,13 +175,9 @@ void set_error(const char *message, int err) {
 }
 
 bool mapping_is_rx_not_writable(const void *address) {
-    if (!address) {
-        return false;
-    }
+    if (!address) return false;
     FILE *maps = std::fopen("/proc/self/maps", "r");
-    if (!maps) {
-        return false;
-    }
+    if (!maps) return false;
     uintptr_t needle = reinterpret_cast<uintptr_t>(address);
     char line[512];
     bool ok = false;
@@ -188,9 +185,7 @@ bool mapping_is_rx_not_writable(const void *address) {
         unsigned long long start = 0;
         unsigned long long end = 0;
         char perms[5] = {0};
-        if (std::sscanf(line, "%llx-%llx %4s", &start, &end, perms) != 3) {
-            continue;
-        }
+        if (std::sscanf(line, "%llx-%llx %4s", &start, &end, perms) != 3) continue;
         if (needle >= start && needle < end) {
             ok = perms[0] == 'r' && perms[1] != 'w' && perms[2] == 'x';
             break;
@@ -201,9 +196,7 @@ bool mapping_is_rx_not_writable(const void *address) {
 }
 
 void discard_code_page(void *page, size_t pagesize) {
-    if (page && page != MAP_FAILED && pagesize > 0) {
-        munmap(page, pagesize);
-    }
+    if (page && page != MAP_FAILED && pagesize > 0) munmap(page, pagesize);
     g_tsd_trampoline_ctx.page_a = nullptr;
     g_tsd_trampoline_ctx.page_b = nullptr;
     g_tsd_trampoline_ctx.page_size = 0;
@@ -211,35 +204,59 @@ void discard_code_page(void *page, size_t pagesize) {
     g_tsd_trampoline_ctx.page_b_prot = PROT_NONE;
     g_tsd_trampoline_ctx.active = nullptr;
     g_tsd_trampoline_ctx.inactive = nullptr;
-    for (auto &slot : g_slots) {
-        slot = nullptr;
-    }
+    for (auto &slot : g_slots) slot = nullptr;
     tsd_trampoline_state_set_page_a_writable(0);
     tsd_trampoline_state_set_page_b_writable(0);
 }
 
-void update_attestation_hash(const tsd_patch_slot_t *slot) {
-    std::lock_guard<std::mutex> lock(g_attestation_mutex);
-    g_active_hash_valid.store(false, std::memory_order_release);
-    if (!slot) {
-        std::snprintf(g_attestation_last_error, sizeof(g_attestation_last_error), "%s", "null slot");
-        return;
-    }
-    SHA256(slot->code, TSD_TRAMPOLINE_SLOT_SIZE, g_active_hash.data());
-    g_active_hash_valid.store(true, std::memory_order_release);
-
-    char hash_line[32 + TSD_ATTESTATION_HASH_SIZE * 2] = {0};
-    int used = std::snprintf(hash_line, sizeof(hash_line), "Trampoline hash=");
-    if (used < 0) return;
+void format_hash_line(const std::array<uint8_t, TSD_ATTESTATION_HASH_SIZE> &hash,
+                      char *buffer, size_t len) {
+    if (!buffer || len == 0) return;
+    int used = std::snprintf(buffer, len, "Trampoline hash=");
+    if (used < 0 || static_cast<size_t>(used) >= len) return;
     size_t cursor = static_cast<size_t>(used);
-    for (uint8_t byte : g_active_hash) {
-        if (cursor + 2 >= sizeof(hash_line)) break;
-        int written = std::snprintf(hash_line + cursor, sizeof(hash_line) - cursor, "%02x",
+    for (uint8_t byte : hash) {
+        if (cursor + 2 >= len) break;
+        int written = std::snprintf(buffer + cursor, len - cursor, "%02x",
                                     static_cast<unsigned int>(byte));
         if (written != 2) break;
         cursor += 2;
     }
+}
+
+int commit_selection_and_attestation(simd_width_t width, tsd_patch_slot_t *target) {
+    if (!target) {
+        set_error("null trampoline target", EINVAL);
+        return -1;
+    }
+
+    std::array<uint8_t, TSD_ATTESTATION_HASH_SIZE> new_hash{};
+    if (!SHA256(target->code, TSD_TRAMPOLINE_SLOT_SIZE, new_hash.data())) {
+        set_error("failed to hash trampoline target", EIO);
+        return -1;
+    }
+
+    PthreadLockGuard hash_guard(&g_attestation_lock);
+    if (!hash_guard.locked()) {
+        set_error("failed to lock attestation state", hash_guard.error());
+        return -1;
+    }
+
+    /* Patch lock is held by the caller. Readers acquire patch then attestation,
+     * so selector publication and attestation commit are one serialized
+     * transaction from every public observer's perspective. */
+    g_active_hash_valid.store(false, std::memory_order_release);
+    tsd_patch_slot_t *old_active = tsd_trampoline_state_active();
+    g_tsd_trampoline_ctx.active = target;
+    g_tsd_trampoline_ctx.inactive = old_active;
+    tsd_trampoline_state_publish_selection(width, target);
+    g_active_hash = new_hash;
+    g_active_hash_valid.store(true, std::memory_order_release);
+
+    char hash_line[32 + TSD_ATTESTATION_HASH_SIZE * 2] = {0};
+    format_hash_line(new_hash, hash_line, sizeof(hash_line));
     tsd_log_info(LOG_COMPONENT, "%s", hash_line);
+    return 0;
 }
 
 int build_canonical_code_page() {
@@ -308,15 +325,11 @@ int build_canonical_code_page() {
 #ifdef TSD_ENABLE_TESTS
 tsd_patch_slot_t* build_test_override_slot(const std::array<uint8_t, TSD_TRAMPOLINE_SLOT_SIZE> &patch) {
     long pagesize_long = sysconf(_SC_PAGESIZE);
-    if (pagesize_long <= 0) {
-        return nullptr;
-    }
+    if (pagesize_long <= 0) return nullptr;
     size_t pagesize = static_cast<size_t>(pagesize_long);
     void *page = mmap(nullptr, pagesize, PROT_READ | PROT_WRITE,
                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (page == MAP_FAILED) {
-        return nullptr;
-    }
+    if (page == MAP_FAILED) return nullptr;
     auto *slot = reinterpret_cast<tsd_patch_slot_t*>(page);
     std::memcpy(slot->code, patch.data(), TSD_TRAMPOLINE_SLOT_SIZE);
     serialize_instruction_stream();
@@ -328,7 +341,13 @@ tsd_patch_slot_t* build_test_override_slot(const std::array<uint8_t, TSD_TRAMPOL
         munmap(page, pagesize);
         return nullptr;
     }
-    g_test_override_pages.push_back(page);
+    try {
+        g_test_override_pages.push_back(page);
+    } catch (...) {
+        munmap(page, pagesize);
+        errno = ENOMEM;
+        return nullptr;
+    }
     return slot;
 }
 #endif
@@ -341,24 +360,23 @@ tsd_trampoline_ctx_t g_tsd_trampoline_ctx = {};
 pthread_mutex_t g_tsd_patch_lock = PTHREAD_MUTEX_INITIALIZER;
 
 int tsd_trampoline_init(void) {
-    pthread_mutex_lock(&g_tsd_patch_lock);
-
-    if (!g_tsd_trampoline_ctx.page_a) {
-        if (build_canonical_code_page() != 0) {
-            pthread_mutex_unlock(&g_tsd_patch_lock);
-            return -1;
-        }
+    PthreadLockGuard patch_guard(&g_tsd_patch_lock);
+    if (!patch_guard.locked()) {
+        errno = patch_guard.error();
+        return -1;
     }
 
+    if (!g_tsd_trampoline_ctx.page_a && build_canonical_code_page() != 0) return -1;
+
+    PthreadLockGuard hash_guard(&g_attestation_lock);
+    if (!hash_guard.locked()) {
+        errno = hash_guard.error();
+        return -1;
+    }
     g_tsd_trampoline_ctx.active = g_slots[SIMD_SSE41];
     g_tsd_trampoline_ctx.inactive = g_slots[SIMD_AVX2];
     tsd_trampoline_state_reset(g_slots[SIMD_SSE41]);
-    {
-        std::lock_guard<std::mutex> hash_lock(g_attestation_mutex);
-        g_active_hash_valid.store(false, std::memory_order_release);
-    }
-
-    pthread_mutex_unlock(&g_tsd_patch_lock);
+    g_active_hash_valid.store(false, std::memory_order_release);
     return 0;
 }
 
@@ -367,7 +385,11 @@ int init_double_buffer_trampoline(void) {
 }
 
 int tsd_trampoline_patch(simd_width_t new_width) {
-    pthread_mutex_lock(&g_tsd_patch_lock);
+    PthreadLockGuard patch_guard(&g_tsd_patch_lock);
+    if (!patch_guard.locked()) {
+        errno = patch_guard.error();
+        return -1;
+    }
 
     simd_width_t previous_width = tsd_trampoline_state_current_width();
     tsd_trampoline_state_set_last_patch_attempt(new_width);
@@ -383,15 +405,14 @@ int tsd_trampoline_patch(simd_width_t new_width) {
             set_error("SSE4.1 is not supported by this host", ENOTSUP);
             break;
         }
-        simd_width_t allowed_width = tsd_detect_max_simd(&g_tsd_config);
+        const tsd_runtime_config *runtime_cfg = tsd_runtime_config_active_snapshot();
+        simd_width_t allowed_width = tsd_detect_max_simd(runtime_cfg);
         if (new_width > allowed_width) {
             set_error("requested SIMD width exceeds host or runtime policy", ENOTSUP);
             break;
         }
 #endif
-        if (!g_tsd_trampoline_ctx.page_a && build_canonical_code_page() != 0) {
-            break;
-        }
+        if (!g_tsd_trampoline_ctx.page_a && build_canonical_code_page() != 0) break;
 
 #ifdef TSD_ENABLE_TESTS
         if (g_test_force_failure_stage == TSD_PATCH_FAIL_PROTECT_WRITE) {
@@ -430,13 +451,7 @@ int tsd_trampoline_patch(simd_width_t new_width) {
             break;
         }
 
-        tsd_patch_slot_t *old_active = tsd_trampoline_state_active();
-        g_tsd_trampoline_ctx.active = target;
-        g_tsd_trampoline_ctx.inactive = old_active;
-
-        tsd_trampoline_state_publish_selection(new_width, target);
-
-        update_attestation_hash(target);
+        if (commit_selection_and_attestation(new_width, target) != 0) break;
         tsd_log_info(LOG_COMPONENT, "Selected immutable %s trampoline",
                      new_width == SIMD_AVX512 ? "AVX-512/512-bit" :
                      new_width == SIMD_AVX2 ? "AVX2/256-bit" : "SSE4.1/128-bit");
@@ -444,19 +459,19 @@ int tsd_trampoline_patch(simd_width_t new_width) {
     } while (0);
 
     tsd_metrics_record_width_transition(previous_width, new_width, rc);
-    pthread_mutex_unlock(&g_tsd_patch_lock);
     return rc;
 }
 
 int tsd_trampoline_self_validate(char *reason, size_t reason_len) {
     PthreadLockGuard patch_guard(&g_tsd_patch_lock);
-    if (reason && reason_len > 0) {
-        reason[0] = '\0';
+    if (!patch_guard.locked()) {
+        errno = patch_guard.error();
+        if (reason && reason_len > 0) std::snprintf(reason, reason_len, "%s", "patch lock unavailable");
+        return -1;
     }
+    if (reason && reason_len > 0) reason[0] = '\0';
     if (!tsd_trampoline_state_initialized()) {
-        if (reason && reason_len > 0) {
-            std::snprintf(reason, reason_len, "%s", "trampoline not initialised");
-        }
+        if (reason && reason_len > 0) std::snprintf(reason, reason_len, "%s", "trampoline not initialised");
         return -1;
     }
 
@@ -464,34 +479,23 @@ int tsd_trampoline_self_validate(char *reason, size_t reason_len) {
     const auto *expected = selected_patch(width);
     tsd_patch_slot_t *active = tsd_trampoline_state_active();
     if (!expected || !active) {
-        if (reason && reason_len > 0) {
-            std::snprintf(reason, reason_len, "%s", "active trampoline unavailable");
-        }
+        if (reason && reason_len > 0) std::snprintf(reason, reason_len, "%s", "active trampoline unavailable");
         return -1;
     }
     if (std::memcmp(active->code, expected->data(), TSD_TRAMPOLINE_SLOT_SIZE) != 0) {
-        if (reason && reason_len > 0) {
-            std::snprintf(reason, reason_len, "%s", "active slot checksum mismatch");
-        }
+        if (reason && reason_len > 0) std::snprintf(reason, reason_len, "%s", "active slot checksum mismatch");
         return -1;
     }
     if (!has_enbr64_prefix(active->code, TSD_TRAMPOLINE_SLOT_SIZE)) {
-        if (reason && reason_len > 0) {
-            std::snprintf(reason, reason_len, "%s", "active slot missing ENDBR64");
-        }
+        if (reason && reason_len > 0) std::snprintf(reason, reason_len, "%s", "active slot missing ENDBR64");
         return -1;
     }
     if (!mapping_is_rx_not_writable(active)) {
-        if (reason && reason_len > 0) {
-            std::snprintf(reason, reason_len, "%s", "active trampoline is not RX-only");
-        }
+        if (reason && reason_len > 0) std::snprintf(reason, reason_len, "%s", "active trampoline is not RX-only");
         return -1;
     }
-    if (tsd_trampoline_state_page_a_writable() ||
-        tsd_trampoline_state_page_b_writable()) {
-        if (reason && reason_len > 0) {
-            std::snprintf(reason, reason_len, "%s", "trampoline page writable");
-        }
+    if (tsd_trampoline_state_page_a_writable() || tsd_trampoline_state_page_b_writable()) {
+        if (reason && reason_len > 0) std::snprintf(reason, reason_len, "%s", "trampoline page writable");
         return -1;
     }
     return 0;
@@ -499,9 +503,7 @@ int tsd_trampoline_self_validate(char *reason, size_t reason_len) {
 
 #ifdef TSD_ENABLE_TESTS
 void tsd_trampoline_override_patch(simd_width_t width, const uint8_t *bytes, size_t len) {
-    if (width < SIMD_SSE41 || width > SIMD_AVX512) {
-        return;
-    }
+    if (width < SIMD_SSE41 || width > SIMD_AVX512) return;
     g_test_patch_override[width] = bytes;
     g_test_patch_override_size[width] = len;
 }
@@ -516,14 +518,10 @@ void tsd_trampoline_clear_overrides(void) {
 const uint8_t* tsd_trampoline_patch_bytes(simd_width_t width, size_t *len) {
     const auto *patch = selected_patch(width);
     if (!patch) {
-        if (len) {
-            *len = 0;
-        }
+        if (len) *len = 0;
         return nullptr;
     }
-    if (len) {
-        *len = patch->size();
-    }
+    if (len) *len = patch->size();
     return patch->data();
 }
 
@@ -547,12 +545,16 @@ int tsd_trampoline_test_last_window_used_pku(void) {
 int tsd_attestation_get_active_hash(uint8_t *buffer, size_t len) {
     if (!buffer || len < TSD_ATTESTATION_HASH_SIZE) {
         std::snprintf(g_attestation_last_error, sizeof(g_attestation_last_error), "%s", "buffer too small");
+        errno = EINVAL;
         return -1;
     }
     PthreadLockGuard patch_guard(&g_tsd_patch_lock);
-    std::lock_guard<std::mutex> hash_lock(g_attestation_mutex);
+    if (!patch_guard.locked()) { errno = patch_guard.error(); return -1; }
+    PthreadLockGuard hash_guard(&g_attestation_lock);
+    if (!hash_guard.locked()) { errno = hash_guard.error(); return -1; }
     if (!g_active_hash_valid.load(std::memory_order_acquire)) {
         std::snprintf(g_attestation_last_error, sizeof(g_attestation_last_error), "%s", "hash unavailable");
+        errno = ENODATA;
         return -1;
     }
     std::memcpy(buffer, g_active_hash.data(), TSD_ATTESTATION_HASH_SIZE);
@@ -562,12 +564,16 @@ int tsd_attestation_get_active_hash(uint8_t *buffer, size_t len) {
 int tsd_attestation_get_active_hash_hex(char *buffer, size_t len) {
     if (!buffer || len < (TSD_ATTESTATION_HASH_SIZE * 2 + 1)) {
         std::snprintf(g_attestation_last_error, sizeof(g_attestation_last_error), "%s", "hex buffer too small");
+        errno = EINVAL;
         return -1;
     }
     PthreadLockGuard patch_guard(&g_tsd_patch_lock);
-    std::lock_guard<std::mutex> hash_lock(g_attestation_mutex);
+    if (!patch_guard.locked()) { errno = patch_guard.error(); return -1; }
+    PthreadLockGuard hash_guard(&g_attestation_lock);
+    if (!hash_guard.locked()) { errno = hash_guard.error(); return -1; }
     if (!g_active_hash_valid.load(std::memory_order_acquire)) {
         std::snprintf(g_attestation_last_error, sizeof(g_attestation_last_error), "%s", "hash unavailable");
+        errno = ENODATA;
         return -1;
     }
     for (size_t i = 0; i < g_active_hash.size(); ++i) {
@@ -580,17 +586,19 @@ int tsd_attestation_get_active_hash_hex(char *buffer, size_t len) {
 int tsd_attestation_expect_active_hash(const uint8_t *expected, size_t len) {
     if (!expected || len < TSD_ATTESTATION_HASH_SIZE) {
         std::snprintf(g_attestation_last_error, sizeof(g_attestation_last_error), "%s", "expected hash invalid");
+        errno = EINVAL;
         return -1;
     }
     PthreadLockGuard patch_guard(&g_tsd_patch_lock);
-    std::lock_guard<std::mutex> hash_lock(g_attestation_mutex);
+    if (!patch_guard.locked()) { errno = patch_guard.error(); return -1; }
+    PthreadLockGuard hash_guard(&g_attestation_lock);
+    if (!hash_guard.locked()) { errno = hash_guard.error(); return -1; }
     if (!g_active_hash_valid.load(std::memory_order_acquire)) {
         std::snprintf(g_attestation_last_error, sizeof(g_attestation_last_error), "%s", "hash unavailable");
+        errno = ENODATA;
         return -1;
     }
     if (std::memcmp(expected, g_active_hash.data(), TSD_ATTESTATION_HASH_SIZE) != 0) {
-        /* This is a public C ABI path. Keep mismatch formatting bounded and
-         * allocation-free so no C++ allocation exception can cross it. */
         char message[192] = {0};
         int used = std::snprintf(message, sizeof(message), "attestation mismatch expected=");
         if (used < 0) used = 0;
@@ -603,9 +611,7 @@ int tsd_attestation_expect_active_hash(const uint8_t *expected, size_t len) {
         }
         if (cursor < sizeof(message)) {
             int written = std::snprintf(message + cursor, sizeof(message) - cursor, " actual=");
-            if (written > 0 && static_cast<size_t>(written) < sizeof(message) - cursor) {
-                cursor += static_cast<size_t>(written);
-            }
+            if (written > 0 && static_cast<size_t>(written) < sizeof(message) - cursor) cursor += static_cast<size_t>(written);
         }
         for (uint8_t byte : g_active_hash) {
             if (cursor + 2 >= sizeof(message)) break;
@@ -616,6 +622,7 @@ int tsd_attestation_expect_active_hash(const uint8_t *expected, size_t len) {
         }
         std::snprintf(g_attestation_last_error, sizeof(g_attestation_last_error), "%s", message);
         tsd_log_error(LOG_COMPONENT, "%s", message);
+        errno = EKEYREJECTED;
         return -1;
     }
     g_attestation_last_error[0] = '\0';
