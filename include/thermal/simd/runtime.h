@@ -2,6 +2,7 @@
 #define TSD_RUNTIME_H
 
 #include <thermal/simd/simd_width.h>
+#include <thermal/simd/thermal_config.h>
 #include <thermal/simd/thermal_perf.h>
 
 /*
@@ -41,11 +42,34 @@ extern "C" {
 typedef struct tsd_runtime tsd_runtime_t;
 
 /*
- * Starts the adaptive monitor. `workload` may be NULL for callers that account
- * application work through tsd_kernel_dispatch_execute[_chunked](). Returns
- * EBUSY when another process-global runtime is already active.
+ * Optional baseline/probe callback contract:
+ *
+ * - the callback may be invoked repeatedly during startup calibration (the
+ *   current implementation can invoke it up to 100,000 times per baseline);
+ * - it should be bounded, nonblocking, and safe to repeat; avoid irreversible
+ *   side effects;
+ * - lifecycle re-entry is unsupported as useful work. A nested start is
+ *   rejected with EBUSY instead of waiting on the outer startup;
+ * - applications using registered dispatch accounting may pass NULL and let
+ *   the runtime use its synthetic baseline probe.
+ */
+
+/*
+ * Starts from the legacy g_tsd_config compatibility input. The configuration
+ * is validated and copied into an immutable runtime-generation snapshot before
+ * telemetry, perf, policy, or monitor threads start reading it.
  */
 int tsd_runtime_start(tsd_runtime_t **out_runtime, tsd_workload_fn workload);
+
+/*
+ * Preferred embedding API. `config` is copied; the caller may reuse or mutate
+ * its own object after this function returns without changing the live runtime.
+ * Invalid configuration is rejected with EINVAL. Only one runtime generation
+ * can be active or starting at a time.
+ */
+int tsd_runtime_start_with_config(tsd_runtime_t **out_runtime,
+                                  tsd_workload_fn workload,
+                                  const tsd_runtime_config *config);
 
 /*
  * Non-blocking cooperative stop request. A NULL or stale stopped handle is a
