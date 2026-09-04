@@ -61,31 +61,57 @@ TelemetryFusion::~TelemetryFusion() {
 }
 
 void TelemetryFusion::start() {
-    bool expected = false;
-    if (!running_.compare_exchange_strong(expected, true)) return;
     std::lock_guard<std::mutex> lock(thread_mutex_);
+    if (running_.load(std::memory_order_acquire) || stop_join_in_progress_ || thread_.joinable()) {
+        return;
+    }
+
+    running_.store(true, std::memory_order_release);
     try {
         thread_ = std::thread([this] { run(); });
     } catch (...) {
         running_.store(false, std::memory_order_release);
         throw;
     }
+
     tsd_fusion_telemetry_t telemetry{};
     telemetry.running = 1;
     tsd_observability_update_fusion(&telemetry);
 }
 
 void TelemetryFusion::stop() {
-    bool expected = true;
-    if (!running_.compare_exchange_strong(expected, false)) return;
-    wake_cv_.notify_all();
+    std::thread joiner;
+    bool self_stop = false;
     {
         std::lock_guard<std::mutex> lock(thread_mutex_);
-        if (thread_.joinable()) thread_.join();
+        running_.store(false, std::memory_order_release);
+        wake_cv_.notify_all();
+
+        if (stop_join_in_progress_) return;
+        if (thread_.joinable()) {
+            if (thread_.get_id() == std::this_thread::get_id()) {
+                /* A collector/provider may request stop from the worker itself.
+                 * It cannot join itself; leave the completed thread joinable so
+                 * the next external stop/destructor can reap it safely. */
+                self_stop = true;
+            } else {
+                stop_join_in_progress_ = true;
+                joiner = std::move(thread_);
+            }
+        }
     }
+
+    if (joiner.joinable()) {
+        joiner.join();
+        std::lock_guard<std::mutex> lock(thread_mutex_);
+        stop_join_in_progress_ = false;
+    }
+
     tsd_fusion_telemetry_t telemetry{};
     telemetry.running = 0;
     tsd_observability_update_fusion(&telemetry);
+
+    (void)self_stop;
 }
 
 bool TelemetryFusion::running() const { return running_.load(std::memory_order_acquire); }
