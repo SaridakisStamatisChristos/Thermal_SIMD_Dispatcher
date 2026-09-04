@@ -47,6 +47,7 @@ struct perf_ctx {
     int fd_insns;
     int fd_llc_misses;
     uint64_t baseline_cpi;
+    uint64_t calibrated_cpi_reference;
     uint64_t baseline_llc_mpki_milli;
     uint64_t slow_cpi;
     uint64_t fast_cpi;
@@ -78,14 +79,12 @@ struct perf_ctx {
     int fusion_acquired;
     struct timespec mode_entered_at;
     int timeout_notified;
-    time_t perf_retry_deadline;
+    uint64_t perf_retry_deadline_ns;
     int perf_retry_backoff_seconds;
-    time_t llc_retry_deadline;
+    uint64_t llc_retry_deadline_ns;
     int llc_retry_backoff_seconds;
     int force_software;
 };
-
-_Atomic(uint64_t) g_tsd_workload_iterations = 0;
 
 static int warned_llc_unavailable = 0;
 static int warned_perf_group_layout = 0;
@@ -95,11 +94,6 @@ static void perf_fail_closed(perf_ctx_t *ctx, const char *reason);
 
 static pid_t current_tid(void) {
     return (pid_t)syscall(SYS_gettid);
-}
-
-static int allow_software_upgrades(void) {
-    const char *env = getenv("TSD_ALLOW_SOFTWARE_UPGRADES");
-    return (env && env[0] != '\0' && strcmp(env, "0") != 0) ? 1 : 0;
 }
 
 static void reset_measurement_domain(perf_ctx_t *ctx) {
@@ -128,31 +122,26 @@ static void publish_perf_state(const perf_ctx_t *ctx, int healthy) {
     tsd_observability_update_perf(&telemetry);
 }
 
-static time_t now_seconds(void) {
-    time_t now = time(NULL);
-    return now < 0 ? 0 : now;
+static uint64_t monotonic_now_ns(void) {
+    struct timespec now = {0};
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return 0;
+    return (uint64_t)now.tv_sec * UINT64_C(1000000000) + (uint64_t)now.tv_nsec;
 }
 
 static void reset_perf_retry(perf_ctx_t *ctx) {
-    if (!ctx) {
-        return;
-    }
-    ctx->perf_retry_deadline = 0;
+    if (!ctx) return;
+    ctx->perf_retry_deadline_ns = 0;
     ctx->perf_retry_backoff_seconds = PERF_INITIAL_BACKOFF_SEC;
 }
 
 static void schedule_perf_retry(perf_ctx_t *ctx) {
-    if (!ctx || ctx->force_software) {
-        return;
-    }
-    if (ctx->perf_retry_backoff_seconds <= 0) {
-        ctx->perf_retry_backoff_seconds = PERF_INITIAL_BACKOFF_SEC;
-    }
+    if (!ctx || ctx->force_software) return;
+    if (ctx->perf_retry_backoff_seconds <= 0) ctx->perf_retry_backoff_seconds = PERF_INITIAL_BACKOFF_SEC;
     int delay = ctx->perf_retry_backoff_seconds;
-    if (delay > PERF_MAX_BACKOFF_SEC) {
-        delay = PERF_MAX_BACKOFF_SEC;
-    }
-    ctx->perf_retry_deadline = now_seconds() + (time_t)delay;
+    if (delay > PERF_MAX_BACKOFF_SEC) delay = PERF_MAX_BACKOFF_SEC;
+    uint64_t now = monotonic_now_ns();
+    uint64_t delta = (uint64_t)delay * UINT64_C(1000000000);
+    ctx->perf_retry_deadline_ns = now > UINT64_MAX - delta ? UINT64_MAX : now + delta;
     if (ctx->perf_retry_backoff_seconds < PERF_MAX_BACKOFF_SEC) {
         int next = ctx->perf_retry_backoff_seconds * 2;
         ctx->perf_retry_backoff_seconds = next > PERF_MAX_BACKOFF_SEC ? PERF_MAX_BACKOFF_SEC : next;
@@ -160,32 +149,24 @@ static void schedule_perf_retry(perf_ctx_t *ctx) {
 }
 
 static int perf_retry_due(const perf_ctx_t *ctx) {
-    if (!ctx || ctx->force_software) {
-        return 0;
-    }
-    return ctx->perf_retry_deadline == 0 || now_seconds() >= ctx->perf_retry_deadline;
+    if (!ctx || ctx->force_software) return 0;
+    return ctx->perf_retry_deadline_ns == 0 || monotonic_now_ns() >= ctx->perf_retry_deadline_ns;
 }
 
 static void reset_llc_retry(perf_ctx_t *ctx) {
-    if (!ctx) {
-        return;
-    }
-    ctx->llc_retry_deadline = 0;
+    if (!ctx) return;
+    ctx->llc_retry_deadline_ns = 0;
     ctx->llc_retry_backoff_seconds = PERF_INITIAL_BACKOFF_SEC;
 }
 
 static void schedule_llc_retry(perf_ctx_t *ctx) {
-    if (!ctx || ctx->force_software) {
-        return;
-    }
-    if (ctx->llc_retry_backoff_seconds <= 0) {
-        ctx->llc_retry_backoff_seconds = PERF_INITIAL_BACKOFF_SEC;
-    }
+    if (!ctx || ctx->force_software) return;
+    if (ctx->llc_retry_backoff_seconds <= 0) ctx->llc_retry_backoff_seconds = PERF_INITIAL_BACKOFF_SEC;
     int delay = ctx->llc_retry_backoff_seconds;
-    if (delay > PERF_MAX_BACKOFF_SEC) {
-        delay = PERF_MAX_BACKOFF_SEC;
-    }
-    ctx->llc_retry_deadline = now_seconds() + (time_t)delay;
+    if (delay > PERF_MAX_BACKOFF_SEC) delay = PERF_MAX_BACKOFF_SEC;
+    uint64_t now = monotonic_now_ns();
+    uint64_t delta = (uint64_t)delay * UINT64_C(1000000000);
+    ctx->llc_retry_deadline_ns = now > UINT64_MAX - delta ? UINT64_MAX : now + delta;
     if (ctx->llc_retry_backoff_seconds < PERF_MAX_BACKOFF_SEC) {
         int next = ctx->llc_retry_backoff_seconds * 2;
         ctx->llc_retry_backoff_seconds = next > PERF_MAX_BACKOFF_SEC ? PERF_MAX_BACKOFF_SEC : next;
@@ -193,10 +174,8 @@ static void schedule_llc_retry(perf_ctx_t *ctx) {
 }
 
 static int llc_retry_due(const perf_ctx_t *ctx) {
-    if (!ctx || ctx->force_software || ctx->mode != TSD_PERF_MODE_HARDWARE) {
-        return 0;
-    }
-    return ctx->llc_retry_deadline == 0 || now_seconds() >= ctx->llc_retry_deadline;
+    if (!ctx || ctx->force_software || ctx->mode != TSD_PERF_MODE_HARDWARE) return 0;
+    return ctx->llc_retry_deadline_ns == 0 || monotonic_now_ns() >= ctx->llc_retry_deadline_ns;
 }
 
 static void perf_set_mode(perf_ctx_t *ctx, tsd_perf_mode_t mode, const char *reason) {
@@ -205,7 +184,7 @@ static void perf_set_mode(perf_ctx_t *ctx, tsd_perf_mode_t mode, const char *rea
     }
     tsd_perf_mode_t previous = ctx->mode;
     if (previous == mode) {
-        clock_gettime(CLOCK_MONOTONIC, &ctx->mode_entered_at);
+        /* Re-publishing the same state must not restart degraded-mode timeout. */
         publish_perf_state(ctx, mode == TSD_PERF_MODE_HARDWARE && ctx->hardware_validated);
         return;
     }
@@ -219,16 +198,20 @@ static void perf_set_mode(perf_ctx_t *ctx, tsd_perf_mode_t mode, const char *rea
     const char *why = reason ? reason : "unknown";
 
     if (mode == TSD_PERF_MODE_SOFTWARE) {
+        /* Hardware CPI is not comparable to software ns/work-item. */
+        ctx->calibrated_cpi_reference = 0;
         ctx->hardware_validated = 0;
         tsd_metrics_increment(TSD_METRIC_PERF_FALLBACKS);
         tsd_runtime_config_enter_degraded_mode(&g_tsd_config, why);
         tsd_log_warn(LOG_COMPONENT,
                      "event=perf_mode state=software reason=%s workload_tid=%d pinned_cpu=%d monitor_cpu=%d",
                      why, (int)ctx->owner_tid, ctx->pinned_cpu, ctx->monitor_cpu);
-        if (!allow_software_upgrades() &&
-            atomic_load_explicit(&g_tsd_current_width, memory_order_relaxed) != SIMD_SSE41) {
+        if (atomic_load_explicit(&g_tsd_current_width, memory_order_acquire) != SIMD_SSE41) {
             if (tsd_trampoline_patch(SIMD_SSE41) == 0) {
                 tsd_log_warn(LOG_COMPONENT, "event=perf_mode action=forced-width width=SSE4.1 reason=%s", why);
+            } else {
+                tsd_log_error(LOG_COMPONENT, "event=perf_mode action=force-width-failed width=SSE4.1 reason=%s errno=%d",
+                              why, errno);
             }
         }
         publish_perf_state(ctx, 0);
@@ -817,6 +800,7 @@ static int measure_hardware_baseline(perf_ctx_t *ctx, const tsd_runtime_config *
     }
 
     ctx->baseline_cpi = (delta_cycles * 1000) / delta_insns;
+    ctx->calibrated_cpi_reference = ctx->baseline_cpi ? ctx->baseline_cpi : 1;
     uint64_t delta_llc = (ctx->fd_llc_misses >= 0 && llc_after >= llc_before) ? (llc_after - llc_before) : 0;
     ctx->baseline_llc_mpki_milli = (delta_llc * MPKI_SCALE) / delta_insns;
     if (ctx->baseline_llc_mpki_milli == 0) {
@@ -870,6 +854,7 @@ void tsd_perf_measure_baseline(perf_ctx_t *ctx, const tsd_runtime_config *cfg) {
             surrogate_cpi = 1000;
         }
         ctx->baseline_cpi = surrogate_cpi;
+        ctx->calibrated_cpi_reference = surrogate_cpi;
         ctx->baseline_llc_mpki_milli = 1000;
         ctx->slow_cpi = ctx->fast_cpi = ctx->baseline_cpi;
         ctx->slow_llc_mpki = ctx->fast_llc_mpki = ctx->baseline_llc_mpki_milli;
@@ -957,6 +942,9 @@ static int process_measurement(perf_ctx_t *ctx, tsd_thermal_eval_t *out, uint64_
     if (!ctx) {
         return 0;
     }
+    if (ctx->calibrated_cpi_reference == 0 && current_cpi > 0) {
+        ctx->calibrated_cpi_reference = current_cpi;
+    }
     ctx->fast_cpi = tsd_update_ewma(ctx->fast_cpi, current_cpi, FAST_EWMA_SHIFT);
     ctx->slow_cpi = tsd_update_ewma(ctx->slow_cpi, current_cpi, SLOW_EWMA_SHIFT);
     if (ctx->slow_cpi == 0) {
@@ -967,7 +955,13 @@ static int process_measurement(perf_ctx_t *ctx, tsd_thermal_eval_t *out, uint64_
 
     uint64_t reference_cpi = ctx->slow_cpi ? ctx->slow_cpi : (ctx->baseline_cpi ? ctx->baseline_cpi : 1);
     __uint128_t ratio_num = (__uint128_t)current_cpi * 1000u;
-    uint64_t ratio_milli = (uint64_t)((ratio_num + reference_cpi / 2) / reference_cpi);
+    uint64_t adaptive_ratio_milli = (uint64_t)((ratio_num + reference_cpi / 2) / reference_cpi);
+    uint64_t absolute_reference = ctx->calibrated_cpi_reference ? ctx->calibrated_cpi_reference : reference_cpi;
+    uint64_t absolute_ratio_milli = (uint64_t)((ratio_num + absolute_reference / 2) / absolute_reference);
+    /* A slow EWMA must not normalize sustained degradation back to 1.0. Keep a
+     * frozen live calibration and use the more conservative of the two ratios. */
+    uint64_t ratio_milli = adaptive_ratio_milli > absolute_ratio_milli
+                               ? adaptive_ratio_milli : absolute_ratio_milli;
     if (ctx->ratio_history_count < RATIO_HISTORY) {
         ctx->ratio_history_count++;
     }
@@ -982,7 +976,7 @@ static int process_measurement(perf_ctx_t *ctx, tsd_thermal_eval_t *out, uint64_
     uint64_t mpki_ratio = (uint64_t)((mpki_ratio_num + baseline_mpki / 2) / baseline_mpki);
     int memory_bound = ctx->fd_llc_misses >= 0 && mpki_ratio > 2500;
 
-    uint64_t dynamic_threshold = cfg ? cfg->down_ratio_milli : 1500;
+    uint64_t dynamic_threshold = cfg ? tsd_runtime_config_effective_down_ratio_milli(cfg) : 1500;
     if (ctx->fast_cpi > ctx->slow_cpi) {
         uint64_t delta = ctx->fast_cpi - ctx->slow_cpi;
         uint64_t delta_ratio = (uint64_t)(((__uint128_t)delta * 1000u) / (ctx->slow_cpi ? ctx->slow_cpi : 1));
@@ -1068,39 +1062,39 @@ int tsd_perf_evaluate(perf_ctx_t *ctx, tsd_thermal_eval_t *out, const tsd_runtim
         memset(out, 0, sizeof(*out));
     }
 
+#ifdef TSD_ENABLE_TESTS
+    if (g_test_perf_script.enabled && g_test_perf_script.count > 0) {
+        size_t script_index = g_test_perf_script.index;
+        uint32_t ratio = g_test_perf_script.ratios[script_index];
+        if (g_test_perf_script.index + 1 < g_test_perf_script.count) {
+            g_test_perf_script.index++;
+        }
+        uint64_t baseline = ctx->slow_cpi ? ctx->slow_cpi : (ctx->baseline_cpi ? ctx->baseline_cpi : 1000);
+        uint64_t current_cpi = (uint64_t)(((__uint128_t)baseline * ratio + 500u) / 1000u);
+        tsd_telemetry_sample_t scripted_telemetry = {0};
+        if (g_test_perf_script.telemetry_count > 0) {
+            size_t tele_index = script_index < g_test_perf_script.telemetry_count
+                                    ? script_index
+                                    : g_test_perf_script.telemetry_count - 1;
+            scripted_telemetry = g_test_perf_script.telemetry[tele_index];
+            if (scripted_telemetry.temp_available && !scripted_telemetry.filtered_temp_available) {
+                scripted_telemetry.filtered_temp_available = 1;
+                scripted_telemetry.filtered_package_temp_millic = scripted_telemetry.package_temp_millic;
+            }
+            if (scripted_telemetry.freq_ratio_available && !scripted_telemetry.filtered_freq_ratio_available) {
+                scripted_telemetry.filtered_freq_ratio_available = 1;
+                scripted_telemetry.filtered_freq_ratio_milli = scripted_telemetry.freq_ratio_milli;
+            }
+        } else {
+            fetch_fused_telemetry(ctx, &scripted_telemetry);
+        }
+        return process_measurement(ctx, out, current_cpi, g_test_perf_script.mpki, cfg, &scripted_telemetry);
+    }
+#endif
     if (ctx->mode == TSD_PERF_MODE_SOFTWARE) {
         if (try_recover_hardware(ctx)) {
             return 0;
         }
-#ifdef TSD_ENABLE_TESTS
-        if (g_test_perf_script.enabled && g_test_perf_script.count > 0) {
-            size_t script_index = g_test_perf_script.index;
-            uint32_t ratio = g_test_perf_script.ratios[script_index];
-            if (g_test_perf_script.index + 1 < g_test_perf_script.count) {
-                g_test_perf_script.index++;
-            }
-            uint64_t baseline = ctx->slow_cpi ? ctx->slow_cpi : (ctx->baseline_cpi ? ctx->baseline_cpi : 1000);
-            uint64_t current_cpi = (uint64_t)(((__uint128_t)baseline * ratio + 500u) / 1000u);
-            tsd_telemetry_sample_t scripted_telemetry = {0};
-            if (g_test_perf_script.telemetry_count > 0) {
-                size_t tele_index = script_index < g_test_perf_script.telemetry_count
-                                        ? script_index
-                                        : g_test_perf_script.telemetry_count - 1;
-                scripted_telemetry = g_test_perf_script.telemetry[tele_index];
-                if (scripted_telemetry.temp_available && !scripted_telemetry.filtered_temp_available) {
-                    scripted_telemetry.filtered_temp_available = 1;
-                    scripted_telemetry.filtered_package_temp_millic = scripted_telemetry.package_temp_millic;
-                }
-                if (scripted_telemetry.freq_ratio_available && !scripted_telemetry.filtered_freq_ratio_available) {
-                    scripted_telemetry.filtered_freq_ratio_available = 1;
-                    scripted_telemetry.filtered_freq_ratio_milli = scripted_telemetry.freq_ratio_milli;
-                }
-            } else {
-                fetch_fused_telemetry(ctx, &scripted_telemetry);
-            }
-            return process_measurement(ctx, out, current_cpi, g_test_perf_script.mpki, cfg, &scripted_telemetry);
-        }
-#endif
         if (!ctx->software_adaptation) {
             ctx->sw_last_iterations = atomic_load_explicit(&g_tsd_workload_iterations, memory_order_relaxed);
             clock_gettime(CLOCK_MONOTONIC, &ctx->sw_last_timestamp);
@@ -1238,8 +1232,7 @@ int tsd_perf_upgrades_allowed(const perf_ctx_t *ctx) {
     if (!ctx) {
         return 0;
     }
-    return (ctx->mode == TSD_PERF_MODE_HARDWARE && ctx->hardware_validated) ||
-           (ctx->mode == TSD_PERF_MODE_SOFTWARE && allow_software_upgrades());
+    return ctx->mode == TSD_PERF_MODE_HARDWARE && ctx->hardware_validated;
 }
 
 int tsd_perf_check_software_timeout(perf_ctx_t *ctx, int timeout_sec) {
@@ -1301,6 +1294,24 @@ void tsd_perf_test_set_mode(perf_ctx_t *ctx, tsd_perf_mode_t mode) {
         ctx->timeout_notified = 0;
         clock_gettime(CLOCK_MONOTONIC, &ctx->mode_entered_at);
     }
+}
+
+void tsd_perf_test_seed_cpi_reference(perf_ctx_t *ctx, uint64_t baseline_cpi) {
+    if (!ctx || baseline_cpi == 0) return;
+    ctx->baseline_cpi = baseline_cpi;
+    ctx->calibrated_cpi_reference = baseline_cpi;
+    ctx->slow_cpi = baseline_cpi;
+    ctx->fast_cpi = baseline_cpi;
+    memset(ctx->ratio_history, 0, sizeof(ctx->ratio_history));
+    ctx->ratio_history_count = 0;
+    ctx->ratio_history_cursor = 0;
+    ctx->ratio_trimmed_milli = 0;
+}
+
+int tsd_perf_test_process_cpi(perf_ctx_t *ctx, uint64_t current_cpi,
+                              tsd_thermal_eval_t *out, const tsd_runtime_config *cfg) {
+    tsd_telemetry_sample_t telemetry = {0};
+    return process_measurement(ctx, out, current_cpi, 0, cfg, &telemetry);
 }
 
 void tsd_test_perf_rewind_mode(perf_ctx_t *ctx, int seconds) {

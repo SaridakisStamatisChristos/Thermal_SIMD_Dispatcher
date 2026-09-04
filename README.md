@@ -350,3 +350,22 @@ sublicensing, and broader rights require a separate written commercial
 agreement with the copyright holder. See [NOTICE](NOTICE) for the ownership
 notice, [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for third-party terms,
 and [CONTRIBUTING.md](CONTRIBUTING.md) before proposing changes.
+
+
+## Runtime safety invariants and model provenance
+
+The adaptive runtime is deliberately fail-closed. Registered kernel execution and
+live safety-state mutation are linearized by a process-wide safety gate; loss of
+hardware perf authority or fresh raw package-temperature authority revokes wider
+SIMD and forces SSE4.1. Cooldown/minimum-dwell policy never suppresses emergency
+thermal observation, and software perf mode is diagnostic/degraded operation only:
+it cannot authorize AVX2 or AVX-512.
+
+The default `config/controller_coeffs.json` is a conservative reference controller
+profile, not a universally calibrated physical plant model. Its ARX terms and
+explicit per-width thermal/performance effects are engineering priors used to make
+model-assisted discrete width decisions. Production deployments should calibrate
+and validate coefficients on the target CPU/package/workload, preserve the raw
+thermal safety channel independently of the forecast, and use HIL evidence before
+enabling AVX-512 policy. The controller never treats a wider SIMD step as a cooling
+action; width temperature cost is non-negative by construction.

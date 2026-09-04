@@ -31,6 +31,9 @@ typedef struct {
     int thermal_temp_weight_milli;
     int thermal_ratio_weight_milli;
     int degraded_timeout_sec;
+    /* Compatibility/configuration field. Runtime degraded state is published
+     * separately by tsd_runtime_config_is_degraded() and no longer mutates this
+     * structure after startup. */
     int degraded_policy_active;
     int health_check_mode;
     int metrics_enabled;
@@ -61,9 +64,22 @@ extern tsd_runtime_config g_tsd_config;
 
 void tsd_runtime_config_set_defaults(tsd_runtime_config *cfg);
 int tsd_runtime_config_refresh_ticks(tsd_runtime_config *cfg);
+
+/*
+ * Degraded mode no longer rewrites g_tsd_config in place. The startup
+ * configuration remains immutable while the runtime is active; dynamic policy
+ * callers use the effective accessors below. This removes cross-thread data
+ * races during perf fallback/recovery.
+ */
 void tsd_runtime_config_enter_degraded_mode(tsd_runtime_config *cfg, const char *reason);
 void tsd_runtime_config_exit_degraded_mode(tsd_runtime_config *cfg, const char *reason);
 int tsd_runtime_config_is_degraded(void);
+int tsd_runtime_config_effective_down_count(const tsd_runtime_config *cfg);
+int tsd_runtime_config_effective_up_count(const tsd_runtime_config *cfg);
+int tsd_runtime_config_effective_cooldown_down_ms(const tsd_runtime_config *cfg);
+int tsd_runtime_config_effective_cooldown_up_ms(const tsd_runtime_config *cfg);
+int tsd_runtime_config_effective_min_dwell_ms(const tsd_runtime_config *cfg);
+uint64_t tsd_runtime_config_effective_down_ratio_milli(const tsd_runtime_config *cfg);
 
 int tsd_runtime_config_parse_cli(tsd_runtime_config *cfg, int argc, char **argv);
 void tsd_runtime_config_print_usage(const char *prog);

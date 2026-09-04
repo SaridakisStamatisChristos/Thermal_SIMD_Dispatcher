@@ -2,6 +2,8 @@
 
 #include <mutex>
 
+#include "../runtime_guard_internal.h"
+
 namespace observability {
 
 TelemetryState &TelemetryState::instance() {
@@ -22,52 +24,67 @@ void TelemetryState::update_controller(const tsd_controller_telemetry_t *telemet
 
 void TelemetryState::update_fusion(const tsd_fusion_telemetry_t *telemetry) {
     if (!telemetry) return;
-    std::lock_guard<std::mutex> lock(mutex_);
-    fusion_.running = telemetry->running != 0;
-    fusion_.degraded = telemetry->degraded != 0;
-    fusion_.temp_available = telemetry->temp_available != 0;
-    fusion_.package_temp_c = telemetry->package_temp_c;
-    fusion_.filtered_temp_available = telemetry->temp_available != 0;
-    fusion_.filtered_package_temp_c = telemetry->package_temp_c;
-    fusion_.freq_available = telemetry->freq_available != 0;
-    fusion_.freq_ratio = telemetry->freq_ratio;
-    fusion_.cpi_available = telemetry->cpi_available != 0;
-    fusion_.thermal_cpi = telemetry->thermal_cpi;
-    fusion_.power_available = telemetry->power_available != 0;
-    fusion_.power_budget_w = telemetry->power_budget_w;
-    fusion_.updated_at = std::chrono::system_clock::now();
-    fusion_.freshness_at = std::chrono::steady_clock::now();
+    if (tsd_runtime_safety_write_enter() != 0) return;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        fusion_.running = telemetry->running != 0;
+        fusion_.degraded = telemetry->degraded != 0;
+        fusion_.temp_available = telemetry->temp_available != 0;
+        fusion_.package_temp_c = telemetry->package_temp_c;
+        fusion_.filtered_temp_available = telemetry->temp_available != 0;
+        fusion_.filtered_package_temp_c = telemetry->package_temp_c;
+        fusion_.freq_available = telemetry->freq_available != 0;
+        fusion_.freq_ratio = telemetry->freq_ratio;
+        fusion_.cpi_available = telemetry->cpi_available != 0;
+        fusion_.thermal_cpi = telemetry->thermal_cpi;
+        fusion_.power_available = telemetry->power_available != 0;
+        fusion_.power_budget_w = telemetry->power_budget_w;
+        fusion_.updated_at = std::chrono::system_clock::now();
+        fusion_.freshness_at = std::chrono::steady_clock::now();
+    }
+    tsd_runtime_safety_write_leave();
 }
 
 void TelemetryState::update_temperature_channels(const tsd_temperature_channels_t *telemetry) {
     if (!telemetry) return;
-    std::lock_guard<std::mutex> lock(mutex_);
-    fusion_.raw_temp_available = telemetry->raw_available != 0;
-    fusion_.raw_package_temp_c = telemetry->raw_package_temp_c;
-    if (telemetry->raw_available) {
-        fusion_.raw_temp_freshness_at = std::chrono::steady_clock::now();
-    } else {
-        fusion_.raw_temp_freshness_at = {};
+    if (tsd_runtime_safety_write_enter() != 0) return;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        fusion_.raw_temp_available = telemetry->raw_available != 0;
+        fusion_.raw_package_temp_c = telemetry->raw_package_temp_c;
+        if (telemetry->raw_available) {
+            fusion_.raw_temp_freshness_at = std::chrono::steady_clock::now();
+        } else {
+            fusion_.raw_temp_freshness_at = {};
+        }
+        fusion_.filtered_temp_available = telemetry->filtered_available != 0;
+        fusion_.filtered_package_temp_c = telemetry->filtered_package_temp_c;
+        if (telemetry->filtered_available) {
+            fusion_.temp_available = true;
+            fusion_.package_temp_c = telemetry->filtered_package_temp_c;
+        } else if (!telemetry->raw_available) {
+            fusion_.temp_available = false;
+            fusion_.package_temp_c = 0.0;
+        }
+        fusion_.updated_at = std::chrono::system_clock::now();
+        fusion_.freshness_at = std::chrono::steady_clock::now();
     }
-    fusion_.filtered_temp_available = telemetry->filtered_available != 0;
-    fusion_.filtered_package_temp_c = telemetry->filtered_package_temp_c;
-    if (telemetry->filtered_available) {
-        fusion_.temp_available = true;
-        fusion_.package_temp_c = telemetry->filtered_package_temp_c;
-    }
-    fusion_.updated_at = std::chrono::system_clock::now();
-    fusion_.freshness_at = std::chrono::steady_clock::now();
+    tsd_runtime_safety_write_leave();
 }
 
 void TelemetryState::update_perf(const tsd_perf_telemetry_t *telemetry) {
     if (!telemetry) return;
-    std::lock_guard<std::mutex> lock(mutex_);
-    perf_.mode = telemetry->mode;
-    perf_.counters_healthy = telemetry->counters_healthy != 0;
-    perf_.pinned_cpu = telemetry->pinned_cpu;
-    perf_.monitor_cpu = telemetry->monitor_cpu;
-    perf_.updated_at = std::chrono::system_clock::now();
-    perf_.freshness_at = std::chrono::steady_clock::now();
+    if (tsd_runtime_safety_write_enter() != 0) return;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        perf_.mode = telemetry->mode;
+        perf_.counters_healthy = telemetry->counters_healthy != 0;
+        perf_.pinned_cpu = telemetry->pinned_cpu;
+        perf_.monitor_cpu = telemetry->monitor_cpu;
+        perf_.updated_at = std::chrono::system_clock::now();
+        perf_.freshness_at = std::chrono::steady_clock::now();
+    }
+    tsd_runtime_safety_write_leave();
 }
 
 ControllerTelemetrySnapshot TelemetryState::controller_snapshot() const {

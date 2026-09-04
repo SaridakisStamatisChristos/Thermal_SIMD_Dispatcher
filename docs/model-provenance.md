@@ -12,7 +12,7 @@ The runtime therefore keeps safety authority outside the model:
 
 - raw package temperature drives emergency handling and wider-SIMD authorization;
 - loss of required package-temperature telemetry blocks upgrades and can force SSE4.1;
-- primary perf-counter loss enters software/degraded mode and blocks wider SIMD by default;
+- primary perf-counter loss enters software/degraded mode and blocks wider SIMD unconditionally;
 - predictive recommendations are bounded to the discrete ISA widths the host and runtime already permit;
 - hysteresis remains available as the fallback controller.
 

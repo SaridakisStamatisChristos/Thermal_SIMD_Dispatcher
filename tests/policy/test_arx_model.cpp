@@ -1,6 +1,7 @@
 #include <cassert>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <cmath>
@@ -227,8 +228,8 @@ void test_mpc_explicit_reload() {
 
     std::ofstream stream(base_path);
     stream << R"JSON({
-  "bias": 5000.0,
-  "ar_temperature": [0.9],
+  "bias": 20000.0,
+  "ar_temperature": [1.0],
   "ratio": [0.0],
   "severity": [0.0],
   "ma": 0.0,
@@ -236,7 +237,9 @@ void test_mpc_explicit_reload() {
 })JSON";
     stream.close();
 
+    assert(::setenv("TSD_PREDICTIVE_COEFF_PATH", base_path.c_str(), 1) == 0);
     assert(controller.reloadCoefficients());
+    (void)::unsetenv("TSD_PREDICTIVE_COEFF_PATH");
 
     populateSample(sample, 1650, 81000);
     controller.pushSample(sample, SIMD_AVX2);

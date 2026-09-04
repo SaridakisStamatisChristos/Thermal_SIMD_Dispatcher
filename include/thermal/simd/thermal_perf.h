@@ -1,9 +1,7 @@
 #ifndef TSD_THERMAL_PERF_H
 #define TSD_THERMAL_PERF_H
 
-#ifdef __cplusplus
-#include <atomic>
-#else
+#ifndef __cplusplus
 #include <stdatomic.h>
 #endif
 #include <stddef.h>
@@ -27,11 +25,17 @@ typedef enum {
 
 typedef void (*tsd_workload_fn)(void);
 
-#ifdef __cplusplus
-extern std::atomic<uint64_t> g_tsd_workload_iterations;
-#else
+/*
+ * The raw counter is C11-owned. Keep the raw declaration C-only so C++ never
+ * aliases a C _Atomic object as std::atomic. Cross-language callers use the C
+ * ABI functions below.
+ */
+#ifndef __cplusplus
 extern _Atomic(uint64_t) g_tsd_workload_iterations;
 #endif
+uint64_t tsd_workload_iterations_load(void);
+void tsd_workload_iterations_add(uint64_t count);
+void tsd_workload_iterations_reset(void);
 
 perf_ctx_t* tsd_perf_init(tsd_workload_fn workload_cb);
 void tsd_perf_enable(perf_ctx_t *ctx);
@@ -44,9 +48,10 @@ int tsd_perf_get_monitor_cpu(const perf_ctx_t *ctx);
 int tsd_perf_check_software_timeout(perf_ctx_t *ctx, int timeout_sec);
 
 /*
- * Wider SIMD authorization must be checked continuously. Hardware mode is
- * eligible only after a fresh, running perf baseline has been validated;
- * software mode is eligible only under TSD_ALLOW_SOFTWARE_UPGRADES.
+ * Wider SIMD authorization must be checked continuously. Only validated,
+ * currently healthy hardware perf mode may authorize an upgrade. Software mode
+ * is degraded diagnostic/control telemetry only and is always fail-closed to
+ * SSE4.1, regardless of legacy environment variables.
  */
 int tsd_perf_upgrades_allowed(const perf_ctx_t *ctx);
 
@@ -77,6 +82,9 @@ void tsd_perf_test_destroy_dummy_context(perf_ctx_t *ctx);
 void tsd_perf_test_set_group_fd(perf_ctx_t *ctx, int fd);
 void tsd_perf_test_set_llc_fd(perf_ctx_t *ctx, int fd);
 void tsd_perf_test_set_mode(perf_ctx_t *ctx, tsd_perf_mode_t mode);
+void tsd_perf_test_seed_cpi_reference(perf_ctx_t *ctx, uint64_t baseline_cpi);
+int tsd_perf_test_process_cpi(perf_ctx_t *ctx, uint64_t current_cpi,
+                              tsd_thermal_eval_t *out, const tsd_runtime_config *cfg);
 void tsd_perf_test_set_read_streams(const tsd_perf_test_read_stream_t *streams, size_t count);
 void tsd_perf_test_clear_read_streams(void);
 uint64_t tsd_perf_test_get_baseline_cpi(const perf_ctx_t *ctx);

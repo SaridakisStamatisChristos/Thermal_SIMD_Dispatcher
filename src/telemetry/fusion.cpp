@@ -1,11 +1,13 @@
 #include <telemetry/fusion.h>
 
 #include <cmath>
+#include <exception>
 #include <stdexcept>
 
 #include <observability/telemetry_state.h>
 
 #include <telemetry/bus.h>
+#include <thermal/simd/logging.h>
 
 namespace telemetry {
 
@@ -57,7 +59,12 @@ TelemetryFusion::TelemetryFusion(TelemetryFusionConfig config,
     bus_manager_->set_bus(bus_);
 }
 
-TelemetryFusion::~TelemetryFusion() { stop(); }
+TelemetryFusion::~TelemetryFusion() {
+    try {
+        stop();
+    } catch (...) {
+    }
+}
 
 void TelemetryFusion::start() {
     bool expected = false;
@@ -65,7 +72,12 @@ void TelemetryFusion::start() {
         return;
     }
     std::lock_guard<std::mutex> lock(thread_mutex_);
-    thread_ = std::thread([this] { run(); });
+    try {
+        thread_ = std::thread([this] { run(); });
+    } catch (...) {
+        running_.store(false, std::memory_order_release);
+        throw;
+    }
     tsd_fusion_telemetry_t telemetry{};
     telemetry.running = 1;
     tsd_observability_update_fusion(&telemetry);
@@ -105,11 +117,25 @@ std::optional<TelemetrySnapshot> TelemetryFusion::wait_for_snapshot(
 
 void TelemetryFusion::run() {
     auto next_run = std::chrono::steady_clock::now();
-    while (running_.load()) {
-        auto now = std::chrono::steady_clock::now();
-        bus_manager_->poll(now);
-        TelemetrySnapshot snapshot = fuse(now);
-        ring_.publish(snapshot);
+    while (running_.load(std::memory_order_acquire)) {
+        try {
+            auto now = std::chrono::steady_clock::now();
+            bus_manager_->poll(now);
+            TelemetrySnapshot snapshot = fuse(now);
+            ring_.publish(snapshot);
+        } catch (const std::exception &ex) {
+            tsd_log_error("telemetry", "fusion iteration failed: %s", ex.what());
+            tsd_fusion_telemetry_t telemetry{};
+            telemetry.running = running_.load(std::memory_order_acquire) ? 1 : 0;
+            telemetry.degraded = 1;
+            tsd_observability_update_fusion(&telemetry);
+        } catch (...) {
+            tsd_log_error("telemetry", "fusion iteration failed: unknown C++ exception");
+            tsd_fusion_telemetry_t telemetry{};
+            telemetry.running = running_.load(std::memory_order_acquire) ? 1 : 0;
+            telemetry.degraded = 1;
+            tsd_observability_update_fusion(&telemetry);
+        }
 
         next_run += config_.poll_interval;
         auto sleep_duration = next_run - std::chrono::steady_clock::now();
@@ -143,7 +169,7 @@ TelemetrySnapshot TelemetryFusion::fuse(std::chrono::steady_clock::time_point no
         snapshot.degraded = true;
     }
     tsd_fusion_telemetry_t telemetry{};
-    telemetry.running = running_.load() ? 1 : 0;
+    telemetry.running = running_.load(std::memory_order_acquire) ? 1 : 0;
     telemetry.degraded = snapshot.degraded ? 1 : 0;
     telemetry.temp_available = snapshot.temp_available ? 1 : 0;
     telemetry.package_temp_c = snapshot.package_temp_c;
@@ -163,6 +189,10 @@ bool TelemetryFusion::assign_value(TelemetrySignal signal,
                                    std::chrono::steady_clock::time_point now) {
     auto reading = bus_->latest(signal);
     if (!reading || !reading->valid) {
+        out_flag = false;
+        return false;
+    }
+    if (reading->timestamp > now) {
         out_flag = false;
         return false;
     }

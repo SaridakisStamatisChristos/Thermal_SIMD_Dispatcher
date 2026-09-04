@@ -49,21 +49,38 @@ static void test_runtime_group_failure_fails_closed(void) {
     tsd_perf_test_destroy_dummy_context(ctx);
 }
 
-static void test_software_upgrade_gate_is_continuous(void) {
+static void test_software_mode_never_authorizes_upgrades(void) {
     perf_ctx_t *ctx = tsd_perf_test_create_dummy_context();
     assert(ctx != NULL);
 
-    unsetenv("TSD_ALLOW_SOFTWARE_UPGRADES");
     tsd_perf_test_set_mode(ctx, TSD_PERF_MODE_SOFTWARE);
     assert(tsd_perf_upgrades_allowed(ctx) == 0);
 
+    /* The legacy environment escape hatch is intentionally ignored. */
     assert(setenv("TSD_ALLOW_SOFTWARE_UPGRADES", "1", 1) == 0);
-    assert(tsd_perf_upgrades_allowed(ctx) == 1);
-    unsetenv("TSD_ALLOW_SOFTWARE_UPGRADES");
     assert(tsd_perf_upgrades_allowed(ctx) == 0);
+    unsetenv("TSD_ALLOW_SOFTWARE_UPGRADES");
 
     tsd_perf_test_set_mode(ctx, TSD_PERF_MODE_HARDWARE);
     assert(tsd_perf_upgrades_allowed(ctx) == 1);
+    tsd_perf_test_destroy_dummy_context(ctx);
+}
+
+static void test_sustained_degradation_not_normalized_away(void) {
+    tsd_runtime_config_set_defaults(&g_tsd_config);
+    perf_ctx_t *ctx = tsd_perf_test_create_dummy_context();
+    assert(ctx != NULL);
+    tsd_perf_test_seed_cpi_reference(ctx, 1000);
+
+    tsd_thermal_eval_t eval = {0};
+    int throttled = 0;
+    for (int i = 0; i < 128; ++i) {
+        throttled = tsd_perf_test_process_cpi(ctx, 2000, &eval, &g_tsd_config);
+    }
+    assert(eval.ratio_milli >= 1900);
+    assert(eval.trimmed_ratio_milli >= 1900);
+    assert(eval.severity_milli > 0);
+    assert(throttled != 0);
     tsd_perf_test_destroy_dummy_context(ctx);
 }
 
@@ -136,7 +153,8 @@ static void test_fusion_is_reference_counted_and_cpu_coherent(void) {
 
 int main(void) {
     test_runtime_group_failure_fails_closed();
-    test_software_upgrade_gate_is_continuous();
+    test_software_mode_never_authorizes_upgrades();
+    test_sustained_degradation_not_normalized_away();
     test_group_progress_requires_actual_runtime();
     test_cpuset_selection_and_affinity_restoration();
     test_fusion_is_reference_counted_and_cpu_coherent();

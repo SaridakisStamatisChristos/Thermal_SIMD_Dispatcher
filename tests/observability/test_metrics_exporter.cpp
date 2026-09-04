@@ -199,6 +199,16 @@ int main() {
     config.statsd_host = "127.0.0.1";
     config.statsd_port = capture.port;
 
+    tsd_metrics_exporter_config_t rollback_config{};
+    rollback_config.bind_address = "127.0.0.1";
+    rollback_config.port = 0;
+    (void)::setenv("TSD_TEST_METRICS_FAIL_THREAD_AFTER", "1", 1);
+    if (tsd_metrics_exporter_start_with_config(&rollback_config) == 0) {
+        fail("injected partial metrics startup unexpectedly succeeded");
+    }
+    if (tsd_metrics_exporter_listen_port() != 0) fail("failed metrics startup leaked listener state");
+    (void)::unsetenv("TSD_TEST_METRICS_FAIL_THREAD_AFTER");
+
     if (tsd_metrics_exporter_start_with_config(&config) != 0) fail("metrics exporter failed to start");
     uint16_t port = tsd_metrics_exporter_listen_port();
     if (port == 0) fail("listen port not assigned");
@@ -244,7 +254,7 @@ int main() {
     if (metrics.status != 200 || metrics.body.find("tsd_patch_transitions_total") == std::string::npos ||
         metrics.body.find("channel=\"raw_safety\"") == std::string::npos ||
         metrics.body.find("channel=\"filtered_control\"") == std::string::npos) {
-        fail("metrics response invalid or missing temperature channels");
+        fail("metrics response invalid, unescaped, or missing temperature channels");
     }
 
     HttpResponse health = https_request(port, "/healthz", credentials, ca_crt);
@@ -286,6 +296,13 @@ int main() {
     std::string statsd_payload = capture.future.get();
     if (statsd_payload.find("tsd.patch_transition.avx2.avx512.success") == std::string::npos) {
         fail("statsd payload missing transition");
+    }
+
+    tsd_metrics_exporter_record_sensor_health("pkg\"line\nslash\\sensor", 0, 1.0, 1.0, 1);
+    HttpResponse escaped_metrics = https_request(port, "/metrics", credentials, ca_crt);
+    if (escaped_metrics.status != 200 ||
+        escaped_metrics.body.find("sensor=\"pkg\\\"line\\nslash\\\\sensor\"") == std::string::npos) {
+        fail("Prometheus sensor label was not escaped");
     }
 
     tsd_metrics_exporter_stop();

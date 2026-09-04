@@ -15,6 +15,8 @@ namespace tsd {
 namespace policy {
 
 namespace {
+constexpr double kDefaultWidthTemperatureMillicPerStep = 2000.0;
+constexpr double kDefaultWidthPerformanceBenefitMilliPerStep = 100.0;
 
 bool extractNumberToken(const std::string &content, std::size_t &pos, std::string *token) {
     std::size_t start = pos;
@@ -27,12 +29,8 @@ bool extractNumberToken(const std::string &content, std::size_t &pos, std::strin
         }
         break;
     }
-    if (pos == start) {
-        return false;
-    }
-    if (token) {
-        *token = content.substr(start, pos - start);
-    }
+    if (pos == start) return false;
+    if (token) *token = content.substr(start, pos - start);
     return true;
 }
 
@@ -43,50 +41,34 @@ bool parseDoubleField(const std::string &content,
                       bool *found,
                       std::string *error_out) {
     if (!out) {
-        if (error_out) {
-            *error_out = "missing output pointer";
-        }
+        if (error_out) *error_out = "missing output pointer";
         return false;
     }
     std::string needle = "\"" + key + "\"";
     std::size_t pos = content.find(needle);
     if (pos == std::string::npos) {
-        if (found) {
-            *found = false;
-        }
-        if (required && error_out) {
-            *error_out = "missing field: " + key;
-        }
+        if (found) *found = false;
+        if (required && error_out) *error_out = "missing field: " + key;
         return !required;
     }
-    if (found) {
-        *found = true;
-    }
+    if (found) *found = true;
     pos = content.find(':', pos + needle.size());
     if (pos == std::string::npos) {
-        if (error_out) {
-            *error_out = "malformed field: " + key;
-        }
+        if (error_out) *error_out = "malformed field: " + key;
         return false;
     }
     ++pos;
-    while (pos < content.size() && std::isspace(static_cast<unsigned char>(content[pos]))) {
-        ++pos;
-    }
+    while (pos < content.size() && std::isspace(static_cast<unsigned char>(content[pos]))) ++pos;
     std::string token;
     if (!extractNumberToken(content, pos, &token)) {
-        if (error_out) {
-            *error_out = "invalid numeric value for field: " + key;
-        }
+        if (error_out) *error_out = "invalid numeric value for field: " + key;
         return false;
     }
     char *endptr = nullptr;
     errno = 0;
     double value = std::strtod(token.c_str(), &endptr);
     if (errno != 0 || !endptr || *endptr != '\0' || !std::isfinite(value)) {
-        if (error_out) {
-            *error_out = "failed to parse finite double for field: " + key;
-        }
+        if (error_out) *error_out = "failed to parse finite double for field: " + key;
         return false;
     }
     *out = value;
@@ -101,22 +83,14 @@ bool parseUint64Field(const std::string &content,
                       std::string *error_out) {
     double value = 0.0;
     bool local_found = false;
-    if (!parseDoubleField(content, key, required, &value, &local_found, error_out)) {
-        return false;
-    }
+    if (!parseDoubleField(content, key, required, &value, &local_found, error_out)) return false;
     if (!local_found) {
-        if (found) {
-            *found = false;
-        }
+        if (found) *found = false;
         return !required;
     }
-    if (found) {
-        *found = true;
-    }
+    if (found) *found = true;
     if (value < 0.0 || value > static_cast<double>(UINT64_MAX)) {
-        if (error_out) {
-            *error_out = "out-of-range value for field: " + key;
-        }
+        if (error_out) *error_out = "out-of-range value for field: " + key;
         return false;
     }
     *out = static_cast<std::uint64_t>(value + 0.5);
@@ -126,9 +100,7 @@ bool parseUint64Field(const std::string &content,
 bool parseDoubleArrayField(const std::string &content, const std::string &key, std::vector<double> *out,
                            std::string *error_out) {
     if (!out) {
-        if (error_out) {
-            *error_out = "missing output pointer";
-        }
+        if (error_out) *error_out = "missing output pointer";
         return false;
     }
     std::string needle = "\"" + key + "\"";
@@ -139,35 +111,25 @@ bool parseDoubleArrayField(const std::string &content, const std::string &key, s
     }
     pos = content.find('[', pos + needle.size());
     if (pos == std::string::npos) {
-        if (error_out) {
-            *error_out = "malformed array for field: " + key;
-        }
+        if (error_out) *error_out = "malformed array for field: " + key;
         return false;
     }
     ++pos;
     out->clear();
     while (pos < content.size()) {
-        while (pos < content.size() && std::isspace(static_cast<unsigned char>(content[pos]))) {
-            ++pos;
-        }
-        if (pos >= content.size()) {
-            break;
-        }
+        while (pos < content.size() && std::isspace(static_cast<unsigned char>(content[pos]))) ++pos;
+        if (pos >= content.size()) break;
         if (content[pos] == ']') {
             ++pos;
             return true;
         }
         std::size_t start = pos;
-        while (pos < content.size() && content[pos] != ',' && content[pos] != ']') {
-            ++pos;
-        }
+        while (pos < content.size() && content[pos] != ',' && content[pos] != ']') ++pos;
         std::string token = content.substr(start, pos - start);
         std::size_t trimmed_start = token.find_first_not_of(" \t\n\r");
         std::size_t trimmed_end = token.find_last_not_of(" \t\n\r");
         if (trimmed_start == std::string::npos) {
-            if (error_out) {
-                *error_out = "empty entry in array for field: " + key;
-            }
+            if (error_out) *error_out = "empty entry in array for field: " + key;
             return false;
         }
         token = token.substr(trimmed_start, trimmed_end - trimmed_start + 1);
@@ -175,19 +137,13 @@ bool parseDoubleArrayField(const std::string &content, const std::string &key, s
         errno = 0;
         double value = std::strtod(token.c_str(), &endptr);
         if (errno != 0 || !endptr || *endptr != '\0' || !std::isfinite(value)) {
-            if (error_out) {
-                *error_out = "invalid finite numeric entry in array for field: " + key;
-            }
+            if (error_out) *error_out = "invalid finite numeric entry in array for field: " + key;
             return false;
         }
         out->push_back(value);
-        if (pos < content.size() && content[pos] == ',') {
-            ++pos;
-        }
+        if (pos < content.size() && content[pos] == ',') ++pos;
     }
-    if (error_out) {
-        *error_out = "unterminated array for field: " + key;
-    }
+    if (error_out) *error_out = "unterminated array for field: " + key;
     return false;
 }
 
@@ -201,28 +157,25 @@ ARXModel::ARXModel()
       residual_valid_(false),
       coefficients_loaded_(false),
       required_history_(1),
-      staleness_window_ms_(500) {}
+      staleness_window_ms_(500),
+      width_temperature_millic_per_step_(kDefaultWidthTemperatureMillicPerStep),
+      width_performance_benefit_milli_per_step_(kDefaultWidthPerformanceBenefitMilliPerStep) {}
 
 bool ARXModel::loadFromFile(const std::string &path, std::string *error_out) {
     std::ifstream stream(path);
     if (!stream.is_open()) {
-        if (error_out) {
-            *error_out = "unable to open coefficient file: " + path;
-        }
+        if (error_out) *error_out = "unable to open coefficient file: " + path;
         coefficients_loaded_ = false;
         return false;
     }
     std::ostringstream buffer;
     buffer << stream.rdbuf();
     if (buffer.fail()) {
-        if (error_out) {
-            *error_out = "failed to read coefficient file: " + path;
-        }
+        if (error_out) *error_out = "failed to read coefficient file: " + path;
         coefficients_loaded_ = false;
         return false;
     }
-    std::string content = buffer.str();
-    if (!parseContent(content, error_out)) {
+    if (!parseContent(buffer.str(), error_out)) {
         coefficients_loaded_ = false;
         return false;
     }
@@ -238,52 +191,54 @@ bool ARXModel::loadFromFile(const std::string &path, std::string *error_out) {
 bool ARXModel::parseContent(const std::string &content, std::string *error_out) {
     double bias = 0.0;
     bool bias_found = false;
-    if (!parseDoubleField(content, "bias", true, &bias, &bias_found, error_out) || !bias_found) {
-        return false;
-    }
+    if (!parseDoubleField(content, "bias", true, &bias, &bias_found, error_out) || !bias_found) return false;
 
     std::vector<double> temp_coeffs;
-    if (!parseDoubleArrayField(content, "ar_temperature", &temp_coeffs, error_out)) {
-        return false;
-    }
+    if (!parseDoubleArrayField(content, "ar_temperature", &temp_coeffs, error_out)) return false;
     if (temp_coeffs.empty()) {
-        if (error_out) {
-            *error_out = "ar_temperature array must contain at least one coefficient";
-        }
+        if (error_out) *error_out = "ar_temperature array must contain at least one coefficient";
         return false;
     }
 
     std::vector<double> ratio_coeffs;
-    if (!parseDoubleArrayField(content, "ratio", &ratio_coeffs, error_out)) {
-        return false;
-    }
-
+    if (!parseDoubleArrayField(content, "ratio", &ratio_coeffs, error_out)) return false;
     std::vector<double> severity_coeffs;
-    if (!parseDoubleArrayField(content, "severity", &severity_coeffs, error_out)) {
-        return false;
-    }
-
+    if (!parseDoubleArrayField(content, "severity", &severity_coeffs, error_out)) return false;
     std::vector<double> trimmed_ratio_coeffs;
-    if (!parseDoubleArrayField(content, "trimmed_ratio", &trimmed_ratio_coeffs, error_out)) {
-        return false;
-    }
+    if (!parseDoubleArrayField(content, "trimmed_ratio", &trimmed_ratio_coeffs, error_out)) return false;
 
     double ma_coeff = 0.0;
     bool ma_present = false;
-    if (!parseDoubleField(content, "ma", false, &ma_coeff, &ma_present, error_out)) {
-        return false;
-    }
+    if (!parseDoubleField(content, "ma", false, &ma_coeff, &ma_present, error_out)) return false;
 
     std::uint64_t staleness_window = 0;
     bool staleness_found = false;
     if (!parseUint64Field(content, "staleness_window_ms", false, &staleness_window, &staleness_found, error_out)) {
         return false;
     }
-    if (!staleness_found) {
-        staleness_window = 500;
+    if (!staleness_found) staleness_window = 500;
+    if (staleness_window == 0) staleness_window = 1;
+
+    double width_temp = kDefaultWidthTemperatureMillicPerStep;
+    bool width_temp_present = false;
+    if (!parseDoubleField(content, "width_temperature_millic_per_step", false,
+                          &width_temp, &width_temp_present, error_out)) {
+        return false;
     }
-    if (staleness_window == 0) {
-        staleness_window = 1;
+    if (width_temp_present && width_temp < 0.0) {
+        if (error_out) *error_out = "width_temperature_millic_per_step must be non-negative";
+        return false;
+    }
+
+    double width_perf = kDefaultWidthPerformanceBenefitMilliPerStep;
+    bool width_perf_present = false;
+    if (!parseDoubleField(content, "width_performance_benefit_milli_per_step", false,
+                          &width_perf, &width_perf_present, error_out)) {
+        return false;
+    }
+    if (width_perf_present && width_perf < 0.0) {
+        if (error_out) *error_out = "width_performance_benefit_milli_per_step must be non-negative";
+        return false;
     }
 
     bias_ = bias;
@@ -294,16 +249,14 @@ bool ARXModel::parseContent(const std::string &content, std::string *error_out) 
     ma_coefficient_ = ma_coeff;
     ma_enabled_ = ma_present;
     staleness_window_ms_ = staleness_window;
+    width_temperature_millic_per_step_ = width_temp;
+    width_performance_benefit_milli_per_step_ = width_perf;
     return true;
 }
 
 double ARXModel::predict(const std::deque<TelemetrySample> &history, bool *ok) const {
-    if (ok) {
-        *ok = false;
-    }
-    if (!coefficients_loaded_ || history.size() < required_history_) {
-        return 0.0;
-    }
+    if (ok) *ok = false;
+    if (!coefficients_loaded_ || history.size() < required_history_) return 0.0;
 
     std::size_t size = history.size();
     double prediction = bias_;
@@ -311,48 +264,39 @@ double ARXModel::predict(const std::deque<TelemetrySample> &history, bool *ok) c
 
     for (std::size_t i = 0; i < temperature_coeffs_.size(); ++i) {
         const TelemetrySample &sample = history[size - 1 - i];
-        if (!sample.temp_valid) {
-            /* Missing required thermal lag is not a zero-degree observation. */
-            return 0.0;
-        }
+        if (!sample.temp_valid) return 0.0;
         prediction += temperature_coeffs_[i] * sample.temperature_millic;
         used_temperature = true;
     }
-
     for (std::size_t i = 0; i < ratio_coeffs_.size(); ++i) {
         const TelemetrySample &sample = history[size - 1 - i];
         double ratio = sample.trimmed_ratio_milli > 0.0 ? sample.trimmed_ratio_milli : sample.ratio_milli;
         prediction += ratio_coeffs_[i] * ratio;
     }
-
     for (std::size_t i = 0; i < severity_coeffs_.size(); ++i) {
         const TelemetrySample &sample = history[size - 1 - i];
         prediction += severity_coeffs_[i] * sample.severity_milli;
     }
-
     for (std::size_t i = 0; i < trimmed_ratio_coeffs_.size(); ++i) {
         const TelemetrySample &sample = history[size - 1 - i];
         prediction += trimmed_ratio_coeffs_[i] * sample.trimmed_ratio_milli;
     }
 
-    if (!used_temperature || !std::isfinite(prediction)) {
-        return 0.0;
-    }
-
+    if (!used_temperature || !std::isfinite(prediction)) return 0.0;
     if (ma_enabled_ && residual_valid_) {
         prediction += ma_coefficient_ * last_residual_;
-        if (!std::isfinite(prediction)) {
-            return 0.0;
-        }
+        if (!std::isfinite(prediction)) return 0.0;
     }
-
-    if (ok) {
-        *ok = true;
-    }
+    if (ok) *ok = true;
     return prediction;
 }
 
 void ARXModel::updateResidual(double residual) {
+    if (!std::isfinite(residual)) {
+        residual_valid_ = false;
+        last_residual_ = 0.0;
+        return;
+    }
     last_residual_ = residual;
     residual_valid_ = true;
 }

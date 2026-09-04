@@ -18,7 +18,6 @@ static void tsd_stress_setenv(const char *key, const char *value) {
 
 int tsd_stress_prepare_runtime(void) {
     tsd_stress_setenv("TSD_FAKE_PERF", "1");
-    tsd_stress_setenv("TSD_ALLOW_SOFTWARE_UPGRADES", "1");
     tsd_test_reset_runtime();
     tsd_test_reset_workload_counter();
     tsd_test_set_policy_counts(1, 1);
@@ -61,7 +60,6 @@ void tsd_stress_teardown_runtime(void) {
     tsd_test_set_fake_telemetry(NULL, 0);
     tsd_test_clear_detect_override();
     tsd_stress_clear_env("TSD_FAKE_PERF");
-    tsd_stress_clear_env("TSD_ALLOW_SOFTWARE_UPGRADES");
 }
 
 int tsd_stress_patch(simd_width_t width) {

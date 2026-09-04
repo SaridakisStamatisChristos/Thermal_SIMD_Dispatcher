@@ -61,6 +61,7 @@ set(THERMAL_SIMD_CORE_SOURCES
     src/config/runtime_flags.c
     src/dispatch/adaptive_dispatch.c
     src/runtime_guard.c
+    src/workload_counter.c
     src/logging.c
     src/config_parser.c
     src/third_party/jsmn.c
@@ -82,6 +83,7 @@ set(THERMAL_SIMD_CORE_SOURCES
     src/thermal_config.c
     src/thermal_cpu.c
     src/patcher/trampoline.cpp
+    src/patcher/trampoline_state.c
     src/patcher/trampoline_guard.c
     src/thermal_perf.c
     src/thermal_signals.c

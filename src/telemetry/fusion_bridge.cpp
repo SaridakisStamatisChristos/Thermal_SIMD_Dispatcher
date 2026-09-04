@@ -1,11 +1,15 @@
 #include <thermal/simd/telemetry_fusion.h>
 
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cmath>
+#include <exception>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <optional>
+#include <system_error>
 
 #include <observability/telemetry_state.h>
 #include <telemetry/bus.h>
@@ -14,6 +18,8 @@
 #include <thermal/simd/logging.h>
 #include <thermal/simd/thermal_config.h>
 #include <thermal/simd/thermal_trampoline.h>
+
+#include "../runtime_guard_internal.h"
 
 namespace {
 
@@ -140,7 +146,7 @@ bool publish_sample_unlocked(const tsd_telemetry_sample_t &sample) {
 bool raw_is_fresh(std::chrono::steady_clock::time_point timestamp,
                   std::chrono::steady_clock::time_point now) {
     if (timestamp.time_since_epoch().count() == 0) return false;
-    return now - timestamp <= freshness_window();
+    return now >= timestamp && now - timestamp <= freshness_window();
 }
 
 void copy_raw_cache_unlocked(tsd_telemetry_sample_t *out,
@@ -194,10 +200,24 @@ void update_temperature_observability_unlocked(const tsd_telemetry_sample_t &sam
 }
 
 void update_temperature_gate_unlocked(bool raw_temperature_available) {
-    g_temperature_upgrade_allowed.store(raw_temperature_available, std::memory_order_release);
+    /* The gate bit is itself part of wide-width authorization. Publish it under
+     * the same write-side safety lock used by telemetry guard state. */
+    if (tsd_runtime_safety_write_enter() == 0) {
+        g_temperature_upgrade_allowed.store(raw_temperature_available, std::memory_order_release);
+        tsd_runtime_safety_write_leave();
+    } else {
+        /* A lock failure must never create permission to upgrade. */
+        g_temperature_upgrade_allowed.store(false, std::memory_order_release);
+        raw_temperature_available = false;
+    }
+
+    /* Global selection is also driven back to the conservative slot. The
+     * effective execution path is already fail-closed as soon as the gate bit
+     * above becomes false, so this best-effort selector update cannot create an
+     * unsafe entry window. */
     if (!raw_temperature_available &&
-        std::atomic_load_explicit(&g_tsd_trampoline_initialized, std::memory_order_acquire) != 0 &&
-        std::atomic_load_explicit(&g_tsd_current_width, std::memory_order_acquire) != SIMD_SSE41) {
+        tsd_trampoline_state_initialized() != 0 &&
+        tsd_trampoline_state_current_width() != SIMD_SSE41) {
         (void)tsd_trampoline_patch(SIMD_SSE41);
     }
 }
@@ -213,47 +233,99 @@ void reset_signal_state_unlocked() {
     g_raw_freq_at = {};
 }
 
+void rollback_start_unlocked() noexcept {
+    try {
+        if (g_fusion) g_fusion->stop();
+    } catch (...) {
+    }
+    g_fusion.reset();
+    g_manager.reset();
+    if (g_direct_helper_ready) {
+        tsd_telemetry_helper_destroy(&g_direct_helper);
+        g_direct_helper_ready = false;
+    }
+    g_fusion_users = 0;
+    g_fusion_cpu = -1;
+    reset_signal_state_unlocked();
+    g_fusion_running.store(false, std::memory_order_release);
+    if (tsd_runtime_safety_write_enter() == 0) {
+        g_temperature_upgrade_allowed.store(true, std::memory_order_release);
+        tsd_runtime_safety_write_leave();
+    }
+    tsd_temperature_channels_t channels{};
+    tsd_observability_update_temperature_channels(&channels);
+}
+
 int start_unlocked(int cpu) {
-    if (cpu < 0) return -1;
+    if (cpu < 0) {
+        errno = EINVAL;
+        return -1;
+    }
 
     if (runtime_config_initialized() && g_tsd_config.telemetry_profile_path[0] != '\0') {
         tsd_log_error("telemetry",
                       "telemetry profile manifests are not implemented; refusing fusion startup for profile=%s",
                       g_tsd_config.telemetry_profile_path);
+        errno = ENOTSUP;
         return -1;
     }
 
     if (g_fusion && g_fusion->running()) {
-        if (cpu != g_fusion_cpu) return -1;
+        if (cpu != g_fusion_cpu) {
+            errno = EBUSY;
+            return -1;
+        }
         ++g_fusion_users;
         return 0;
     }
 
-    g_manager = std::make_shared<telemetry::TelemetryBusManager>();
-    telemetry::TelemetryFusionConfig config = default_config();
-    g_fusion = std::make_unique<telemetry::TelemetryFusion>(config, g_manager);
+    try {
+        g_manager = std::make_shared<telemetry::TelemetryBusManager>();
+        telemetry::TelemetryFusionConfig config = default_config();
+        g_fusion = std::make_unique<telemetry::TelemetryFusion>(config, g_manager);
 
-    reset_signal_state_unlocked();
-    g_direct_helper_ready = direct_helper_enabled() && tsd_telemetry_helper_init(&g_direct_helper, cpu) == 0;
-    g_fusion_cpu = cpu;
-    g_fusion->start();
-    g_fusion_users = 1;
-    g_fusion_running.store(true, std::memory_order_release);
+        reset_signal_state_unlocked();
+        g_direct_helper_ready = direct_helper_enabled() && tsd_telemetry_helper_init(&g_direct_helper, cpu) == 0;
+        g_fusion_cpu = cpu;
+        g_fusion->start();
+        g_fusion_users = 1;
+        g_fusion_running.store(true, std::memory_order_release);
 
-    tsd_telemetry_sample_t initial{};
-    bool has_raw_temp = false;
-    if (g_direct_helper_ready && tsd_telemetry_helper_sample(&g_direct_helper, &initial) == 0) {
-        if (initial.temp_available || initial.freq_ratio_available) (void)publish_sample_unlocked(initial);
-        has_raw_temp = initial.temp_available != 0;
-        if (initial.temp_available && g_smoothed_temp_c.has_value()) {
-            initial.filtered_temp_available = 1;
-            initial.filtered_package_temp_millic =
-                static_cast<int32_t>(std::llround(*g_smoothed_temp_c * 1000.0));
+        tsd_telemetry_sample_t initial{};
+        bool has_raw_temp = false;
+        if (g_direct_helper_ready && tsd_telemetry_helper_sample(&g_direct_helper, &initial) == 0) {
+            if (initial.temp_available || initial.freq_ratio_available) (void)publish_sample_unlocked(initial);
+            has_raw_temp = initial.temp_available != 0;
+            if (initial.temp_available && g_smoothed_temp_c.has_value()) {
+                initial.filtered_temp_available = 1;
+                initial.filtered_package_temp_millic =
+                    static_cast<int32_t>(std::llround(*g_smoothed_temp_c * 1000.0));
+            }
+            update_temperature_observability_unlocked(initial);
         }
-        update_temperature_observability_unlocked(initial);
+        update_temperature_gate_unlocked(has_raw_temp);
+        return 0;
+    } catch (const std::bad_alloc &) {
+        rollback_start_unlocked();
+        errno = ENOMEM;
+        tsd_log_error("telemetry", "fusion startup failed: allocation failure");
+        return -1;
+    } catch (const std::system_error &ex) {
+        rollback_start_unlocked();
+        errno = ex.code().value() > 0 ? ex.code().value() : EAGAIN;
+        tsd_log_error("telemetry", "fusion startup failed: %s", ex.what());
+        return -1;
+    } catch (const std::exception &ex) {
+        rollback_start_unlocked();
+        errno = EIO;
+        tsd_log_error("telemetry", "fusion startup failed: %s", ex.what());
+        return -1;
+    } catch (...) {
+        rollback_start_unlocked();
+        errno = EIO;
+        tsd_log_error("telemetry", "fusion startup failed: unknown C++ exception");
+        return -1;
     }
-    update_temperature_gate_unlocked(has_raw_temp);
-    return 0;
 }
 
 }  // namespace
@@ -263,75 +335,117 @@ extern "C" int tsd_telemetry_fusion_start(void) {
 }
 
 extern "C" int tsd_telemetry_fusion_start_for_cpu(int cpu) {
-    std::lock_guard<std::mutex> lock(g_fusion_mutex);
-    return start_unlocked(cpu);
+    try {
+        std::lock_guard<std::mutex> lock(g_fusion_mutex);
+        return start_unlocked(cpu);
+    } catch (...) {
+        errno = EIO;
+        return -1;
+    }
 }
 
 extern "C" void tsd_telemetry_fusion_stop(void) {
-    std::lock_guard<std::mutex> lock(g_fusion_mutex);
-    if (g_fusion_users > 1) {
-        --g_fusion_users;
-        return;
+    try {
+        std::lock_guard<std::mutex> lock(g_fusion_mutex);
+        if (g_fusion_users > 1) {
+            --g_fusion_users;
+            return;
+        }
+        g_fusion_users = 0;
+        if (g_fusion) {
+            try {
+                g_fusion->stop();
+            } catch (const std::exception &ex) {
+                tsd_log_error("telemetry", "fusion stop failed: %s", ex.what());
+            } catch (...) {
+                tsd_log_error("telemetry", "fusion stop failed: unknown C++ exception");
+            }
+            g_fusion.reset();
+        }
+        g_manager.reset();
+        if (g_direct_helper_ready) {
+            tsd_telemetry_helper_destroy(&g_direct_helper);
+            g_direct_helper_ready = false;
+        }
+        g_fusion_cpu = -1;
+        reset_signal_state_unlocked();
+        g_fusion_running.store(false, std::memory_order_release);
+        if (tsd_runtime_safety_write_enter() == 0) {
+            g_temperature_upgrade_allowed.store(true, std::memory_order_release);
+            tsd_runtime_safety_write_leave();
+        }
+        tsd_temperature_channels_t channels{};
+        tsd_observability_update_temperature_channels(&channels);
+    } catch (...) {
+        /* C ABI: never allow a C++ exception to escape a teardown routine. */
     }
-    g_fusion_users = 0;
-    if (g_fusion) {
-        g_fusion->stop();
-        g_fusion.reset();
-    }
-    g_manager.reset();
-    if (g_direct_helper_ready) {
-        tsd_telemetry_helper_destroy(&g_direct_helper);
-        g_direct_helper_ready = false;
-    }
-    g_fusion_cpu = -1;
-    reset_signal_state_unlocked();
-    g_fusion_running.store(false, std::memory_order_release);
-    g_temperature_upgrade_allowed.store(true, std::memory_order_release);
-    tsd_temperature_channels_t channels{};
-    tsd_observability_update_temperature_channels(&channels);
 }
 
 extern "C" int tsd_telemetry_fusion_publish_sample(const tsd_telemetry_sample_t *sample) {
-    if (!sample) return -1;
-    std::lock_guard<std::mutex> lock(g_fusion_mutex);
-    if (!g_fusion || !g_manager) return -1;
-    bool published = publish_sample_unlocked(*sample);
-    const auto now = std::chrono::steady_clock::now();
-    tsd_telemetry_sample_t safety{};
-    copy_raw_cache_unlocked(&safety, now);
-    if (g_smoothed_temp_c.has_value()) {
-        safety.filtered_temp_available = 1;
-        safety.filtered_package_temp_millic =
-            static_cast<int32_t>(std::llround(*g_smoothed_temp_c * 1000.0));
+    if (!sample) {
+        errno = EINVAL;
+        return -1;
     }
-    update_temperature_observability_unlocked(safety);
-    update_temperature_gate_unlocked(safety.temp_available != 0);
-    return published ? 0 : -1;
+    try {
+        std::lock_guard<std::mutex> lock(g_fusion_mutex);
+        if (!g_fusion || !g_manager) {
+            errno = ENODEV;
+            return -1;
+        }
+        bool published = publish_sample_unlocked(*sample);
+        const auto now = std::chrono::steady_clock::now();
+        tsd_telemetry_sample_t safety{};
+        copy_raw_cache_unlocked(&safety, now);
+        if (g_smoothed_temp_c.has_value()) {
+            safety.filtered_temp_available = 1;
+            safety.filtered_package_temp_millic =
+                static_cast<int32_t>(std::llround(*g_smoothed_temp_c * 1000.0));
+        }
+        update_temperature_observability_unlocked(safety);
+        update_temperature_gate_unlocked(safety.temp_available != 0);
+        if (!published) errno = ENODATA;
+        return published ? 0 : -1;
+    } catch (...) {
+        errno = EIO;
+        return -1;
+    }
 }
 
 extern "C" int tsd_telemetry_fusion_sample(tsd_telemetry_sample_t *out) {
-    if (!out) return -1;
-    *out = tsd_telemetry_sample_t{};
-    std::lock_guard<std::mutex> lock(g_fusion_mutex);
-    if (!g_fusion) return -1;
-
-    tsd_telemetry_sample_t direct{};
-    if (g_direct_helper_ready && tsd_telemetry_helper_sample(&g_direct_helper, &direct) == 0 &&
-        (direct.temp_available || direct.freq_ratio_available)) {
-        (void)publish_sample_unlocked(direct);
+    if (!out) {
+        errno = EINVAL;
+        return -1;
     }
+    *out = tsd_telemetry_sample_t{};
+    try {
+        std::lock_guard<std::mutex> lock(g_fusion_mutex);
+        if (!g_fusion) {
+            errno = ENODEV;
+            return -1;
+        }
 
-    auto snapshot = g_fusion->latest_snapshot();
-    bool filtered_usable = snapshot && copy_filtered_snapshot(*snapshot, out);
+        tsd_telemetry_sample_t direct{};
+        if (g_direct_helper_ready && tsd_telemetry_helper_sample(&g_direct_helper, &direct) == 0 &&
+            (direct.temp_available || direct.freq_ratio_available)) {
+            (void)publish_sample_unlocked(direct);
+        }
 
-    const auto now = std::chrono::steady_clock::now();
-    copy_raw_cache_unlocked(out, now);
-    fill_filtered_from_raw(out);
+        auto snapshot = g_fusion->latest_snapshot();
+        bool filtered_usable = snapshot && copy_filtered_snapshot(*snapshot, out);
 
-    update_temperature_observability_unlocked(*out);
-    update_temperature_gate_unlocked(out->temp_available != 0);
-    bool raw_usable = out->temp_available || out->freq_ratio_available;
-    return (raw_usable || filtered_usable) ? 0 : -1;
+        const auto now = std::chrono::steady_clock::now();
+        copy_raw_cache_unlocked(out, now);
+        fill_filtered_from_raw(out);
+
+        update_temperature_observability_unlocked(*out);
+        update_temperature_gate_unlocked(out->temp_available != 0);
+        bool raw_usable = out->temp_available || out->freq_ratio_available;
+        if (!raw_usable && !filtered_usable) errno = ENODATA;
+        return (raw_usable || filtered_usable) ? 0 : -1;
+    } catch (...) {
+        errno = EIO;
+        return -1;
+    }
 }
 
 extern "C" int tsd_telemetry_temperature_upgrade_allowed(void) {
@@ -341,7 +455,10 @@ extern "C" int tsd_telemetry_temperature_upgrade_allowed(void) {
 
 #ifdef TSD_ENABLE_TESTS
 extern "C" void tsd_telemetry_fusion_test_disable_direct_helper(int disabled) {
-    std::lock_guard<std::mutex> lock(g_fusion_mutex);
-    g_test_disable_direct_helper = disabled != 0;
+    try {
+        std::lock_guard<std::mutex> lock(g_fusion_mutex);
+        g_test_disable_direct_helper = disabled != 0;
+    } catch (...) {
+    }
 }
 #endif

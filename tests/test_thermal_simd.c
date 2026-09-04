@@ -32,7 +32,6 @@ static int run_monitor_thread_scenario(void) {
     perf_ctx_t *ctx = NULL;
 
     setenv("TSD_FAKE_PERF", "1", 1);
-    setenv("TSD_ALLOW_SOFTWARE_UPGRADES", "1", 1);
     tsd_test_reset_runtime();
     tsd_test_set_policy_counts(1, 1);
     tsd_test_set_timing(1000, 1, 1, 1);
@@ -65,6 +64,7 @@ static int run_monitor_thread_scenario(void) {
     tsd_runtime_config_exit_degraded_mode(&g_tsd_config, "tests");
     g_tsd_config.degraded_policy_active = 0;
     tsd_test_measure_baseline(ctx);
+    tsd_test_perf_set_mode(ctx, TSD_PERF_MODE_HARDWARE);
 
     /*
      * The production runtime now treats package temperature as explicit
@@ -144,7 +144,6 @@ out:
     tsd_test_set_fake_telemetry(NULL, 0);
     tsd_test_clear_patch_overrides();
     unsetenv("TSD_FAKE_PERF");
-    unsetenv("TSD_ALLOW_SOFTWARE_UPGRADES");
     return rc;
 }
 

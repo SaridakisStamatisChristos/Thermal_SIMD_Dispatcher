@@ -128,8 +128,8 @@ If the primary group cannot be read, returns an invalid layout, or repeatedly st
 
 1. closes the invalid perf descriptors;
 2. enters software/degraded mode;
-3. fails closed to SSE4.1 by default;
-4. continuously denies wider SIMD while software mode remains active unless `TSD_ALLOW_SOFTWARE_UPGRADES` is explicitly enabled;
+3. fails closed to SSE4.1;
+4. continuously denies wider SIMD for the entire time software mode remains active;
 5. publishes unhealthy perf state for readiness;
 6. schedules a hardware re-probe.
 
