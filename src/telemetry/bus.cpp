@@ -10,23 +10,42 @@ TelemetryBus::TelemetryBus() = default;
 
 void TelemetryBus::publish(TelemetrySignal signal, const TelemetryReading &reading) {
     std::lock_guard<std::mutex> lock(mutex_);
-    auto &slot = readings_[signal];
+    const std::string key = reading.source.empty() ? std::string("default") : reading.source;
+    auto &slot = readings_[signal][key];
 
-    /* Freshness is authoritative. A newer invalid observation must invalidate
-     * an older good sample; otherwise sensor loss is hidden until the stale
-     * reading ages out. Quality is only a tie-breaker at equal timestamps. */
+    /* Each producer owns its own time series. Newer invalid data invalidates
+     * only that source instead of erasing another healthy sensor. */
     if (slot.timestamp.time_since_epoch().count() == 0 ||
         reading.timestamp > slot.timestamp ||
-        (reading.timestamp == slot.timestamp && reading.quality > slot.quality)) {
+        (reading.timestamp == slot.timestamp && reading.quality >= slot.quality)) {
         slot = reading;
+        if (slot.source.empty()) slot.source = key;
     }
 }
 
-std::optional<TelemetryReading> TelemetryBus::latest(TelemetrySignal signal) const {
+std::vector<TelemetryReading> TelemetryBus::readings(TelemetrySignal signal) const {
     std::lock_guard<std::mutex> lock(mutex_);
+    std::vector<TelemetryReading> result;
     auto it = readings_.find(signal);
-    if (it == readings_.end()) return std::nullopt;
-    return it->second;
+    if (it == readings_.end()) return result;
+    result.reserve(it->second.size());
+    for (const auto &entry : it->second) result.push_back(entry.second);
+    return result;
+}
+
+std::optional<TelemetryReading> TelemetryBus::latest(TelemetrySignal signal) const {
+    auto candidates = readings(signal);
+    std::optional<TelemetryReading> best;
+    for (const auto &reading : candidates) {
+        if (!best.has_value() ||
+            (reading.valid && !best->valid) ||
+            (reading.valid == best->valid && reading.timestamp > best->timestamp) ||
+            (reading.valid == best->valid && reading.timestamp == best->timestamp &&
+             reading.quality > best->quality)) {
+            best = reading;
+        }
+    }
+    return best;
 }
 
 TelemetryBusManager::TelemetryBusManager() = default;
