@@ -318,7 +318,7 @@ static int run_perf_read_retry_test(void) {
     memset(&eval, 0, sizeof(eval));
     triggered = tsd_perf_evaluate(ctx, &eval, NULL);
     tsd_test_perf_clear_read_streams();
-    if (triggered != 0 || eval.cpi_milli != 1000 ||
+    if (triggered != 0 || eval.performance_available != 0 || eval.cpi_milli != 0 ||
         tsd_test_perf_get_last_llc_value(ctx) != llc_stable) {
         fprintf(stderr, "stable partial group read verification failed\n");
         rc = 1;
@@ -355,7 +355,7 @@ static int run_perf_read_retry_test(void) {
 
     if (!tsd_test_perf_get_last_group_valid(ctx) ||
         tsd_test_perf_get_last_llc_value(ctx) != llc_hot ||
-        eval.cpi_milli != 2000 || triggered == 0) {
+        eval.performance_available != 0 || eval.cpi_milli != 0 || triggered != 0) {
         fprintf(stderr, "hot partial group read verification failed\n");
         rc = 1;
     }

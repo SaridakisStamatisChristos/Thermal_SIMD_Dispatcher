@@ -1150,7 +1150,11 @@ int tsd_perf_evaluate(perf_ctx_t *ctx, tsd_thermal_eval_t *out, const tsd_runtim
         }
         tsd_telemetry_sample_t telemetry = {0};
         fetch_fused_telemetry(ctx, &telemetry);
-        return process_measurement(ctx, out, software_cost_milli, 0, 0, cfg, &telemetry);
+        int software_rc = process_measurement(ctx, out, software_cost_milli, 0, 0, cfg, &telemetry);
+        /* Software mode is a fail-closed observability domain, never an
+         * authority for normal width optimization or predictive history. */
+        if (out) out->performance_available = 0;
+        return software_rc;
     }
 
     if (ctx->mode != TSD_PERF_MODE_HARDWARE || !ctx->hardware_validated) {
@@ -1237,6 +1241,35 @@ int tsd_perf_evaluate(perf_ctx_t *ctx, tsd_thermal_eval_t *out, const tsd_runtim
     uint64_t current_work_cost_milli = delta_work
         ? (uint64_t)(((__uint128_t)delta_cycles * 1000u) / delta_work)
         : 0;
+
+    if (!ctx->workload && delta_work == 0) {
+        /* In registered-dispatch mode, owner-thread instructions with no
+         * completed registered work are not workload performance evidence.
+         * Advance the perf cursors so idle/unrelated cycles cannot leak into
+         * the next real work sample, while still exporting raw safety telemetry
+         * for the admission gate and emergency-temperature path. */
+        ctx->last_group_read = rd_now;
+        ctx->last_llc_value = llc_now;
+        publish_perf_state(ctx, 1);
+
+        tsd_telemetry_sample_t telemetry = {0};
+        fetch_fused_telemetry(ctx, &telemetry);
+        if (out) {
+            out->performance_available = 0;
+            out->work_normalized = 0;
+            out->work_cost_milli = 0;
+            out->temp_available = telemetry.temp_available;
+            out->freq_ratio_available = telemetry.freq_ratio_available;
+            out->package_temp_millic = telemetry.package_temp_millic;
+            out->freq_ratio_milli = telemetry.freq_ratio_milli;
+            out->filtered_temp_available = telemetry.filtered_temp_available;
+            out->filtered_freq_ratio_available = telemetry.filtered_freq_ratio_available;
+            out->filtered_package_temp_millic = telemetry.filtered_package_temp_millic;
+            out->filtered_freq_ratio_milli = telemetry.filtered_freq_ratio_milli;
+        }
+        return 0;
+    }
+
     uint64_t delta_llc = (ctx->fd_llc_misses >= 0 && llc_now >= ctx->last_llc_value)
                              ? (llc_now - ctx->last_llc_value)
                              : 0;
