@@ -10,6 +10,7 @@ permissions:
 
 jobs:
   transform-and-validate:
+    if: github.event_name != 'push' || github.event.head_commit.message != 'Complete final safety and liveness hardening'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout hardening branch
@@ -106,9 +107,10 @@ jobs:
       - name: Validate legacy build
         run: make -j2
 
-      - name: Remove one-shot transformer
+      - name: Prepare source-only commit
         run: |
-          rm -f ci/_apply_final_hardening.py .github/workflows/_apply_final_hardening.yml
+          rm -f ci/_apply_final_hardening.py
+          git checkout -- .github/workflows/quality.yml
 
       - name: Commit validated hardening
         run: |
