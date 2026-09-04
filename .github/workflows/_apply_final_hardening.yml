@@ -1,0 +1,64 @@
+name: Apply Final Hardening
+
+on:
+  push:
+    branches: [ fix/final-safety-liveness-hardening ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  transform-and-validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout hardening branch
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: fix/final-safety-liveness-hardening
+          fetch-depth: 0
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang cmake ninja-build libssl-dev
+
+      - name: Apply exact source transformations
+        run: |
+          python3 ci/_apply_final_hardening.py
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('src/healthcheck/sandbox.cpp')
+          s = p.read_text(encoding='utf-8')
+          if '#include <new>' not in s:
+              s = s.replace('#include <exception>\n', '#include <exception>\n#include <new>\n', 1)
+          p.write_text(s, encoding='utf-8')
+          PY
+
+      - name: Configure GCC Debug
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTING=ON -DTSD_BUILD_BENCHMARKS=ON
+
+      - name: Build all
+        run: cmake --build build -j2
+
+      - name: Run full test suite
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Validate legacy build
+        run: make -j2
+
+      - name: Remove one-shot transformer
+        run: |
+          rm -f ci/_apply_final_hardening.py .github/workflows/_apply_final_hardening.yml
+
+      - name: Commit validated hardening
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No transformed changes to commit"
+            exit 0
+          fi
+          git commit -m "Complete final safety and liveness hardening"
+          git push origin HEAD:fix/final-safety-liveness-hardening
