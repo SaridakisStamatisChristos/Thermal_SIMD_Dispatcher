@@ -26,29 +26,39 @@ struct tsd_kernel_dispatch_v2 {
 
 struct execution_cleanup {
     simd_width_t width;
-    int previous_cancel_state;
-    int restore_cancel_state;
 };
 
 static void execution_cleanup_handler(void *opaque) {
     struct execution_cleanup *cleanup = (struct execution_cleanup *)opaque;
     if (!cleanup) return;
 
-    /* Release admission accounting before re-enabling cancellation. A pending
-     * cancellation may take effect as soon as the old state is restored. */
+    /* POSIX runs cancellation cleanup with cancellation disabled and requires
+     * it to remain disabled through thread termination. Never change the
+     * caller's cancellation state from a cleanup handler; only release the
+     * admission accounting that protects wide execution. */
     tsd_runtime_execution_leave(cleanup->width);
-    if (cleanup->restore_cancel_state) {
-        (void)pthread_setcancelstate(cleanup->previous_cancel_state, NULL);
-    }
 }
 
 static int cancel_disable(int *previous_state) {
-    if (!previous_state) return 0;
-    return pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, previous_state) == 0;
+    if (!previous_state) {
+        errno = EINVAL;
+        return -1;
+    }
+    int rc = pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, previous_state);
+    if (rc != 0) {
+        errno = rc;
+        return -1;
+    }
+    return 0;
 }
 
-static void cancel_restore_if_needed(int restore, int previous_state) {
-    if (restore) (void)pthread_setcancelstate(previous_state, NULL);
+static int cancel_set_state(int state) {
+    int rc = pthread_setcancelstate(state, NULL);
+    if (rc != 0) {
+        errno = rc;
+        return -1;
+    }
+    return 0;
 }
 
 static simd_width_t detect_host_max(void) {
@@ -167,27 +177,60 @@ int tsd_kernel_dispatch_execute(tsd_kernel_dispatch_t *dispatch,
     tsd_kernel_fn fn = NULL;
     simd_width_t actual = SIMD_SSE41;
     int previous_cancel_state = PTHREAD_CANCEL_ENABLE;
-    int restore_cancel_state = cancel_disable(&previous_cancel_state);
+    if (cancel_disable(&previous_cancel_state) != 0) return -1;
 
     if (resolve_internal(dispatch, &actual, &fn) != 0 || !fn) {
-        cancel_restore_if_needed(restore_cancel_state, previous_cancel_state);
+        int saved_errno = errno;
+        (void)cancel_set_state(previous_cancel_state);
+        errno = saved_errno;
         return -1;
     }
     if (enter_or_fallback_v1(dispatch, &actual, &fn) != 0) {
-        cancel_restore_if_needed(restore_cancel_state, previous_cancel_state);
+        int saved_errno = errno;
+        (void)cancel_set_state(previous_cancel_state);
+        errno = saved_errno;
         return -1;
     }
 
-    struct execution_cleanup cleanup = {
-        .width = actual,
-        .previous_cancel_state = previous_cancel_state,
-        .restore_cancel_state = restore_cancel_state,
-    };
+    struct execution_cleanup cleanup = {.width = actual};
+    int callback_completed = 0;
+    int callback_cleanup_disabled = 0;
+    int callback_cleanup_errno = 0;
+
     pthread_cleanup_push(execution_cleanup_handler, &cleanup);
-    fn(dispatch->variants.context, work_items);
-    account_completed_work(work_items);
-    if (used_width) *used_width = actual;
+
+    /* The handler is installed before re-enabling cancellation. A cancellation
+     * already pending on entry can therefore take effect immediately without
+     * stranding wide-execution accounting. */
+    if (cancel_set_state(previous_cancel_state) == 0) {
+        fn(dispatch->variants.context, work_items);
+
+        /* Protect the normal post-callback accounting/pop sequence from an
+         * asynchronous cancellation. If cancellation lands before this call,
+         * the registered cleanup handler still releases admission. */
+        if (cancel_disable(&callback_cleanup_disabled) == 0) {
+            account_completed_work(work_items);
+            if (used_width) *used_width = actual;
+            callback_completed = 1;
+        } else {
+            callback_cleanup_errno = errno;
+        }
+    } else {
+        callback_cleanup_errno = errno;
+    }
+
     pthread_cleanup_pop(1);
+
+    if (!callback_completed) {
+        int saved_errno = callback_cleanup_errno ? callback_cleanup_errno : EIO;
+        (void)cancel_set_state(previous_cancel_state);
+        errno = saved_errno;
+        return -1;
+    }
+
+    /* Admission is already released. A pending deferred cancellation may be
+     * delivered here, which is safe because no dispatcher accounting remains. */
+    if (cancel_set_state(previous_cancel_state) != 0) return -1;
     return 0;
 }
 
@@ -297,30 +340,52 @@ int tsd_kernel_dispatch_v2_execute(tsd_kernel_dispatch_v2_t *dispatch,
     tsd_kernel_fn_v2 fn = NULL;
     simd_width_t actual = SIMD_SSE41;
     int previous_cancel_state = PTHREAD_CANCEL_ENABLE;
-    int restore_cancel_state = cancel_disable(&previous_cancel_state);
+    if (cancel_disable(&previous_cancel_state) != 0) return -1;
     int callback_rc = -1;
+    int callback_completed = 0;
+    int callback_cleanup_disabled = 0;
+    int callback_cleanup_errno = 0;
 
     if (resolve_v2_internal(dispatch, &actual, &fn) != 0 || !fn) {
-        cancel_restore_if_needed(restore_cancel_state, previous_cancel_state);
+        int saved_errno = errno;
+        (void)cancel_set_state(previous_cancel_state);
+        errno = saved_errno;
         return -1;
     }
     if (enter_or_fallback_v2(dispatch, &actual, &fn) != 0) {
-        cancel_restore_if_needed(restore_cancel_state, previous_cancel_state);
+        int saved_errno = errno;
+        (void)cancel_set_state(previous_cancel_state);
+        errno = saved_errno;
         return -1;
     }
 
-    struct execution_cleanup cleanup = {
-        .width = actual,
-        .previous_cancel_state = previous_cancel_state,
-        .restore_cancel_state = restore_cancel_state,
-    };
+    struct execution_cleanup cleanup = {.width = actual};
     pthread_cleanup_push(execution_cleanup_handler, &cleanup);
-    callback_rc = fn(dispatch->variants.context, offset, work_items);
-    if (callback_rc == 0) {
-        account_completed_work(work_items);
-        if (used_width) *used_width = actual;
+
+    if (cancel_set_state(previous_cancel_state) == 0) {
+        callback_rc = fn(dispatch->variants.context, offset, work_items);
+        if (cancel_disable(&callback_cleanup_disabled) == 0) {
+            if (callback_rc == 0) {
+                account_completed_work(work_items);
+                if (used_width) *used_width = actual;
+            }
+            callback_completed = 1;
+        } else {
+            callback_cleanup_errno = errno;
+        }
+    } else {
+        callback_cleanup_errno = errno;
     }
+
     pthread_cleanup_pop(1);
+
+    if (!callback_completed) {
+        int saved_errno = callback_cleanup_errno ? callback_cleanup_errno : EIO;
+        (void)cancel_set_state(previous_cancel_state);
+        errno = saved_errno;
+        return -1;
+    }
+    if (cancel_set_state(previous_cancel_state) != 0) return -1;
     return callback_rc;
 }
 
