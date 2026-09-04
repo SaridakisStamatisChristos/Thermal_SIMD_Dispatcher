@@ -4,6 +4,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -21,6 +22,8 @@ struct TelemetryReading {
     bool valid = false;
     int quality = 0;
     std::chrono::steady_clock::time_point timestamp{};
+    /* Stable producer identity. Empty means the legacy/default source. */
+    std::string source;
 };
 
 class TelemetryBus {
@@ -29,9 +32,11 @@ public:
 
     void publish(TelemetrySignal signal, const TelemetryReading &reading);
     std::optional<TelemetryReading> latest(TelemetrySignal signal) const;
+    std::vector<TelemetryReading> readings(TelemetrySignal signal) const;
 
 private:
-    using ReadingMap = std::unordered_map<TelemetrySignal, TelemetryReading>;
+    using SourceMap = std::unordered_map<std::string, TelemetryReading>;
+    using ReadingMap = std::unordered_map<TelemetrySignal, SourceMap>;
 
     mutable std::mutex mutex_;
     ReadingMap readings_;
