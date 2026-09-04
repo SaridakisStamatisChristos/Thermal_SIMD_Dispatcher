@@ -1,8 +1,13 @@
 #include <assert.h>
+#include <errno.h>
 #include <stdint.h>
 #include <stdio.h>
 
 #include <thermal/simd/policy/dispatcher_policy.h>
+#include <thermal/simd/thermal_config.h>
+
+/* Test-only hook emitted by the white-box policy build. */
+void tsd_dispatcher_policy_test_force_exception(int stage);
 
 static tsd_thermal_eval_t make_sample(uint32_t ratio_milli, int32_t temp_millic) {
     tsd_thermal_eval_t sample = {0};
@@ -115,7 +120,7 @@ static void test_missing_temperature_does_not_invent_thermal_relief(void) {
     tsd_dispatcher_policy_destroy(state);
 }
 
-static void test_predictive_fallback(void) {
+static void test_predictive_fallback_downgrades(void) {
     tsd_policy_config cfg;
     tsd_policy_config_set_defaults(&cfg);
     cfg.forecast_horizon = 3;
@@ -127,18 +132,86 @@ static void test_predictive_fallback(void) {
     simd_width_t target = SIMD_AVX2;
     int fallback = 0;
     int rc = tsd_dispatcher_policy_recommend(state, SIMD_AVX2, SIMD_AVX512, &target, &fallback);
-    assert(rc == 0);
+    assert(rc == 1);
     assert(fallback == 1);
-    assert(target == SIMD_AVX2);
+    assert(target == SIMD_SSE41);
+
+    tsd_dispatcher_policy_destroy(state);
+}
+
+static void test_invalid_runtime_temperature_limits_fail_closed(void) {
+    tsd_runtime_config_set_defaults(&g_tsd_config);
+    g_tsd_config.predictive_temp_ceiling_c = 0;
+
+    tsd_policy_config cfg;
+    tsd_policy_config_set_defaults(&cfg);
+    tsd_dispatcher_policy_state *state = tsd_dispatcher_policy_create(&cfg);
+    assert(state != NULL);
+
+    tsd_thermal_eval_t sample = make_sample(1200, 50000);
+    tsd_dispatcher_policy_record(state, &sample, SIMD_AVX2);
+
+    simd_width_t target = SIMD_AVX2;
+    int fallback = 0;
+    int rc = tsd_dispatcher_policy_recommend(state, SIMD_AVX2, SIMD_AVX512, &target, &fallback);
+    assert(rc == 1);
+    assert(target == SIMD_SSE41);
+
+    tsd_dispatcher_policy_destroy(state);
+    tsd_runtime_config_set_defaults(&g_tsd_config);
+}
+
+static void test_c_abi_exception_containment(void) {
+    tsd_policy_config cfg;
+    tsd_policy_config_set_defaults(&cfg);
+
+    errno = 0;
+    tsd_dispatcher_policy_test_force_exception(1);
+    assert(tsd_dispatcher_policy_create(&cfg) == NULL);
+    assert(errno == EIO);
+
+    tsd_dispatcher_policy_state *state = tsd_dispatcher_policy_create(&cfg);
+    assert(state != NULL);
+    tsd_thermal_eval_t sample = make_sample(1400, 70000);
+
+    errno = 0;
+    tsd_dispatcher_policy_test_force_exception(3);
+    tsd_dispatcher_policy_record(state, &sample, SIMD_AVX2);
+    assert(errno == EIO);
+
+    simd_width_t target = SIMD_AVX2;
+    int fallback = 0;
+    assert(tsd_dispatcher_policy_recommend(state, SIMD_AVX2, SIMD_AVX512, &target, &fallback) == 1);
+    assert(fallback == 1);
+    assert(target == SIMD_SSE41);
+
+    tsd_dispatcher_policy_reset(state, &cfg);
+    errno = 0;
+    tsd_dispatcher_policy_test_force_exception(4);
+    target = SIMD_AVX2;
+    fallback = 0;
+    assert(tsd_dispatcher_policy_recommend(state, SIMD_AVX2, SIMD_AVX512, &target, &fallback) == 1);
+    assert(errno == EIO);
+    assert(fallback == 1);
+    assert(target == SIMD_SSE41);
+
+    tsd_dispatcher_policy_reset(state, &cfg);
+    errno = 0;
+    tsd_dispatcher_policy_test_force_exception(5);
+    assert(tsd_dispatcher_policy_reload(state) == -1);
+    assert(errno == EIO);
 
     tsd_dispatcher_policy_destroy(state);
 }
 
 int main(void) {
+    tsd_runtime_config_set_defaults(&g_tsd_config);
     test_predictive_convergence();
     test_predictive_stability();
     test_missing_temperature_does_not_invent_thermal_relief();
-    test_predictive_fallback();
+    test_predictive_fallback_downgrades();
+    test_invalid_runtime_temperature_limits_fail_closed();
+    test_c_abi_exception_containment();
     printf("policy controller tests passed\n");
     return 0;
 }
