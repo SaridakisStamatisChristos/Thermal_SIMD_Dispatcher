@@ -60,6 +60,14 @@ typedef struct {
     tsd_policy_config policy;
 } tsd_runtime_config;
 
+/*
+ * Legacy process-global configuration retained for source/ABI compatibility.
+ * Configure it before starting the adaptive runtime; callers must not write it
+ * concurrently with a live runtime. Safety-critical thermal authorization and
+ * controller limits are captured per live runtime/control generation, so later
+ * accidental writes cannot relax those already-established safety bounds.
+ * Future integrations should treat this object as startup-only configuration.
+ */
 extern tsd_runtime_config g_tsd_config;
 
 /* Pure value initializers: these never modify process-global runtime state. */

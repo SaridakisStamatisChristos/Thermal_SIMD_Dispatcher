@@ -26,9 +26,7 @@ extern "C" {
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
-#include <iomanip>
 #include <mutex>
-#include <sstream>
 #include <vector>
 
 #include <openssl/sha.h>
@@ -591,18 +589,33 @@ int tsd_attestation_expect_active_hash(const uint8_t *expected, size_t len) {
         return -1;
     }
     if (std::memcmp(expected, g_active_hash.data(), TSD_ATTESTATION_HASH_SIZE) != 0) {
-        std::ostringstream oss;
-        oss << "attestation mismatch expected=";
-        for (size_t i = 0; i < TSD_ATTESTATION_HASH_SIZE; ++i) {
-            oss << std::hex << std::setfill('0') << std::setw(2) << static_cast<int>(expected[i]);
+        /* This is a public C ABI path. Keep mismatch formatting bounded and
+         * allocation-free so no C++ allocation exception can cross it. */
+        char message[192] = {0};
+        int used = std::snprintf(message, sizeof(message), "attestation mismatch expected=");
+        if (used < 0) used = 0;
+        size_t cursor = static_cast<size_t>(used);
+        for (size_t i = 0; i < TSD_ATTESTATION_HASH_SIZE && cursor + 2 < sizeof(message); ++i) {
+            int written = std::snprintf(message + cursor, sizeof(message) - cursor, "%02x",
+                                        static_cast<unsigned int>(expected[i]));
+            if (written != 2) break;
+            cursor += 2;
         }
-        oss << " actual=";
+        if (cursor < sizeof(message)) {
+            int written = std::snprintf(message + cursor, sizeof(message) - cursor, " actual=");
+            if (written > 0 && static_cast<size_t>(written) < sizeof(message) - cursor) {
+                cursor += static_cast<size_t>(written);
+            }
+        }
         for (uint8_t byte : g_active_hash) {
-            oss << std::hex << std::setfill('0') << std::setw(2) << static_cast<int>(byte);
+            if (cursor + 2 >= sizeof(message)) break;
+            int written = std::snprintf(message + cursor, sizeof(message) - cursor, "%02x",
+                                        static_cast<unsigned int>(byte));
+            if (written != 2) break;
+            cursor += 2;
         }
-        std::string message = oss.str();
-        std::snprintf(g_attestation_last_error, sizeof(g_attestation_last_error), "%s", message.c_str());
-        tsd_log_error(LOG_COMPONENT, "%s", message.c_str());
+        std::snprintf(g_attestation_last_error, sizeof(g_attestation_last_error), "%s", message);
+        tsd_log_error(LOG_COMPONENT, "%s", message);
         return -1;
     }
     g_attestation_last_error[0] = '\0';
