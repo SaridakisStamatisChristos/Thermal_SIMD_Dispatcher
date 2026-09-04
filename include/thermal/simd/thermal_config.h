@@ -76,11 +76,17 @@ extern tsd_runtime_config g_tsd_config;
  */
 const tsd_runtime_config *tsd_runtime_config_active_snapshot(void);
 
-/* The private runtime implementation is compiled with this definition. Route
- * its historical g_tsd_config reads through the immutable generation snapshot
- * without changing the external symbol or legacy source ABI. */
-#ifdef TSD_RUNTIME_INTERNAL_IMPL
-#define g_tsd_config (*tsd_runtime_config_active_snapshot())
+/*
+ * Private implementation bridge for the historical thermal_simd.c source.
+ * Production builds route those legacy lvalue references into the validated
+ * generation copy. The copy is semantically immutable after activation; the
+ * mutable type exists only because old startup code contains initialization
+ * branches that validation makes unreachable. White-box test builds keep the
+ * real writable g_tsd_config so their existing mutation hooks remain valid.
+ */
+tsd_runtime_config *tsd_runtime_config_active_snapshot_internal(void);
+#if defined(TSD_RUNTIME_INTERNAL_IMPL) && !defined(TSD_ENABLE_TESTS)
+#define g_tsd_config (*tsd_runtime_config_active_snapshot_internal())
 #endif
 
 /* Pure value initializers: these never modify process-global runtime state. */
