@@ -6,6 +6,7 @@
 
 static tsd_thermal_eval_t make_sample(uint32_t ratio_milli, int32_t temp_millic) {
     tsd_thermal_eval_t sample = {0};
+    sample.performance_available = 1;
     sample.ratio_milli = ratio_milli;
     sample.trimmed_ratio_milli = ratio_milli;
     sample.llc_mpki_milli = 0;

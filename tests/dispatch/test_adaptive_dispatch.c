@@ -2,6 +2,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include <config/runtime_flags.h>
 #include <thermal/simd/adaptive_dispatch.h>
 #include <thermal/simd/thermal_trampoline.h>
 
@@ -45,6 +46,8 @@ static int run_v2(void *context, size_t offset, size_t work_items) {
 }
 
 int main(void) {
+    tsd_runtime_flags_init();
+    tsd_runtime_flags_record_sandbox_success();
     assert(tsd_trampoline_init() == 0);
     assert(tsd_trampoline_patch(SIMD_SSE41) == 0);
 

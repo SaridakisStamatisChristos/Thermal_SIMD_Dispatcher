@@ -230,12 +230,18 @@ void update_attestation_hash(const tsd_patch_slot_t *slot) {
     SHA256(slot->code, TSD_TRAMPOLINE_SLOT_SIZE, g_active_hash.data());
     g_active_hash_valid.store(true, std::memory_order_release);
 
-    std::ostringstream oss;
-    oss << "Trampoline hash=";
+    char hash_line[32 + TSD_ATTESTATION_HASH_SIZE * 2] = {0};
+    int used = std::snprintf(hash_line, sizeof(hash_line), "Trampoline hash=");
+    if (used < 0) return;
+    size_t cursor = static_cast<size_t>(used);
     for (uint8_t byte : g_active_hash) {
-        oss << std::hex << std::setfill('0') << std::setw(2) << static_cast<int>(byte);
+        if (cursor + 2 >= sizeof(hash_line)) break;
+        int written = std::snprintf(hash_line + cursor, sizeof(hash_line) - cursor, "%02x",
+                                    static_cast<unsigned int>(byte));
+        if (written != 2) break;
+        cursor += 2;
     }
-    tsd_log_info(LOG_COMPONENT, "%s", oss.str().c_str());
+    tsd_log_info(LOG_COMPONENT, "%s", hash_line);
 }
 
 int build_canonical_code_page() {

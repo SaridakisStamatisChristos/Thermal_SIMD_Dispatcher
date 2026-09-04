@@ -3,6 +3,7 @@
 #include <cerrno>
 #include <cstdio>
 #include <exception>
+#include <new>
 #include <sstream>
 
 #include <thermal/simd/logging.h>

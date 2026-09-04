@@ -5,6 +5,8 @@
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <sys/syscall.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <config/runtime_flags.h>
@@ -14,6 +16,8 @@
 #include <thermal/simd/thermal_config.h>
 #include <thermal/simd/thermal_cpu.h>
 #include <thermal/simd/thermal_trampoline.h>
+
+#include "runtime_guard_internal.h"
 
 typedef struct {
     tsd_runtime_t *runtime;
@@ -153,10 +157,16 @@ static void test_execution_revocation_linearization(void) {
 
     pthread_t revoker;
     assert(pthread_create(&revoker, NULL, revoke_temperature, &kernel) == 0);
-    usleep(5000);
-    /* Guard publication takes the write side and therefore cannot complete
-       while the non-preemptible kernel still holds the execution side. */
-    assert(atomic_load_explicit(&kernel.revocation_done, memory_order_acquire) == 0);
+    for (int i = 0; i < 100 &&
+                    !atomic_load_explicit(&kernel.revocation_done, memory_order_acquire); ++i) {
+        usleep(1000);
+    }
+    /* Revocation closes admission immediately and must not wait for an already
+       admitted non-preemptible callback to finish. */
+    assert(atomic_load_explicit(&kernel.revocation_done, memory_order_acquire) == 1);
+    simd_width_t during = SIMD_AVX2;
+    assert(tsd_kernel_dispatch_resolve(dispatch, &during) == 0);
+    assert(during == SIMD_SSE41);
 
     pthread_mutex_lock(&kernel.mutex);
     kernel.release = 1;
@@ -178,8 +188,197 @@ static void test_execution_revocation_linearization(void) {
     clear_observability_guard();
 }
 
+
+typedef struct {
+    _Atomic int done;
+    int patch_rc;
+} reentrant_kernel_ctx_t;
+
+static void reentrant_selector_kernel(void *opaque, size_t work_items) {
+    (void)work_items;
+    reentrant_kernel_ctx_t *ctx = (reentrant_kernel_ctx_t *)opaque;
+    ctx->patch_rc = tsd_trampoline_patch(SIMD_SSE41);
+    atomic_store_explicit(&ctx->done, 1, memory_order_release);
+}
+
+static void *execute_reentrant(void *opaque) {
+    execute_ctx_t *ctx = (execute_ctx_t *)opaque;
+    ctx->rc = tsd_kernel_dispatch_execute(ctx->dispatch, 1, &ctx->used);
+    return NULL;
+}
+
+static void test_callback_selector_reentrancy(void) {
+    tsd_runtime_config_set_defaults(&g_tsd_config);
+    tsd_runtime_flags_init();
+    tsd_runtime_flags_record_sandbox_success();
+    publish_hardware_guard(60.0);
+    assert(tsd_trampoline_init() == 0);
+
+    tsd_runtime_config probe = g_tsd_config;
+    probe.allow_avx512 = 1;
+    if (tsd_detect_max_simd(&probe) < SIMD_AVX2) {
+        clear_observability_guard();
+        return;
+    }
+    assert(tsd_trampoline_patch(SIMD_AVX2) == 0);
+
+    reentrant_kernel_ctx_t kernel = {.patch_rc = -1};
+    atomic_init(&kernel.done, 0);
+    tsd_kernel_variants_t variants = {
+        .sse41 = reentrant_selector_kernel,
+        .avx2 = reentrant_selector_kernel,
+        .avx512 = reentrant_selector_kernel,
+        .context = &kernel,
+    };
+    tsd_kernel_dispatch_t *dispatch = NULL;
+    assert(tsd_kernel_dispatch_create(&variants, &dispatch) == 0);
+
+    execute_ctx_t exec = {.dispatch = dispatch, .used = SIMD_SSE41, .rc = -1};
+    pthread_t thread;
+    assert(pthread_create(&thread, NULL, execute_reentrant, &exec) == 0);
+    struct timespec deadline;
+    assert(clock_gettime(CLOCK_REALTIME, &deadline) == 0);
+    deadline.tv_sec += 2;
+    assert(pthread_timedjoin_np(thread, NULL, &deadline) == 0);
+    assert(exec.rc == 0);
+    assert(exec.used == SIMD_AVX2);
+    assert(atomic_load_explicit(&kernel.done, memory_order_acquire) == 1);
+    assert(kernel.patch_rc == 0);
+    assert(tsd_trampoline_state_current_width() == SIMD_SSE41);
+    tsd_kernel_dispatch_destroy(dispatch);
+    clear_observability_guard();
+}
+
+typedef struct {
+    tsd_kernel_dispatch_t *dispatch;
+    _Atomic int stop;
+} reader_loop_ctx_t;
+
+static void no_op_kernel(void *opaque, size_t work_items) {
+    (void)opaque;
+    (void)work_items;
+}
+
+static void *dispatch_reader_loop(void *opaque) {
+    reader_loop_ctx_t *ctx = (reader_loop_ctx_t *)opaque;
+    while (!atomic_load_explicit(&ctx->stop, memory_order_acquire)) {
+        simd_width_t used = SIMD_SSE41;
+        assert(tsd_kernel_dispatch_execute(ctx->dispatch, 1, &used) == 0);
+    }
+    return NULL;
+}
+
+static void test_revocation_not_starved_by_readers(void) {
+    tsd_runtime_config_set_defaults(&g_tsd_config);
+    tsd_runtime_flags_init();
+    tsd_runtime_flags_record_sandbox_success();
+    publish_hardware_guard(60.0);
+    assert(tsd_trampoline_init() == 0);
+
+    tsd_runtime_config probe = g_tsd_config;
+    probe.allow_avx512 = 1;
+    if (tsd_detect_max_simd(&probe) < SIMD_AVX2) {
+        clear_observability_guard();
+        return;
+    }
+    assert(tsd_trampoline_patch(SIMD_AVX2) == 0);
+
+    tsd_kernel_variants_t variants = {
+        .sse41 = no_op_kernel,
+        .avx2 = no_op_kernel,
+        .avx512 = no_op_kernel,
+        .context = NULL,
+    };
+    tsd_kernel_dispatch_t *dispatch = NULL;
+    assert(tsd_kernel_dispatch_create(&variants, &dispatch) == 0);
+    reader_loop_ctx_t readers = {.dispatch = dispatch};
+    atomic_init(&readers.stop, 0);
+    pthread_t threads[8];
+    for (size_t i = 0; i < 8; ++i) assert(pthread_create(&threads[i], NULL, dispatch_reader_loop, &readers) == 0);
+
+    blocking_kernel_ctx_t revocation = {
+        .mutex = PTHREAD_MUTEX_INITIALIZER,
+        .cv = PTHREAD_COND_INITIALIZER,
+    };
+    atomic_init(&revocation.revocation_done, 0);
+    pthread_t revoker;
+    assert(pthread_create(&revoker, NULL, revoke_temperature, &revocation) == 0);
+    struct timespec deadline;
+    assert(clock_gettime(CLOCK_REALTIME, &deadline) == 0);
+    deadline.tv_sec += 2;
+    assert(pthread_timedjoin_np(revoker, NULL, &deadline) == 0);
+    assert(atomic_load_explicit(&revocation.revocation_done, memory_order_acquire) == 1);
+
+    atomic_store_explicit(&readers.stop, 1, memory_order_release);
+    for (size_t i = 0; i < 8; ++i) assert(pthread_join(threads[i], NULL) == 0);
+    tsd_kernel_dispatch_destroy(dispatch);
+    assert(tsd_trampoline_patch(SIMD_SSE41) == 0);
+    clear_observability_guard();
+}
+
+typedef struct {
+    tsd_kernel_dispatch_t *dispatch;
+    simd_width_t resolved;
+    int rc;
+} resolve_thread_ctx_t;
+
+static void *resolve_on_other_thread(void *opaque) {
+    resolve_thread_ctx_t *ctx = (resolve_thread_ctx_t *)opaque;
+    ctx->resolved = SIMD_AVX2;
+    ctx->rc = tsd_kernel_dispatch_resolve(ctx->dispatch, &ctx->resolved);
+    return NULL;
+}
+
+static void test_owner_domain_fail_closed(void) {
+    tsd_runtime_config_set_defaults(&g_tsd_config);
+    tsd_runtime_flags_init();
+    tsd_runtime_flags_record_sandbox_success();
+    publish_hardware_guard(60.0);
+    assert(tsd_trampoline_init() == 0);
+
+    tsd_runtime_config probe = g_tsd_config;
+    probe.allow_avx512 = 1;
+    if (tsd_detect_max_simd(&probe) < SIMD_AVX2) {
+        clear_observability_guard();
+        return;
+    }
+    assert(tsd_trampoline_patch(SIMD_AVX2) == 0);
+    assert(tsd_runtime_safety_write_enter() == 0);
+    tsd_runtime_set_owner_tid_locked((int)syscall(SYS_gettid));
+    tsd_runtime_safety_write_leave();
+
+    tsd_kernel_variants_t variants = {
+        .sse41 = no_op_kernel,
+        .avx2 = no_op_kernel,
+        .avx512 = no_op_kernel,
+        .context = NULL,
+    };
+    tsd_kernel_dispatch_t *dispatch = NULL;
+    assert(tsd_kernel_dispatch_create(&variants, &dispatch) == 0);
+    simd_width_t local = SIMD_SSE41;
+    assert(tsd_kernel_dispatch_resolve(dispatch, &local) == 0);
+    assert(local == SIMD_AVX2);
+
+    resolve_thread_ctx_t other = {.dispatch = dispatch, .resolved = SIMD_AVX2, .rc = -1};
+    pthread_t thread;
+    assert(pthread_create(&thread, NULL, resolve_on_other_thread, &other) == 0);
+    assert(pthread_join(thread, NULL) == 0);
+    assert(other.rc == 0);
+    assert(other.resolved == SIMD_SSE41);
+
+    assert(tsd_runtime_safety_write_enter() == 0);
+    tsd_runtime_set_owner_tid_locked(0);
+    tsd_runtime_safety_write_leave();
+    tsd_kernel_dispatch_destroy(dispatch);
+    assert(tsd_trampoline_patch(SIMD_SSE41) == 0);
+    clear_observability_guard();
+}
+
 int main(void) {
     test_execution_revocation_linearization();
+    test_callback_selector_reentrancy();
+    test_revocation_not_starved_by_readers();
+    test_owner_domain_fail_closed();
 
     assert(setenv("TSD_FAKE_PERF", "1", 1) == 0);
     configure_runtime();
