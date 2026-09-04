@@ -41,6 +41,7 @@ struct tsd_runtime {
     perf_ctx_t *perf;
     pthread_t monitor;
     int monitor_started;
+    int stop_in_progress;
 };
 
 static pthread_mutex_t g_tsd_runtime_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -714,14 +715,25 @@ int tsd_runtime_stop(tsd_runtime_t *runtime) {
         errno = EINVAL;
         return -1;
     }
+    if (runtime->stop_in_progress) {
+        pthread_mutex_unlock(&g_tsd_runtime_lock);
+        errno = EBUSY;
+        return -1;
+    }
+    runtime->stop_in_progress = 1;
 
     if (tsd_runtime_safety_write_enter() != 0) {
+        runtime->stop_in_progress = 0;
         pthread_mutex_unlock(&g_tsd_runtime_lock);
         return -1;
     }
     tsd_runtime_set_stopping_locked(1);
     atomic_store_explicit(&g_tsd_running, 0, memory_order_release);
     tsd_runtime_safety_write_leave();
+
+    /* Keep the active runtime installed as a STOPPING tombstone, but never
+     * hold the lifecycle mutex while waiting for monitor/application code. */
+    pthread_mutex_unlock(&g_tsd_runtime_lock);
 
     if (runtime->monitor_started) {
         pthread_join(runtime->monitor, NULL);
@@ -732,6 +744,8 @@ int tsd_runtime_stop(tsd_runtime_t *runtime) {
      * that were already admitted; new wide work cannot join this set. */
     if (tsd_runtime_wait_for_wide_quiescence() != 0) {
         int saved_errno = errno ? errno : EIO;
+        pthread_mutex_lock(&g_tsd_runtime_lock);
+        if (runtime == g_tsd_active_runtime) runtime->stop_in_progress = 0;
         pthread_mutex_unlock(&g_tsd_runtime_lock);
         errno = saved_errno;
         return -1;
@@ -744,8 +758,17 @@ int tsd_runtime_stop(tsd_runtime_t *runtime) {
     if (tsd_trampoline_state_current_width() != SIMD_SSE41 &&
         tsd_trampoline_patch(SIMD_SSE41) != 0) {
         int saved_errno = errno ? errno : EIO;
+        pthread_mutex_lock(&g_tsd_runtime_lock);
+        if (runtime == g_tsd_active_runtime) runtime->stop_in_progress = 0;
         pthread_mutex_unlock(&g_tsd_runtime_lock);
         errno = saved_errno;
+        return -1;
+    }
+
+    pthread_mutex_lock(&g_tsd_runtime_lock);
+    if (runtime != g_tsd_active_runtime || !runtime->stop_in_progress) {
+        pthread_mutex_unlock(&g_tsd_runtime_lock);
+        errno = EBUSY;
         return -1;
     }
 

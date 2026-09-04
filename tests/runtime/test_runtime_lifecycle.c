@@ -374,11 +374,135 @@ static void test_owner_domain_fail_closed(void) {
     clear_observability_guard();
 }
 
+
+typedef struct {
+    pthread_mutex_t mutex;
+    pthread_cond_t cv;
+    tsd_runtime_t *runtime;
+    int runtime_ready;
+    int callback_entered;
+    int dispatch_rc;
+    simd_width_t used;
+    int nested_start_rc;
+    int nested_start_errno;
+    int stop_rc;
+    int stop_errno;
+} stop_quiescence_ctx_t;
+
+static void stop_quiescence_kernel(void *opaque, size_t work_items) {
+    (void)work_items;
+    stop_quiescence_ctx_t *ctx = (stop_quiescence_ctx_t *)opaque;
+    pthread_mutex_lock(&ctx->mutex);
+    ctx->callback_entered = 1;
+    pthread_cond_broadcast(&ctx->cv);
+    pthread_mutex_unlock(&ctx->mutex);
+
+    for (int i = 0; i < 4000 && !tsd_runtime_is_stopping(); ++i) usleep(1000);
+    assert(tsd_runtime_is_stopping());
+
+    tsd_runtime_t *nested = NULL;
+    errno = 0;
+    ctx->nested_start_rc = tsd_runtime_start(&nested, NULL);
+    ctx->nested_start_errno = errno;
+    assert(nested == NULL);
+}
+
+static void *stop_quiescence_owner(void *opaque) {
+    stop_quiescence_ctx_t *ctx = (stop_quiescence_ctx_t *)opaque;
+    tsd_runtime_t *runtime = NULL;
+    assert(tsd_runtime_start(&runtime, NULL) == 0);
+
+    pthread_mutex_lock(&ctx->mutex);
+    ctx->runtime = runtime;
+    ctx->runtime_ready = 1;
+    pthread_cond_broadcast(&ctx->cv);
+    pthread_mutex_unlock(&ctx->mutex);
+
+    publish_hardware_guard(60.0);
+    assert(tsd_trampoline_patch(SIMD_AVX2) == 0);
+
+    tsd_kernel_variants_t variants = {
+        .sse41 = stop_quiescence_kernel,
+        .avx2 = stop_quiescence_kernel,
+        .avx512 = stop_quiescence_kernel,
+        .context = ctx,
+    };
+    tsd_kernel_dispatch_t *dispatch = NULL;
+    assert(tsd_kernel_dispatch_create(&variants, &dispatch) == 0);
+    ctx->used = SIMD_SSE41;
+    ctx->dispatch_rc = tsd_kernel_dispatch_execute(dispatch, 1, &ctx->used);
+    tsd_kernel_dispatch_destroy(dispatch);
+    return NULL;
+}
+
+static void *stop_quiescence_stopper(void *opaque) {
+    stop_quiescence_ctx_t *ctx = (stop_quiescence_ctx_t *)opaque;
+    errno = 0;
+    ctx->stop_rc = tsd_runtime_stop(ctx->runtime);
+    ctx->stop_errno = errno;
+    return NULL;
+}
+
+static void test_stop_quiescence_releases_lifecycle_locks(void) {
+    tsd_runtime_config probe;
+    tsd_runtime_config_set_defaults(&probe);
+    probe.allow_avx512 = 1;
+    if (tsd_detect_max_simd(&probe) < SIMD_AVX2) return;
+
+    assert(setenv("TSD_FAKE_PERF", "1", 1) == 0);
+    configure_runtime();
+    g_tsd_config.check_interval_us = 250000;
+    (void)snprintf(g_tsd_config.telemetry_profile_path,
+                   sizeof(g_tsd_config.telemetry_profile_path),
+                   "%s", "test-unsupported-profile");
+    assert(tsd_runtime_config_refresh_ticks(&g_tsd_config) == 0);
+    tsd_runtime_flags_record_sandbox_success();
+
+    stop_quiescence_ctx_t ctx = {
+        .mutex = PTHREAD_MUTEX_INITIALIZER,
+        .cv = PTHREAD_COND_INITIALIZER,
+        .nested_start_rc = 0,
+        .nested_start_errno = 0,
+        .stop_rc = -1,
+    };
+
+    pthread_t owner;
+    assert(pthread_create(&owner, NULL, stop_quiescence_owner, &ctx) == 0);
+
+    pthread_mutex_lock(&ctx.mutex);
+    while (!ctx.runtime_ready || !ctx.callback_entered) {
+        pthread_cond_wait(&ctx.cv, &ctx.mutex);
+    }
+    pthread_mutex_unlock(&ctx.mutex);
+
+    pthread_t stopper;
+    assert(pthread_create(&stopper, NULL, stop_quiescence_stopper, &ctx) == 0);
+
+    struct timespec deadline;
+    assert(clock_gettime(CLOCK_REALTIME, &deadline) == 0);
+    deadline.tv_sec += 4;
+    assert(pthread_timedjoin_np(stopper, NULL, &deadline) == 0);
+    assert(clock_gettime(CLOCK_REALTIME, &deadline) == 0);
+    deadline.tv_sec += 4;
+    assert(pthread_timedjoin_np(owner, NULL, &deadline) == 0);
+
+    assert(ctx.stop_rc == 0);
+    assert(ctx.dispatch_rc == 0);
+    assert(ctx.used == SIMD_AVX2);
+    assert(ctx.nested_start_rc != 0);
+    assert(ctx.nested_start_errno == EBUSY);
+    assert(tsd_runtime_destroy(ctx.runtime) == 0);
+
+    clear_observability_guard();
+    unsetenv("TSD_FAKE_PERF");
+}
+
 int main(void) {
     test_execution_revocation_linearization();
     test_callback_selector_reentrancy();
     test_revocation_not_starved_by_readers();
     test_owner_domain_fail_closed();
+    test_stop_quiescence_releases_lifecycle_locks();
 
     assert(setenv("TSD_FAKE_PERF", "1", 1) == 0);
     configure_runtime();
