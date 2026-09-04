@@ -29,8 +29,49 @@ static _Atomic int g_tsd_runtime_stopping = 0;
 static _Atomic int g_tsd_runtime_owner_tid = 0;
 static _Thread_local unsigned int g_tsd_wide_execution_depth = 0;
 
+typedef struct {
+    int telemetry_max_skew_ms;
+    int predictive_temp_ceiling_c;
+    int predictive_safety_margin_c;
+    int predictive_emergency_margin_c;
+} tsd_safety_config_snapshot_t;
+
+/* 0=uncaptured, 1=writer publishing, 2=immutable snapshot available. */
+static _Atomic int g_tsd_safety_config_snapshot_state = 0;
+static tsd_safety_config_snapshot_t g_tsd_safety_config_snapshot;
+
 static int current_tid(void) {
     return (int)syscall(SYS_gettid);
+}
+
+static int safety_config_snapshot(tsd_safety_config_snapshot_t *out) {
+    if (!out) return 0;
+
+    int state = atomic_load_explicit(&g_tsd_safety_config_snapshot_state, memory_order_acquire);
+    if (state == 0) {
+        int expected = 0;
+        if (atomic_compare_exchange_strong_explicit(&g_tsd_safety_config_snapshot_state,
+                                                    &expected, 1,
+                                                    memory_order_acq_rel,
+                                                    memory_order_acquire)) {
+            tsd_safety_config_snapshot_t snapshot = {
+                .telemetry_max_skew_ms = g_tsd_config.telemetry_max_skew_ms,
+                .predictive_temp_ceiling_c = g_tsd_config.predictive_temp_ceiling_c,
+                .predictive_safety_margin_c = g_tsd_config.predictive_safety_margin_c,
+                .predictive_emergency_margin_c = g_tsd_config.predictive_emergency_margin_c,
+            };
+            g_tsd_safety_config_snapshot = snapshot;
+            atomic_store_explicit(&g_tsd_safety_config_snapshot_state, 2, memory_order_release);
+            state = 2;
+        } else {
+            state = expected;
+        }
+    }
+
+    /* Contention with the one-time publisher fails closed for this check. */
+    if (state != 2) return 0;
+    *out = g_tsd_safety_config_snapshot;
+    return 1;
 }
 
 void tsd_runtime_wide_admission_close(void) {
@@ -155,36 +196,41 @@ void tsd_runtime_safety_write_leave(void) {
 
 void tsd_runtime_set_stopping_locked(int stopping) {
     atomic_store_explicit(&g_tsd_runtime_stopping, stopping ? 1 : 0, memory_order_release);
-    if (stopping) tsd_runtime_wide_admission_close();
+    if (stopping) {
+        tsd_runtime_wide_admission_close();
+        /* Each runtime/control generation captures a fresh immutable safety
+         * configuration after it leaves the stopping/startup state. */
+        atomic_store_explicit(&g_tsd_safety_config_snapshot_state, 0, memory_order_release);
+    }
 }
 
 int tsd_runtime_is_stopping(void) {
     return atomic_load_explicit(&g_tsd_runtime_stopping, memory_order_acquire) != 0;
 }
 
-static int runtime_temperature_limits_valid(void) {
-    return g_tsd_config.predictive_temp_ceiling_c >= 20 &&
-           g_tsd_config.predictive_temp_ceiling_c <= 125 &&
-           g_tsd_config.predictive_safety_margin_c >= 0 &&
-           g_tsd_config.predictive_safety_margin_c <= 60 &&
-           g_tsd_config.predictive_emergency_margin_c >= 0 &&
-           g_tsd_config.predictive_emergency_margin_c <= 60;
+static int runtime_temperature_limits_valid(const tsd_safety_config_snapshot_t *cfg) {
+    return cfg && cfg->predictive_temp_ceiling_c >= 20 &&
+           cfg->predictive_temp_ceiling_c <= 125 &&
+           cfg->predictive_safety_margin_c >= 0 &&
+           cfg->predictive_safety_margin_c <= 60 &&
+           cfg->predictive_emergency_margin_c >= 0 &&
+           cfg->predictive_emergency_margin_c <= 60;
 }
 
 static int raw_temperature_upgrade_allowed(void) {
     if (!tsd_telemetry_temperature_upgrade_allowed()) return 0;
 
-    int freshness_ms = g_tsd_config.telemetry_max_skew_ms;
+    tsd_safety_config_snapshot_t cfg;
+    if (!safety_config_snapshot(&cfg) || !runtime_temperature_limits_valid(&cfg)) return 0;
+
+    int freshness_ms = cfg.telemetry_max_skew_ms;
     if (freshness_ms < 0) freshness_ms = 150;
 
     double raw_temp_c = 0.0;
     if (!tsd_observability_raw_temperature_c(&raw_temp_c, freshness_ms) || !isfinite(raw_temp_c)) return 0;
 
-    /* Safety configuration corruption is never an implicit opt-out. */
-    if (!runtime_temperature_limits_valid()) return 0;
-
-    const double limit_c = (double)(g_tsd_config.predictive_temp_ceiling_c -
-                                    g_tsd_config.predictive_safety_margin_c);
+    const double limit_c = (double)(cfg.predictive_temp_ceiling_c -
+                                    cfg.predictive_safety_margin_c);
     return raw_temp_c <= limit_c;
 }
 
