@@ -1,6 +1,7 @@
 #include <thermal/simd/adaptive_dispatch.h>
 
 #include <errno.h>
+#include <pthread.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -22,6 +23,33 @@ struct tsd_kernel_dispatch_v2 {
     tsd_kernel_variants_v2_t variants;
     simd_width_t host_max;
 };
+
+struct execution_cleanup {
+    simd_width_t width;
+    int previous_cancel_state;
+    int restore_cancel_state;
+};
+
+static void execution_cleanup_handler(void *opaque) {
+    struct execution_cleanup *cleanup = (struct execution_cleanup *)opaque;
+    if (!cleanup) return;
+
+    /* Release admission accounting before re-enabling cancellation. A pending
+     * cancellation may take effect as soon as the old state is restored. */
+    tsd_runtime_execution_leave(cleanup->width);
+    if (cleanup->restore_cancel_state) {
+        (void)pthread_setcancelstate(cleanup->previous_cancel_state, NULL);
+    }
+}
+
+static int cancel_disable(int *previous_state) {
+    if (!previous_state) return 0;
+    return pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, previous_state) == 0;
+}
+
+static void cancel_restore_if_needed(int restore, int previous_state) {
+    if (restore) (void)pthread_setcancelstate(previous_state, NULL);
+}
 
 static simd_width_t detect_host_max(void) {
     tsd_runtime_config probe = {0};
@@ -138,13 +166,28 @@ int tsd_kernel_dispatch_execute(tsd_kernel_dispatch_t *dispatch,
                                 simd_width_t *used_width) {
     tsd_kernel_fn fn = NULL;
     simd_width_t actual = SIMD_SSE41;
-    if (resolve_internal(dispatch, &actual, &fn) != 0 || !fn) return -1;
-    if (enter_or_fallback_v1(dispatch, &actual, &fn) != 0) return -1;
+    int previous_cancel_state = PTHREAD_CANCEL_ENABLE;
+    int restore_cancel_state = cancel_disable(&previous_cancel_state);
 
+    if (resolve_internal(dispatch, &actual, &fn) != 0 || !fn) {
+        cancel_restore_if_needed(restore_cancel_state, previous_cancel_state);
+        return -1;
+    }
+    if (enter_or_fallback_v1(dispatch, &actual, &fn) != 0) {
+        cancel_restore_if_needed(restore_cancel_state, previous_cancel_state);
+        return -1;
+    }
+
+    struct execution_cleanup cleanup = {
+        .width = actual,
+        .previous_cancel_state = previous_cancel_state,
+        .restore_cancel_state = restore_cancel_state,
+    };
+    pthread_cleanup_push(execution_cleanup_handler, &cleanup);
     fn(dispatch->variants.context, work_items);
     account_completed_work(work_items);
     if (used_width) *used_width = actual;
-    tsd_runtime_execution_leave(actual);
+    pthread_cleanup_pop(1);
     return 0;
 }
 
@@ -253,18 +296,32 @@ int tsd_kernel_dispatch_v2_execute(tsd_kernel_dispatch_v2_t *dispatch,
                                    simd_width_t *used_width) {
     tsd_kernel_fn_v2 fn = NULL;
     simd_width_t actual = SIMD_SSE41;
-    if (resolve_v2_internal(dispatch, &actual, &fn) != 0 || !fn) return -1;
-    if (enter_or_fallback_v2(dispatch, &actual, &fn) != 0) return -1;
+    int previous_cancel_state = PTHREAD_CANCEL_ENABLE;
+    int restore_cancel_state = cancel_disable(&previous_cancel_state);
+    int callback_rc = -1;
 
-    int rc = fn(dispatch->variants.context, offset, work_items);
-    if (rc != 0) {
-        tsd_runtime_execution_leave(actual);
-        return rc;
+    if (resolve_v2_internal(dispatch, &actual, &fn) != 0 || !fn) {
+        cancel_restore_if_needed(restore_cancel_state, previous_cancel_state);
+        return -1;
     }
-    account_completed_work(work_items);
-    if (used_width) *used_width = actual;
-    tsd_runtime_execution_leave(actual);
-    return 0;
+    if (enter_or_fallback_v2(dispatch, &actual, &fn) != 0) {
+        cancel_restore_if_needed(restore_cancel_state, previous_cancel_state);
+        return -1;
+    }
+
+    struct execution_cleanup cleanup = {
+        .width = actual,
+        .previous_cancel_state = previous_cancel_state,
+        .restore_cancel_state = restore_cancel_state,
+    };
+    pthread_cleanup_push(execution_cleanup_handler, &cleanup);
+    callback_rc = fn(dispatch->variants.context, offset, work_items);
+    if (callback_rc == 0) {
+        account_completed_work(work_items);
+        if (used_width) *used_width = actual;
+    }
+    pthread_cleanup_pop(1);
+    return callback_rc;
 }
 
 int tsd_kernel_dispatch_v2_execute_chunked(tsd_kernel_dispatch_v2_t *dispatch,
